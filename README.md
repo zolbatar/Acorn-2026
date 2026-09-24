@@ -6,11 +6,12 @@ Acorn-2026 is a design and implementation project for a modern, tinkerable compu
 
 ## Project status
 
-The project is in the design phase. The architecture brief is the current starting point; it distinguishes intended principles from exploratory ideas and unresolved decisions.
+The hosted Rust MOS prompt milestone is verified: `HELP` displays help and returns to `*`, and `QUIT` exits. The first BASIC64 source slice runs `INPUT` and `PRINT` string variables from plain UTF-8 `.bas64` files using a pest grammar. Loading previously tokenised BASIC V programs remains a required compatibility milestone.
 
 ## Start here
 
 - [`docs/acorn-2026-design.md`](docs/acorn-2026-design.md) — architecture, compatibility goals, memory model, SWIs and modules, rendering, desktop model, roadmap, and open questions.
+- [`docs/phase-0-mos-prompt-plan.md`](docs/phase-0-mos-prompt-plan.md) — the saved Phase 0 prompt contract and initial SWI catalog.
 
 ## Current direction
 
@@ -24,4 +25,22 @@ The project is in the design phase. The architecture brief is the current starti
 
 ## First design work
 
-Use the open questions in the architecture brief to settle the exact compatibility baseline, SWI contract, task memory model, and first hosted prototype. Keep those decisions explicit before they become implementation assumptions.
+Use the open questions in the architecture brief to settle the compatibility baseline, SWI contract, task memory model, and later host targets. Keep those decisions explicit before they become implementation assumptions.
+
+## Run the first hosted prompt
+
+Open the repository root (the folder containing `Cargo.toml`) in RustRover, then run:
+
+```sh
+cargo run
+```
+
+At the `*` prompt, enter `HELP` to list the built-in commands. Enter `QUIT` to exit the runtime. End-of-input also exits the process.
+
+To run the string echo example, enter:
+
+```text
+RUN examples/echo.bas64
+```
+
+The program asks for a line with `? ` and prints the entered string. Native BASIC64 source is currently plain UTF-8 identified by the `.bas64` extension.

@@ -1,0 +1,13 @@
+program = { SOI ~ line* ~ HSPACE* ~ EOI }
+line = _{ statement_line | blank_line }
+statement_line = { statement ~ HSPACE* ~ line_ending? }
+blank_line = _{ HSPACE* ~ line_ending }
+statement = _{ input_statement | print_statement }
+input_statement = { input_keyword ~ HSPACE+ ~ string_variable }
+print_statement = { print_keyword ~ HSPACE+ ~ string_variable }
+input_keyword = { ^"INPUT" }
+print_keyword = { ^"PRINT" }
+string_variable = @{ identifier ~ "$" }
+identifier = { ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+line_ending = _{ "\r\n" | "\n" | "\r" }
+HSPACE = _{ " " | "\t" }

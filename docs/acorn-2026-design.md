@@ -72,6 +72,8 @@ BASIC64 should remain recognizably BBC BASIC: immediate use, short programs, `PR
 
 The compatibility target is **BBC BASIC V/VI source semantics where feasible**. Existing documented source behavior should remain intact in a compatibility personality: syntax, operators and precedence, numeric and string behavior, control flow, error handling, built-in procedures/functions, memory operators, and interactions with `SYS` should be inventoried and treated as a compatibility contract. New BASIC64 capabilities should be additive or opt-in so they do not silently reinterpret established source.
 
+BASIC64 is the system's native language; BASIC V/VI syntax defines a compatibility path, not the language used to implement the system by default. A firm compatibility requirement is that the system can load previously tokenised BASIC V programs. The native BASIC64 source format starts as plain UTF-8 text with a `.bas64` extension and a separate pest grammar. Legacy tokenised files need their own format detection and decoding path before they can enter the compatibility execution pipeline; their exact file variants and decoding details remain to be specified.
+
 “100% compatible” needs a bounded definition. Source-level compatibility does not itself promise that arbitrary ARM machine code, undocumented interpreter quirks, or hardware-specific code will run unchanged. The exact BASIC V/VI baseline, edge cases, and compatibility boundary are open design questions.
 
 The runtime is written in Rust. Start with an interpreter because it makes the language semantics, memory model, and debugger approachable. Add a JIT later without changing program-visible behavior. Any future compilation strategy should target a stable internal representation and keep the REPL and interpreted path useful.
@@ -264,23 +266,23 @@ The rule is: **preserve the contract, not obsolete implementation**. Where compa
 
 ## 11. Suggested phased roadmap
 
-### Phase 0 — Write down the contracts
+### Phase 0 — Define the first MOS prompt contract
 
-Inventory the BASIC V/VI source surface and documented SWIs/modules. Mark each behavior as required compatibility, an intentional extension, or out of scope. Define the minimum Rust/BASIC64 boundary and the meaning of each memory class.
+Specify the first hosted prototype: a Rust command line that reaches the `*` prompt and accepts `HELP` and `QUIT`. Define the initial console SWI subset (`OS_WriteC`, `OS_WriteS`, `OS_Write0`, `OS_NewLine`, `OS_ReadC`, `OS_ReadLine`, and `OS_CLI`), their caller-memory rules, and the manual acceptance sequence. Defer BASIC64 and the broad compatibility inventory to later phases.
 
-**Exit:** a reviewable compatibility matrix and service catalog exist before implementation choices harden.
+**Exit:** a prompt acceptance contract and initial SWI catalog exist before implementation choices harden.
 
-### Phase 1 — Hosted Rust runtime and BASIC64 interpreter
+### Phase 1 — Hosted Rust MOS prompt
 
-Build a hosted runtime with task identity, a BASIC64 REPL, source loading, and an interpreter. Start with the chosen compatibility subset and make the logical-memory interface part of the interpreter rather than a later retrofit.
+Build a RustRover-ready Cargo project with one command task, a hosted console adapter, a caller-aware SWI dispatcher for the initial console/CLI subset, and the `HELP` and `QUIT` commands. Route prompt, line input, command dispatch, help, and errors through the corresponding SWIs. `QUIT` ends the hosted runtime cleanly. This is a bootstrap sequence; BASIC64 remains part of the long-term architecture and follows this milestone.
 
-**Exit:** BASIC programs can run interactively and in tasks without exposing host pointers as BASIC addresses.
+**Exit:** `cargo run` reaches `*`; entering `HELP` displays help through the SWI output path and returns to `*`; entering `QUIT` ends the runtime without exposing host pointers as guest addresses.
 
-### Phase 2 — SWI dispatch and logical memory
+### Phase 2 — BASIC64 runtime and full logical-memory/SWI model
 
-Implement the global service dispatcher, caller contexts, task/module/shared/system memory classes, checked pointer translation, and a small foundational service set. Provide descriptors for pointer-bearing calls and define retained-reference behavior.
+Build the BASIC64 interpreter around a separate pest grammar and start with runnable UTF-8 `.bas64` programs. The first executable slice supports `INPUT` and `PRINT` of string variables through the existing console SWIs. Continue with the REPL, full global service dispatcher, caller contexts, task/module/shared/system memory classes, checked pointer translation, and retained-reference rules. In this phase, define and implement the format-detection/decoding path needed to load previously tokenised BASIC V programs. Make logical memory part of the interpreter from its start.
 
-**Exit:** a service can be implemented in Rust or BASIC64 and receive the same caller-aware service context.
+**Exit:** native BASIC64 programs can run interactively and call services through the same caller-aware context without exposing host pointers as BASIC addresses, and the defined baseline of previously tokenised BASIC V files can be loaded through an explicit compatibility path.
 
 ### Phase 3 — BASIC64 modules and desktop foundation
 
@@ -317,20 +319,21 @@ Evaluate additional host systems, rendering backends, packaging, and possible de
 Work through these in order; preserve open questions rather than silently converting guesses into requirements.
 
 1. **Compatibility baseline:** Which exact BBC BASIC V and VI versions, documented behaviors, extensions, and known quirks define source compatibility? Which programs form the representative compatibility set?
-2. **Compatibility selection:** How does a program select the 32-bit compatibility personality—source metadata, application manifest, launcher setting, or another mechanism? What should happen when no personality is declared?
-3. **BASIC64 evolution:** Which new language features are essential at the start? How do integer suffixes, pointer/address types, overflow, string representation, and new syntax coexist with historical semantics?
-4. **SWI contract:** Which parts of the register/calling convention, errors, flag behavior, argument blocks, and module lifecycle must remain byte-for-byte compatible? How are extensions versioned without changing existing calls?
-5. **Pointer descriptors:** How are pointer-bearing SWI arguments described? What are the exact rules for buffers retained after return, callbacks, vectors, async I/O, and module-held references?
-6. **Shared memory and Dynamic Areas:** What names or handles identify a shared region? Who can map it, resize it, revoke it, or free it? How are old Dynamic Area calls represented?
-7. **Task and module lifetime:** Are modules reentrant? How is module workspace allocated per call or per task? What happens to retained references when a task or module exits?
-8. **Address layout:** What logical ranges and alignment rules are visible in each personality? Which historical BASIC memory variables/operators must retain exact meaning?
-9. **ARM compatibility scope:** Which ARM ISA generations and legacy modes are required? Is an interpreter sufficient initially, and what semantics must a translator preserve for memory and SWIs?
-10. **Rendering backend:** Which host library best fits the first prototype's platforms, 2D drawing, text, and compositing needs? How will rendering and windowing remain replaceable?
-11. **Text profiles:** Which legacy metrics and layout behaviors can be reproduced? How does an application declare a profile, and how are profile changes prevented from breaking measurement/painting consistency?
-12. **Desktop input:** How should Select/Menu/Adjust work on a trackpad or two-button mouse, and what accessibility remapping is needed?
-13. **Application bundles:** What is the directory layout and manifest format? How are file types, launch behavior, permissions, updates, and resource lookup described while keeping the bundle inspectable?
-14. **Trust boundary:** Which services are safe for every task, which require capabilities, and which components are trusted? How does BASIC64 system code receive privileges without giving every application access to system memory?
-15. **First host target:** Which host OS and runtime architecture should the first useful prototype support? What is the smallest end-to-end demonstration that proves the design: REPL, file handling, graphics, a BASIC64 desktop component, or all four?
+2. **Tokenised BASIC V files:** Which prior tokenised file variants must load, how are they detected, and should they be decoded to source/IR or executed through a compatibility interpreter?
+3. **Compatibility selection:** How does a program select the 32-bit compatibility personality—source metadata, application manifest, launcher setting, or another mechanism? What should happen when no personality is declared?
+4. **BASIC64 evolution:** Which new language features are essential at the start? How do integer suffixes, pointer/address types, overflow, string representation, and new syntax coexist with historical semantics?
+5. **SWI contract:** Which parts of the register/calling convention, errors, flag behavior, argument blocks, and module lifecycle must remain byte-for-byte compatible? How are extensions versioned without changing existing calls?
+6. **Pointer descriptors:** How are pointer-bearing SWI arguments described? What are the exact rules for buffers retained after return, callbacks, vectors, async I/O, and module-held references?
+7. **Shared memory and Dynamic Areas:** What names or handles identify a shared region? Who can map it, resize it, revoke it, or free it? How are old Dynamic Area calls represented?
+8. **Task and module lifetime:** Are modules reentrant? How is module workspace allocated per call or per task? What happens to retained references when a task or module exits?
+9. **Address layout:** What logical ranges and alignment rules are visible in each personality? Which historical BASIC memory variables/operators must retain exact meaning?
+10. **ARM compatibility scope:** Which ARM ISA generations and legacy modes are required? Is an interpreter sufficient initially, and what semantics must a translator preserve for memory and SWIs?
+11. **Rendering backend:** Which host library best fits the first prototype's platforms, 2D drawing, text, and compositing needs? How will rendering and windowing remain replaceable?
+12. **Text profiles:** Which legacy metrics and layout behaviors can be reproduced? How does an application declare a profile, and how are profile changes prevented from breaking measurement/painting consistency?
+13. **Desktop input:** How should Select/Menu/Adjust work on a trackpad or two-button mouse, and what accessibility remapping is needed?
+14. **Application bundles:** What is the directory layout and manifest format? How are file types, launch behavior, permissions, updates, and resource lookup described while keeping the bundle inspectable?
+15. **Trust boundary:** Which services are safe for every task, which require capabilities, and which components are trusted? How does BASIC64 system code receive privileges without giving every application access to system memory?
+16. **First host target:** The first prototype targets a hosted macOS terminal. Which additional host systems and runtime backends should follow? The initial end-to-end demonstration is the MOS `*` prompt with `HELP` and `QUIT`; broader demonstrations can add the BASIC64 REPL, file handling, graphics, and desktop components.
 
 ## 13. Working principles
 
