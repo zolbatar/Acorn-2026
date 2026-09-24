@@ -59,6 +59,7 @@ TOKENS = {
     "ENDCASE": 0xCB,
     "ENDIF": 0xCD,
     "ENDWHILE": 0xCE,
+    "DIM": 0xE2,
     "SOUND": 0xD4,
     "CALL": 0xD6,
     "DATA": 0xDC,
