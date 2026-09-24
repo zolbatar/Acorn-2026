@@ -24,7 +24,7 @@ const MAX_CLI_BYTES: usize = 256;
 const MAX_STRING_BYTES: usize = 4096;
 const OUTPUT_BUFFER: u32 = GUEST_MEMORY_BASE + 0x1000;
 const HELP_TEXT: &[u8] =
-    b"Acorn-2026 MOS commands:\n\r  HELP       Show this help.\n\r  RUN        Run a .bas64 source file.\n\r  BASICLOAD  Load a tokenised BASIC file (decode only).\n\r  QUIT       Exit the runtime.";
+    b"Acorn-2026 MOS commands:\n\r  HELP       Show this help.\n\r  RUN        Run a .bas64 source file.\n\r  BASICLOAD  Load a tokenised BASIC file.\n\r  BASICRUN   Run the loaded compatibility subset.\n\r  QUIT       Exit the runtime.";
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SwiContext {
@@ -324,6 +324,29 @@ impl SwiDispatcher {
                 }
                 Err(error) => {
                     let message = format!("BASICLOAD error: {error}");
+                    self.write_inline(task, message.as_bytes())?;
+                    self.write_new_line(task)
+                }
+            }
+        } else if verb.eq_ignore_ascii_case("BASICRUN") {
+            if !arguments.is_empty() {
+                self.write_inline(task, b"Syntax: BASICRUN")?;
+                return self.write_new_line(task);
+            }
+
+            let Some(program) = task.loaded_tokenized_program.take() else {
+                self.write_inline(
+                    task,
+                    b"No tokenised BASIC program is loaded; use BASICLOAD first.",
+                )?;
+                return self.write_new_line(task);
+            };
+            let result = crate::basic_compat::run_program(&program, task, self);
+            task.loaded_tokenized_program = Some(program);
+            match result {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let message = format!("BASICRUN error: {error}");
                     self.write_inline(task, message.as_bytes())?;
                     self.write_new_line(task)
                 }

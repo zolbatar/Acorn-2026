@@ -235,6 +235,10 @@ Compatibility belongs in profiles, not a normal global “HarfBuzz on/off” swi
 
 The desktop is a BASIC64 system made from inspectable, modifiable components. The Filer is a central part of the environment; applications communicate through defined messages and shared services instead of relying on deep coupling. A Wimp-like event and window model can provide the familiar conceptual interface while the Rust core handles low-level window, input, and graphics mechanisms.
 
+### Guest paths and host paths
+
+RISC OS-style paths use `.` between directory components, so guest paths must not be interpreted with the host's path rules. The current prototype's `RUN` and `BASICLOAD` commands accept host paths only as bootstrap conveniences; that syntax is not the guest path contract. Record the distinction now, and implement guest path parsing and host-filesystem mapping with the filesystem, `OS_File`, and Filer layer rather than expanding the current commands' host-path behavior. The exact root/current/parent notation, device syntax, file-type handling, and escaping rules remain to be specified there.
+
 Preserve and evolve these ideas:
 
 - A compact application-centered desktop and a refined icon bar rather than a permanent layer of toolbars.
@@ -280,7 +284,7 @@ Build a RustRover-ready Cargo project with one command task, a hosted console ad
 
 ### Phase 2 — BASIC64 runtime and full logical-memory/SWI model
 
-Build the BASIC64 interpreter around a separate pest grammar and start with runnable UTF-8 `.bas64` programs. The first executable slice supports `INPUT` and `PRINT` of string variables through the existing console SWIs. `BASICLOAD` now decodes the shared tokenised saved-program records, preserves token bytes, extracts line references, and retains a loaded program without executing it. Continue with the REPL, full global service dispatcher, caller contexts, task/module/shared/system memory classes, checked pointer translation, and retained-reference rules. Build the version-aware compatibility execution path for all earlier BASIC versions; use ClockSP5 5.08 as the first file-format fixture. Its CPU and OS operations require later runtime services. Make logical memory part of the interpreter from its start.
+Build the BASIC64 interpreter around a separate pest grammar and start with runnable UTF-8 `.bas64` programs. The first executable slice supports `INPUT` and `PRINT` of string variables through the existing console SWIs. `BASICLOAD` decodes the shared tokenised saved-program records, preserves token bytes, extracts line references, and retains a loaded program. `BASICRUN` now executes the minimal legacy subset `INPUT <string-variable>`, `PRINT <string-variable>`, `REM`, and `END`; its echo fixture demonstrates the console path while ClockSP5 5.08 remains a larger file-format fixture whose language, CPU, and OS operations require further compatibility and runtime services. Continue with the REPL, full global service dispatcher, caller contexts, task/module/shared/system memory classes, checked pointer translation, and retained-reference rules. Build the version-aware compatibility execution path for all earlier BASIC versions. Make logical memory part of the interpreter from its start.
 
 **Exit:** native BASIC64 programs can run interactively and call services through the same caller-aware context without exposing host pointers as BASIC addresses, and tokenised programs from all earlier BASIC versions can be loaded through the shared file-format decoder and a version-aware compatibility path.
 
@@ -334,6 +338,7 @@ Work through these in order; preserve open questions rather than silently conver
 14. **Application bundles:** What is the directory layout and manifest format? How are file types, launch behavior, permissions, updates, and resource lookup described while keeping the bundle inspectable?
 15. **Trust boundary:** Which services are safe for every task, which require capabilities, and which components are trusted? How does BASIC64 system code receive privileges without giving every application access to system memory?
 16. **First host target:** The first prototype targets a hosted macOS terminal. Which additional host systems and runtime backends should follow? The initial end-to-end demonstration is the MOS `*` prompt with `HELP` and `QUIT`; broader demonstrations can add the BASIC64 REPL, file handling, graphics, and desktop components.
+17. **Guest path syntax:** What is the complete RISC OS-style path grammar, including roots, parent/current-directory notation, device names, file-type metadata, and mapping to host paths?
 
 ## 13. Working principles
 

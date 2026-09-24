@@ -6,7 +6,7 @@ Acorn-2026 is a design and implementation project for a modern, tinkerable compu
 
 ## Project status
 
-The hosted Rust MOS prompt milestone is verified: `HELP` displays help and returns to `*`, and `QUIT` exits. The first BASIC64 source slice runs `INPUT` and `PRINT` string variables from plain UTF-8 `.bas64` files using a pest grammar. `BASICLOAD` reads shared tokenised saved-program files and retains their token bytes; execution remains future compatibility work. ClockSP5 5.08 is the first fixture under `examples/clocksp5`.
+The hosted Rust MOS prompt milestone is verified: `HELP` displays help and returns to `*`, and `QUIT` exits. The first BASIC64 source slice runs `INPUT` and `PRINT` string variables from plain UTF-8 `.bas64` files using a pest grammar. `BASICLOAD` reads shared tokenised saved-program files, and `BASICRUN` executes a small compatibility slice: `INPUT A$`, `PRINT A$`, and `END`. ClockSP5 5.08 remains a larger format fixture under `examples/clocksp5`; its execution needs more language and OS support.
 
 ## Start here
 
@@ -45,10 +45,19 @@ RUN examples/echo.bas64
 
 The program asks for a line with `? ` and prints the entered string. Native BASIC64 source is currently plain UTF-8 identified by the `.bas64` extension.
 
-To load and inspect the tokenised compatibility fixture, enter:
+To run the small tokenised BASIC echo fixture, enter:
+
+```text
+BASICLOAD examples/basicv-echo/echo.bbc
+BASICRUN
+```
+
+Type a line when the program shows `? `; it prints that line back and returns to the MOS prompt. The current compatibility executor handles only the fixture's string `INPUT`, string-variable `PRINT`, `REM`, and `END` statements.
+
+To load and inspect the larger ClockSP5 tokenised file without executing it, enter:
 
 ```text
 BASICLOAD examples/clocksp5/ClockSP5.bbc
 ```
 
-This reports the loaded line and reference counts. It does not execute the legacy BASIC program.
+This reports the loaded line and reference counts. ClockSP5 is not yet within the execution subset.

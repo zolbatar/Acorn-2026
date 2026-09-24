@@ -1,4 +1,5 @@
 pub mod basic64;
+pub mod basic_compat;
 pub mod error;
 pub mod host;
 pub mod memory;
