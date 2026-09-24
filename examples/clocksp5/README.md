@@ -4,6 +4,13 @@ ClockSP5.bas is the text program from [dp111/ClockSP5](https://github.com/dp111/
 
 ClockSP5.bbc is a generated ARM BBC BASIC V tokenised saved-program file for testing the legacy file-format path. Its line records and encoded line references follow the [BBC BASIC V file format](https://xania.org/200711/bbc-basic-v-format). Regenerate it with `python3 tools/tokenize_clocksp5.py examples/clocksp5/ClockSP5.bas examples/clocksp5/ClockSP5.bbc`; the converter covers this fixture's tokens and source conventions, not general BBC BASIC input.
 
-Run `cargo run`, then enter `BASICLOAD examples/clocksp5/ClockSP5.bbc` at the MOS prompt. The loader reports the 143 lines and 37 line references. `BASICRUN` currently supports only a small input/print/end subset, so ClockSP5 is a format fixture and is not executable yet.
+Run `cargo run`, then enter these commands at the MOS prompt:
 
-The current Acorn-2026 runtime does not execute this program; it uses hardware and OS features outside the implemented slice.
+```text
+BASICLOAD examples/clocksp5/ClockSP5.bbc
+BASICRUN
+```
+
+The loader reports 143 lines and 37 line references. The compatibility runner executes the subset used by this program and prints three complete workload passes, with the benchmark sections and comparison in each, before returning to `*`. Its hosted profile uses monotonic centisecond `TIME` and the no-key `INKEY` result. ClockSP5's own guards then skip its native ARM call and hardware/OS setup; the final hardware reset command is accepted as a no-op.
+
+The MHz figures compare the hosted BASIC interpreter's elapsed loop work with the program's BBC B reference data; they do not measure the host processor's physical clock. This fixture-specific execution does not imply general BASIC V/VI compatibility. The shared tokenized file decoder is intended to serve files from all earlier BASIC versions, with their execution semantics being added separately.

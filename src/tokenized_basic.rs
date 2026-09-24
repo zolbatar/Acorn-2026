@@ -272,7 +272,7 @@ fn scan_line_references(
     Ok(references)
 }
 
-fn decode_line_reference(encoded: &[u8]) -> u16 {
+pub(crate) fn decode_line_reference(encoded: &[u8]) -> u16 {
     let [marker, low, high] = [encoded[0], encoded[1], encoded[2]];
     let low = low ^ ((marker.wrapping_mul(4)) & 0xC0);
     let high = high ^ marker.wrapping_mul(16);

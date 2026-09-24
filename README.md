@@ -6,7 +6,7 @@ Acorn-2026 is a design and implementation project for a modern, tinkerable compu
 
 ## Project status
 
-The hosted Rust MOS prompt milestone is verified: `HELP` displays help and returns to `*`, and `QUIT` exits. The first BASIC64 source slice runs `INPUT` and `PRINT` string variables from plain UTF-8 `.bas64` files using a pest grammar. `BASICLOAD` reads shared tokenised saved-program files, and `BASICRUN` executes a small compatibility slice: `INPUT A$`, `PRINT A$`, and `END`. ClockSP5 5.08 remains a larger format fixture under `examples/clocksp5`; its execution needs more language and OS support.
+The hosted Rust MOS prompt milestone is verified: `HELP` displays help and returns to `*`, and `QUIT` exits. The first BASIC64 source slice runs `INPUT` and `PRINT` string variables from plain UTF-8 `.bas64` files using a pest grammar. `BASICLOAD` reads shared tokenised saved-program files. `BASICRUN` supports the string echo fixture and the ClockSP5 5.08 program-specific compatibility slice. ClockSP5 completes its benchmark sections and returns to `*`; this does not establish broad BASIC V/VI compatibility.
 
 ## Start here
 
@@ -53,12 +53,13 @@ BASICLOAD examples/basicv-echo/echo.bbc
 BASICRUN
 ```
 
-Type a line when the program shows `? `; it prints that line back and returns to the MOS prompt. The current compatibility executor handles only the fixture's string `INPUT`, string-variable `PRINT`, `REM`, and `END` statements.
+Type a line when the program shows `? `; it prints that line back and returns to the MOS prompt.
 
-To load and inspect the larger ClockSP5 tokenised file without executing it, enter:
+To run ClockSP5, enter:
 
 ```text
 BASICLOAD examples/clocksp5/ClockSP5.bbc
+BASICRUN
 ```
 
-This reports the loaded line and reference counts. ClockSP5 is not yet within the execution subset.
+It runs three workload passes, printing the benchmark sections and comparison each time, then returns to `*`. In this hosted profile, `TIME` is monotonic centiseconds and `INKEY` returns the no-key value, so the program follows its own guarded path that skips native ARM and hardware setup. Its final hardware reset command is accepted as a no-op. The displayed MHz figures compare this hosted BASIC interpreter's performance against the program's BBC B reference data; they do not measure the host processor's physical clock speed.

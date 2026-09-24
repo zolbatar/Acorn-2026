@@ -1,5 +1,9 @@
 # ClockSP5 execution plan
 
+## Status: complete
+
+The acceptance run is implemented. The checked-in tokenized fixture loads as 143 lines with 37 line references, prints all nine benchmark sections and the final comparison in each of its three workload passes, then returns to the MOS `*` prompt. `QUIT` remains available afterward. The hosted profile bypasses the guarded native ARM/hardware setup and treats the final `*FX151,78,243` reset command as a no-op. The runtime's MHz figures are a hosted-interpreter comparison against the fixture's BBC B reference data, not a physical host CPU clock measurement. This milestone implements only the constructs and guarded hosted-OS behavior reached by ClockSP5; general BASIC V/VI compatibility remains future work.
+
 ## Goal
 
 Run the checked-in ARM BASIC V tokenised file with `BASICLOAD` and `BASICRUN`, through the compatibility executor, and have ClockSP5 print its benchmark sections and return to the MOS `*` prompt. Keep `ClockSP5.bas` and `ClockSP5.bbc` as the source and acceptance fixture. This is a program-driven compatibility milestone, not a claim of complete BBC BASIC V/VI support.
@@ -14,11 +18,11 @@ The checked-in program starts with `Z%=&0211`. With the hosted no-key result (`I
 
 ## Implementation sequence
 
-1. **Tokenized execution core:** replace the sequential statement-only runner with a token-aware execution cursor, scalar numeric/string values, expression evaluation, assignments, and checked branch targets. Keep console input/output on the existing SWIs.
-2. **Program control and data:** support the control flow used in the fixture (`IF`, `GOTO`, nested `REPEAT`/`UNTIL`, `FOR`/`NEXT`, procedures, `GOSUB`/`RETURN`) and its `DATA`/`READ`/`RESTORE` tables. Enforce a bounded instruction count so a broken loop returns an error instead of hanging the MOS prompt.
-3. **ClockSP5 language surface:** add the arrays, print formatting, numeric/string built-ins, and variable behavior reached by the fixture. Unsupported syntax should identify its BASIC line and token.
-4. **Hosted OS profile:** expose `TIME` as monotonic centiseconds and `INKEY` as the BBC no-key result. Preserve checked task memory for any supported `?` or `!` access; leave the source's guarded native `CALL` and `*FX` path unsupported and report it if reached.
-5. **Acceptance and documentation:** run the actual `.bbc` fixture from the MOS prompt, confirm each benchmark heading and the final comparison label appear, confirm it returns to `*`, then record the implemented subset and remaining compatibility gaps.
+1. **Tokenized execution core:** implemented a token-aware execution cursor, scalar numeric/string values, expression evaluation, assignments, and checked branch targets. Console input/output uses the existing SWIs.
+2. **Program control and data:** implemented the fixture's `IF`, `GOTO`, nested `REPEAT`/`UNTIL`, `FOR`/`NEXT`, procedures, `GOSUB`/`RETURN`, and `DATA`/`READ`/`RESTORE` paths. Execution has a bounded instruction count.
+3. **ClockSP5 language surface:** implemented the arrays, print formatting, numeric/string built-ins, and variable behavior reached by the fixture, with line-aware errors for unsupported input.
+4. **Hosted OS profile:** `TIME` is monotonic centiseconds and `INKEY` returns the BBC no-key result. Checked task memory remains in place. ClockSP5's guards bypass its native `CALL` and hardware/OS setup paths; the final `*FX151,78,243` reset is accepted as a no-op.
+5. **Acceptance and documentation:** the actual `.bbc` fixture ran from the MOS prompt, printed its benchmark output, and returned to `*`.
 
 Each implementation milestone gets its own focused commit. Run the small echo fixture and Rust checks after interpreter changes, then use the ClockSP5 end-to-end run as the final acceptance check.
 

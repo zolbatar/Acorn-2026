@@ -163,7 +163,15 @@ def tokenise_line(text: str) -> bytes:
         next_index = index + len(matched)
         if matched in PSEUDO_VARIABLES:
             after_name = text[next_index:].lstrip(" \t")
-            token = PSEUDO_VARIABLES[matched][1 if after_name.startswith("=") else 0]
+            before_name = text[:index].rstrip(" \t")
+            at_statement_start = (
+                not before_name
+                or before_name.endswith(":")
+                or re.search(r"\b(?:THEN|ELSE)\s*$", before_name, re.IGNORECASE)
+                is not None
+            )
+            is_assignment_target = at_statement_start and after_name.startswith("=")
+            token = PSEUDO_VARIABLES[matched][1 if is_assignment_target else 0]
         else:
             token = TOKENS[matched]
         output.append(token)
