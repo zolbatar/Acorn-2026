@@ -1,5 +1,7 @@
 use std::{error::Error, fmt};
 
+use crate::tokenized_basic::TokenizedBasicProgram;
+
 pub const GUEST_MEMORY_BASE: u32 = 0x1000;
 pub const GUEST_MEMORY_SIZE: usize = 64 * 1024;
 
@@ -95,6 +97,7 @@ impl GuestMemory {
 pub struct Task {
     pub id: u64,
     pub memory: GuestMemory,
+    pub loaded_tokenized_program: Option<TokenizedBasicProgram>,
 }
 
 impl Task {
@@ -102,6 +105,7 @@ impl Task {
         Self {
             id,
             memory: GuestMemory::default(),
+            loaded_tokenized_program: None,
         }
     }
 }

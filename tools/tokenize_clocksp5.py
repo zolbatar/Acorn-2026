@@ -200,8 +200,8 @@ def encode_program(source: str) -> tuple[bytes, int]:
         if not 0 <= line_number <= 0xFEFF:
             raise ValueError(f"line number out of BASIC V range: {line_number}")
         body = tokenise_line(match.group(2))
-        record_length = len(body) + 4  # number/length fields plus final CR
-        if record_length > 251:
+        record_length = len(body) + 5  # four-byte preamble, body and final CR
+        if record_length > 255:
             raise ValueError(f"line {line_number} is too long for BASIC V")
 
         output.extend((0x0D, line_number >> 8, line_number & 0xFF, record_length))

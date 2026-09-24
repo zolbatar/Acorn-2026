@@ -4,3 +4,4 @@ pub mod host;
 pub mod memory;
 pub mod runtime;
 pub mod swi;
+pub mod tokenized_basic;

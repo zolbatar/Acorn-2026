@@ -24,7 +24,7 @@ const MAX_CLI_BYTES: usize = 256;
 const MAX_STRING_BYTES: usize = 4096;
 const OUTPUT_BUFFER: u32 = GUEST_MEMORY_BASE + 0x1000;
 const HELP_TEXT: &[u8] =
-    b"Acorn-2026 MOS commands:\n\r  HELP   Show this help.\n\r  RUN    Run a .bas64 source file.\n\r  QUIT   Exit the runtime.";
+    b"Acorn-2026 MOS commands:\n\r  HELP       Show this help.\n\r  RUN        Run a .bas64 source file.\n\r  BASICLOAD  Load a tokenised BASIC file (decode only).\n\r  QUIT       Exit the runtime.";
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SwiContext {
@@ -296,6 +296,34 @@ impl SwiDispatcher {
                 Ok(()) => Ok(()),
                 Err(error) => {
                     let message = format!("BASIC64 error: {error}");
+                    self.write_inline(task, message.as_bytes())?;
+                    self.write_new_line(task)
+                }
+            }
+        } else if verb.eq_ignore_ascii_case("BASICLOAD") {
+            if arguments.is_empty() {
+                self.write_inline(task, b"Syntax: BASICLOAD <file>")?;
+                return self.write_new_line(task);
+            }
+
+            let path = arguments
+                .strip_prefix('"')
+                .and_then(|path| path.strip_suffix('"'))
+                .unwrap_or(arguments);
+            match crate::tokenized_basic::TokenizedBasicProgram::load_file(path) {
+                Ok(program) => {
+                    let line_count = program.line_count();
+                    let reference_count = program.line_reference_count();
+                    let unresolved_count = program.unresolved_line_reference_count();
+                    task.loaded_tokenized_program = Some(program);
+                    let message = format!(
+                        "Loaded {line_count} tokenised BASIC lines; {reference_count} line references, {unresolved_count} unresolved."
+                    );
+                    self.write_inline(task, message.as_bytes())?;
+                    self.write_new_line(task)
+                }
+                Err(error) => {
+                    let message = format!("BASICLOAD error: {error}");
                     self.write_inline(task, message.as_bytes())?;
                     self.write_new_line(task)
                 }

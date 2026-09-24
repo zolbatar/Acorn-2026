@@ -6,7 +6,7 @@ Acorn-2026 is a design and implementation project for a modern, tinkerable compu
 
 ## Project status
 
-The hosted Rust MOS prompt milestone is verified: `HELP` displays help and returns to `*`, and `QUIT` exits. The first BASIC64 source slice runs `INPUT` and `PRINT` string variables from plain UTF-8 `.bas64` files using a pest grammar. The first prior-BASIC tokenised fixture, ClockSP5 5.08, is now saved under `examples/clocksp5`; loading and executing it remain future compatibility work.
+The hosted Rust MOS prompt milestone is verified: `HELP` displays help and returns to `*`, and `QUIT` exits. The first BASIC64 source slice runs `INPUT` and `PRINT` string variables from plain UTF-8 `.bas64` files using a pest grammar. `BASICLOAD` reads shared tokenised saved-program files and retains their token bytes; execution remains future compatibility work. ClockSP5 5.08 is the first fixture under `examples/clocksp5`.
 
 ## Start here
 
@@ -44,3 +44,11 @@ RUN examples/echo.bas64
 ```
 
 The program asks for a line with `? ` and prints the entered string. Native BASIC64 source is currently plain UTF-8 identified by the `.bas64` extension.
+
+To load and inspect the tokenised compatibility fixture, enter:
+
+```text
+BASICLOAD examples/clocksp5/ClockSP5.bbc
+```
+
+This reports the loaded line and reference counts. It does not execute the legacy BASIC program.
