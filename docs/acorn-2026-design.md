@@ -72,7 +72,7 @@ BASIC64 should remain recognizably BBC BASIC: immediate use, short programs, `PR
 
 The compatibility target is **BBC BASIC V/VI source semantics where feasible**. Existing documented source behavior should remain intact in a compatibility personality: syntax, operators and precedence, numeric and string behavior, control flow, error handling, built-in procedures/functions, memory operators, and interactions with `SYS` should be inventoried and treated as a compatibility contract. New BASIC64 capabilities should be additive or opt-in so they do not silently reinterpret established source.
 
-BASIC64 is the system's native language; BASIC V/VI syntax defines a compatibility path, not the language used to implement the system by default. A firm compatibility requirement is that the system can load previously tokenised BASIC V programs. The native BASIC64 source format starts as plain UTF-8 text with a `.bas64` extension and a separate pest grammar. Legacy tokenised files need their own format detection and decoding path before they can enter the compatibility execution pipeline; their exact file variants and decoding details remain to be specified.
+BASIC64 is the system's native language; earlier BASIC syntax defines compatibility paths, not the language used to implement the system by default. A firm requirement is that the system can load programs from all earlier BBC BASIC versions. The user has confirmed that these versions share a tokenised saved-program bytecode format, so the file reader should use one format decoder while the compatibility execution path preserves version-specific behavior. The native BASIC64 source format starts as plain UTF-8 text with a `.bas64` extension and a separate pest grammar. The first encoded compatibility fixture is ClockSP5 5.08, kept beside its text source.
 
 “100% compatible” needs a bounded definition. Source-level compatibility does not itself promise that arbitrary ARM machine code, undocumented interpreter quirks, or hardware-specific code will run unchanged. The exact BASIC V/VI baseline, edge cases, and compatibility boundary are open design questions.
 
@@ -280,9 +280,9 @@ Build a RustRover-ready Cargo project with one command task, a hosted console ad
 
 ### Phase 2 — BASIC64 runtime and full logical-memory/SWI model
 
-Build the BASIC64 interpreter around a separate pest grammar and start with runnable UTF-8 `.bas64` programs. The first executable slice supports `INPUT` and `PRINT` of string variables through the existing console SWIs. Continue with the REPL, full global service dispatcher, caller contexts, task/module/shared/system memory classes, checked pointer translation, and retained-reference rules. In this phase, define and implement the format-detection/decoding path needed to load previously tokenised BASIC V programs. Make logical memory part of the interpreter from its start.
+Build the BASIC64 interpreter around a separate pest grammar and start with runnable UTF-8 `.bas64` programs. The first executable slice supports `INPUT` and `PRINT` of string variables through the existing console SWIs. Continue with the REPL, full global service dispatcher, caller contexts, task/module/shared/system memory classes, checked pointer translation, and retained-reference rules. In this phase, implement the shared tokenised saved-program decoder and a compatibility path for programs from all earlier BASIC versions. Use the converted ClockSP5 5.08 program as an initial file-format fixture; its CPU and OS operations require later runtime services. Make logical memory part of the interpreter from its start.
 
-**Exit:** native BASIC64 programs can run interactively and call services through the same caller-aware context without exposing host pointers as BASIC addresses, and the defined baseline of previously tokenised BASIC V files can be loaded through an explicit compatibility path.
+**Exit:** native BASIC64 programs can run interactively and call services through the same caller-aware context without exposing host pointers as BASIC addresses, and tokenised programs from all earlier BASIC versions can be loaded through the shared file-format decoder and a version-aware compatibility path.
 
 ### Phase 3 — BASIC64 modules and desktop foundation
 
@@ -319,7 +319,7 @@ Evaluate additional host systems, rendering backends, packaging, and possible de
 Work through these in order; preserve open questions rather than silently converting guesses into requirements.
 
 1. **Compatibility baseline:** Which exact BBC BASIC V and VI versions, documented behaviors, extensions, and known quirks define source compatibility? Which programs form the representative compatibility set?
-2. **Tokenised BASIC V files:** Which prior tokenised file variants must load, how are they detected, and should they be decoded to source/IR or executed through a compatibility interpreter?
+2. **Shared tokenised format:** Earlier BASIC versions share one saved-program bytecode format. Which version-specific language and runtime behaviors must remain distinct after the shared file decoder loads a program?
 3. **Compatibility selection:** How does a program select the 32-bit compatibility personality—source metadata, application manifest, launcher setting, or another mechanism? What should happen when no personality is declared?
 4. **BASIC64 evolution:** Which new language features are essential at the start? How do integer suffixes, pointer/address types, overflow, string representation, and new syntax coexist with historical semantics?
 5. **SWI contract:** Which parts of the register/calling convention, errors, flag behavior, argument blocks, and module lifecycle must remain byte-for-byte compatible? How are extensions versioned without changing existing calls?
