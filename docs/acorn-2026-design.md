@@ -219,7 +219,7 @@ The initial BASIC V/VI surface adds `MODE`, `VDU`, `LINE`, `MOVE`, `DRAW`, `PLOT
 
 The scene is retained as logical commands for a host renderer; this slice does not rasterize to a fixed pixel buffer or open a graphics window. Connecting a renderer remains part of Phase 4. Legacy saved-file decoding remains shared, but execution semantics are selected by the compatibility profile. In particular, graphics support does not imply machine-code execution. `CALL` needs a separately selected processor compatibility service; no 6502 emulator is introduced by this graphics work.
 
-The authentic TDU-01 file remains useful for verifying a real BBC Micro saved-program layout and the common graphics statements it contains. It is not the graphics execution acceptance program: its remaining procedure flow, direct memory operations, and BBC Micro machine-code routines exceed this language/service slice.
+The authentic TDU-01 file remains the working source for the common graphics slice and useful evidence for a real BBC Micro saved-program layout. Develop the language-level `MODE`, VDU, and drawing behavior it contains through the standard SWI services. TDU-01 itself is not a required release-compatibility or whole-program acceptance target: its procedure flow, direct memory operations, and machine-code routines extend beyond this slice. The compatibility corpus records this distinction in [`docs/tokenized-basic-compatibility.md`](tokenized-basic-compatibility.md).
 
 Text is a first-class graphics primitive alongside paths, images, surfaces, transforms, clipping, and paint. The system owns text shaping and measurement so applications do not each choose a separate text stack.
 
