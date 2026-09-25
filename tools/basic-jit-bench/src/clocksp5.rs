@@ -7,33 +7,38 @@ use std::{
 };
 
 use acorn_2026::{
-    basic_compat::run_program,
+    basic_compat::{
+        compiler_api::{
+            self, IntegerCondition, IntegerExpression, IntegerProgram, IntegerStatement,
+        },
+        run_program,
+    },
     host::HostConsole,
     memory::Task,
     swi::{DisplayEvent, SwiDispatcher},
     tokenized_basic::TokenizedBasicProgram,
 };
 use cranelift_codegen::{
-    ir::{AbiParam, InstBuilder, UserFuncName, condcodes::IntCC, types},
+    ir::{AbiParam, InstBuilder, UserFuncName, Value, condcodes::IntCC, types},
     settings::{self, Configurable},
 };
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
-const B_INCREMENT: i32 = 1;
-const I_START: i32 = 0;
-const INNER_LIMIT: i32 = 100;
-const OUTER_LIMIT: i32 = 10_000;
 const INTERPRETER_SAMPLES: usize = 3;
 const NATIVE_SAMPLES: usize = 7;
 
-type IntegerRepeat = extern "C" fn(i32, i32, i32, i32) -> i32;
+type CompiledIntegerProgram = extern "C" fn() -> i32;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let fixture = repository_root().join("examples/clocksp5/integer-repeat-jit.bbc");
     let program = TokenizedBasicProgram::load_file(&fixture)?;
+
+    let lowering_started = Instant::now();
+    let integer_program = compiler_api::lower_integer_program(&program)?;
+    let basic_lowering_time = lowering_started.elapsed();
 
     let jit_started = Instant::now();
     let isa_builder =
@@ -41,16 +46,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let isa = isa_builder.finish(compiler_flags()?)?;
     let target = isa.triple().to_string();
     let mut jit_module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
-    let function = define_integer_repeat(&mut jit_module)?;
+    let function = define_integer_program(&mut jit_module, &integer_program)?;
     jit_module.finalize_definitions()?;
     let jit_compile_time = jit_started.elapsed();
 
-    // SAFETY: the JIT function uses the matching extern "C" signature above,
-    // and its module stays alive until every sample has completed.
+    // SAFETY: this generated function has the `extern "C" fn() -> i32`
+    // signature declared above, and its JIT module stays alive through all calls.
     let address = jit_module.get_finalized_function(function);
-    let integer_repeat: IntegerRepeat = unsafe { std::mem::transmute(address) };
+    let compiled_program: CompiledIntegerProgram = unsafe { std::mem::transmute(address) };
 
-    let (object_path, object_bytes, object_compile_time) = emit_object()?;
+    let (object_path, object_bytes, object_compile_time) = emit_object(&integer_program)?;
     let mut interpreter_times = Vec::with_capacity(INTERPRETER_SAMPLES);
     let mut interpreter_checksum = None;
     for _ in 0..INTERPRETER_SAMPLES {
@@ -66,15 +71,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut native_checksum = None;
     for _ in 0..NATIVE_SAMPLES {
         let started = Instant::now();
-        let checksum = integer_repeat(
-            std::hint::black_box(B_INCREMENT),
-            std::hint::black_box(I_START),
-            std::hint::black_box(INNER_LIMIT),
-            std::hint::black_box(OUTER_LIMIT),
-        );
+        let checksum = std::hint::black_box(compiled_program());
         let elapsed = started.elapsed();
         if native_checksum.is_some_and(|previous| previous != checksum) {
-            return Err("JIT checksum varied between runs".into());
+            return Err("compiled checksum varied between runs".into());
         }
         native_checksum = Some(checksum);
         native_times.push(elapsed);
@@ -84,7 +84,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let native_checksum = native_checksum.expect("native samples configured");
     if interpreter_checksum != native_checksum {
         return Err(format!(
-            "interpreter/JIT checksum mismatch: {interpreter_checksum} vs {native_checksum}"
+            "interpreter/Cranelift checksum mismatch: {interpreter_checksum} vs {native_checksum}"
         )
         .into());
     }
@@ -94,29 +94,36 @@ fn main() -> Result<(), Box<dyn Error>> {
     let speedup = interpreter_median.as_secs_f64() / native_median.as_secs_f64();
 
     println!("target: {target}");
+    println!("source: examples/clocksp5/integer-repeat-jit.bas");
     println!(
-        "workload: ClockSP5 integer REPEAT section, B%={B_INCREMENT}, I%={I_START}, D%={INNER_LIMIT}, E%={OUTER_LIMIT}"
+        "lowered integer locals: {}, result PRINT at BASIC line {}",
+        integer_program.locals.len(),
+        integer_program.result_line
     );
-    println!("checksum: {interpreter_checksum} (interpreter and JIT agree)");
+    println!("checksum: {interpreter_checksum} (interpreter and Cranelift agree)");
     println!(
-        "JIT compile and finalize: {}",
+        "BASIC parse and typed-subset lowering: {}",
+        format_duration(basic_lowering_time)
+    );
+    println!(
+        "Cranelift JIT compile and finalize: {}",
         format_duration(jit_compile_time)
     );
     println!(
-        "AOT object compile: {}",
+        "Cranelift AOT object compile: {}",
         format_duration(object_compile_time)
     );
     println!(
-        "tokenized BASIC fixture median (parse + full loop): {}",
+        "tokenized BASIC fixture median (parse + execution): {}",
         format_duration(interpreter_median)
     );
     println!(
-        "Cranelift integer loop median: {}",
+        "Cranelift compiled function median: {}",
         format_duration(native_median)
     );
     println!("measured speedup: {speedup:.1}×");
     println!("object: {} ({} bytes)", object_path.display(), object_bytes);
-    println!("note: Cranelift IR is hand-built for this one ClockSP5 section.");
+    println!("note: BASIC PRINT is returned as the compiled function result for this benchmark.");
     Ok(())
 }
 
@@ -126,11 +133,11 @@ fn compiler_flags() -> Result<settings::Flags, Box<dyn Error>> {
     Ok(settings::Flags::new(builder))
 }
 
-fn define_integer_repeat<M: Module>(module: &mut M) -> Result<FuncId, Box<dyn Error>> {
+fn define_integer_program<M: Module>(
+    module: &mut M,
+    program: &IntegerProgram,
+) -> Result<FuncId, Box<dyn Error>> {
     let mut signature = module.make_signature();
-    for _ in 0..4 {
-        signature.params.push(AbiParam::new(types::I32));
-    }
     signature.returns.push(AbiParam::new(types::I32));
 
     let function =
@@ -144,72 +151,24 @@ fn define_integer_repeat<M: Module>(module: &mut M) -> Result<FuncId, Box<dyn Er
     {
         let mut builder = FunctionBuilder::new(&mut context.func, &mut builder_context);
         let entry = builder.create_block();
-        let outer_loop = builder.create_block();
-        let inner_loop = builder.create_block();
-        let inner_exit = builder.create_block();
-        let exit = builder.create_block();
-
-        builder.append_block_params_for_function_params(entry);
-        builder.append_block_param(outer_loop, types::I32);
-        builder.append_block_param(inner_loop, types::I32);
-        builder.append_block_param(inner_loop, types::I32);
-        builder.append_block_param(inner_exit, types::I32);
-        builder.append_block_param(inner_exit, types::I32);
-        builder.append_block_param(exit, types::I32);
-        builder.append_block_param(exit, types::I32);
-
         builder.switch_to_block(entry);
         builder.seal_block(entry);
-        let arguments = builder.block_params(entry).to_vec();
-        let (increment, inner_start, inner_limit, outer_limit) =
-            (arguments[0], arguments[1], arguments[2], arguments[3]);
-        let zero = builder.ins().iconst(types::I32, 0);
-        builder.ins().jump(outer_loop, &[zero.into()]);
 
-        builder.switch_to_block(outer_loop);
-        let outer_count = builder.block_params(outer_loop)[0];
-        let next_outer_count = builder.ins().iadd(outer_count, increment);
-        builder
-            .ins()
-            .jump(inner_loop, &[next_outer_count.into(), inner_start.into()]);
+        let locals = program
+            .locals
+            .iter()
+            .map(|_| builder.declare_var(types::I32))
+            .collect::<Vec<_>>();
+        for local in &locals {
+            let zero = builder.ins().iconst(types::I32, 0);
+            builder.def_var(*local, zero);
+        }
 
-        builder.switch_to_block(inner_loop);
-        let inner_state = builder.block_params(inner_loop).to_vec();
-        let outer_count = inner_state[0];
-        let inner_count = inner_state[1];
-        let next_inner_count = builder.ins().iadd(inner_count, increment);
-        let inner_done =
-            builder
-                .ins()
-                .icmp(IntCC::SignedGreaterThan, next_inner_count, inner_limit);
-        builder.ins().brif(
-            inner_done,
-            inner_exit,
-            &[outer_count.into(), next_inner_count.into()],
-            inner_loop,
-            &[outer_count.into(), next_inner_count.into()],
-        );
-
-        builder.switch_to_block(inner_exit);
-        let completed = builder.block_params(inner_exit).to_vec();
-        let outer_count = completed[0];
-        let inner_count = completed[1];
-        let outer_done = builder
-            .ins()
-            .icmp(IntCC::SignedGreaterThan, outer_count, outer_limit);
-        builder.ins().brif(
-            outer_done,
-            exit,
-            &[outer_count.into(), inner_count.into()],
-            outer_loop,
-            &[outer_count.into()],
-        );
-
-        builder.switch_to_block(exit);
+        lower_statements(&mut builder, &program.statements, &locals)?;
+        let result_variable = local_variable(&locals, program.result_local, program.result_line)?;
+        let result = builder.use_var(result_variable);
+        builder.ins().return_(&[result]);
         builder.seal_all_blocks();
-        let result_state = builder.block_params(exit).to_vec();
-        let checksum = builder.ins().iadd(result_state[0], result_state[1]);
-        builder.ins().return_(&[checksum]);
         builder.finalize(frontend_config);
     }
 
@@ -218,7 +177,100 @@ fn define_integer_repeat<M: Module>(module: &mut M) -> Result<FuncId, Box<dyn Er
     Ok(function)
 }
 
-fn emit_object() -> Result<(PathBuf, usize, Duration), Box<dyn Error>> {
+fn lower_statements(
+    builder: &mut FunctionBuilder<'_>,
+    statements: &[IntegerStatement],
+    locals: &[Variable],
+) -> Result<(), Box<dyn Error>> {
+    for statement in statements {
+        match statement {
+            IntegerStatement::Assign { line, local, value } => {
+                let variable = local_variable(locals, *local, *line)?;
+                let value = lower_expression(builder, value, locals)
+                    .map_err(|error| format!("BASIC line {line}: {error}"))?;
+                let value = narrow_to_basic_integer(builder, value);
+                builder.def_var(variable, value);
+            }
+            IntegerStatement::RepeatUntil {
+                line: _,
+                condition_line,
+                body,
+                condition,
+            } => {
+                let header = builder.create_block();
+                let exit = builder.create_block();
+                builder.ins().jump(header, &[]);
+                builder.switch_to_block(header);
+                lower_statements(builder, body, locals)?;
+                let condition = lower_condition(builder, condition, locals)
+                    .map_err(|error| format!("BASIC line {condition_line}: {error}"))?;
+                builder.ins().brif(condition, exit, &[], header, &[]);
+                builder.seal_block(header);
+                builder.seal_block(exit);
+                builder.switch_to_block(exit);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn lower_condition(
+    builder: &mut FunctionBuilder<'_>,
+    condition: &IntegerCondition,
+    locals: &[Variable],
+) -> Result<Value, Box<dyn Error>> {
+    match condition {
+        IntegerCondition::GreaterThan(left, right) => {
+            let left = lower_expression(builder, left, locals)?;
+            let right = lower_expression(builder, right, locals)?;
+            Ok(builder.ins().icmp(IntCC::SignedGreaterThan, left, right))
+        }
+    }
+}
+
+fn lower_expression(
+    builder: &mut FunctionBuilder<'_>,
+    expression: &IntegerExpression,
+    locals: &[Variable],
+) -> Result<Value, Box<dyn Error>> {
+    match expression {
+        IntegerExpression::Constant(value) => {
+            Ok(builder.ins().iconst(types::I64, i64::from(*value)))
+        }
+        IntegerExpression::Local(index) => {
+            let variable = local_variable(locals, *index, 0)?;
+            let value = builder.use_var(variable);
+            Ok(builder.ins().sextend(types::I64, value))
+        }
+        IntegerExpression::Add(left, right) => {
+            let left = lower_expression(builder, left, locals)?;
+            let right = lower_expression(builder, right, locals)?;
+            Ok(builder.ins().iadd(left, right))
+        }
+    }
+}
+
+fn narrow_to_basic_integer(builder: &mut FunctionBuilder<'_>, value: Value) -> Value {
+    // The interpreter converts to signed 32-bit when assigning a numeric
+    // result to a `%` variable. Keep expression arithmetic widened until that
+    // assignment boundary, then apply the interpreter's saturating conversion.
+    let minimum = builder.ins().iconst(types::I64, i64::from(i32::MIN));
+    let maximum = builder.ins().iconst(types::I64, i64::from(i32::MAX));
+    let below = builder.ins().icmp(IntCC::SignedLessThan, value, minimum);
+    let above = builder.ins().icmp(IntCC::SignedGreaterThan, value, maximum);
+    let clamped_low = builder.ins().select(below, minimum, value);
+    let clamped = builder.ins().select(above, maximum, clamped_low);
+    builder.ins().ireduce(types::I32, clamped)
+}
+
+fn local_variable(locals: &[Variable], index: u32, line: u16) -> Result<Variable, Box<dyn Error>> {
+    locals
+        .get(index as usize)
+        .copied()
+        .ok_or_else(|| format!("BASIC line {line}: invalid local index {index}").into())
+}
+
+fn emit_object(program: &IntegerProgram) -> Result<(PathBuf, usize, Duration), Box<dyn Error>> {
     let started = Instant::now();
     let isa_builder =
         cranelift_native::builder().map_err(|message| std::io::Error::other(message))?;
@@ -229,7 +281,7 @@ fn emit_object() -> Result<(PathBuf, usize, Duration), Box<dyn Error>> {
         default_libcall_names(),
     )?;
     let mut module = ObjectModule::new(object_builder);
-    define_integer_repeat(&mut module)?;
+    define_integer_program(&mut module, program)?;
     let product = module.finish();
     let bytes = product.object.write()?;
 

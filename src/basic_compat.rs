@@ -1,3 +1,6 @@
+#[doc(hidden)]
+pub mod compiler_api;
+
 mod parser;
 mod runtime;
 

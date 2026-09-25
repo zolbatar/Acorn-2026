@@ -362,6 +362,8 @@ Expand BBC BASIC V/VI source coverage and the stable SWI surface according to th
 
 Add a JIT behind the interpreter's established semantics and logical-memory interfaces. Preserve the interpreter as a debugging and reference path. Use representative BASIC64, classic BASIC compatibility, and desktop workloads to guide optimization, and evaluate clean-code analysis as a way to identify code suitable for JIT or, later, native compilation.
 
+An isolated feasibility prototype now parses a ClockSP5-derived ARM BASIC V fixture with the compatibility parser, lowers its integer assignments and nested `REPEAT`/`UNTIL` loops into a small backend-neutral typed IR, and maps that IR to Cranelift JIT and object code in `tools/basic-jit-bench`. The prototype returns the fixture's final integer `PRINT` value to the harness for interpreter comparison. It rejects unsupported syntax and does not compile the full ClockSP5 suite. This is evidence for one compiler path, not a decision about the production IR, compilation unit, runtime ABI, or AOT packaging.
+
 **Exit:** interpreted and compiled execution share observable behavior for BASIC64 and each implemented classic compatibility profile; compiled artifacts can be tied to the source, compatibility profile, target, and runtime dependencies they were built from.
 
 ### Phase 7 — Portability and broader hardware ambition

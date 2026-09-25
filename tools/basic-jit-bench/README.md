@@ -1,9 +1,10 @@
 # BASIC Cranelift feasibility benchmarks
 
 This isolated Cargo project benchmarks selected BASIC compatibility workloads
-against Cranelift-generated native kernels. The Cranelift IR is currently
-written by hand for each selected kernel; the BASIC parser and interpreter are
-not yet connected to a compiler.
+against Cranelift-generated native code. The ClockSP5 pass takes an AST from the
+hosted compatibility parser, lowers its supported integer subset into a small
+backend-neutral IR, and then lowers that IR into Cranelift. The Mandelbrot pass
+still uses hand-built Cranelift IR. Neither pass is a general BASIC compiler.
 
 The Cranelift version is pinned separately from the application so these
 experiments do not add compiler dependencies to the runtime build.
@@ -34,10 +35,19 @@ object under `target/basic-jit-bench/`.
 The ClockSP5 pass isolates the integer REPEAT loop from lines 120–123 of
 [`ClockSP5.bas`](../../examples/clocksp5/ClockSP5.bas). A project-authored
 fixture fixes the upper bounds so the same deterministic loop can run in the
-interpreter and in a Cranelift kernel. It preserves the nested increment and
-post-tested REPEAT/UNTIL behavior, then prints a checksum. This targets one
-section of the ClockSP5 suite; it does not compile the whole program or its
-other real, string, procedure, GOSUB, and trig/log sections.
+interpreter and in Cranelift. The compatibility parser produces a syntax AST;
+`basic_compat::compiler_api::lower_integer_program` converts that AST to a
+typed integer IR with source line numbers; the benchmark's Cranelift backend
+converts the IR to JIT code and an AOT object. It preserves the nested
+increment and post-tested REPEAT/UNTIL behavior, then returns the printed
+integer variable as the compiled function result for checksum comparison.
+This targets one section of the ClockSP5 suite; it does not compile the whole
+program or its other real, string, procedure, GOSUB, and trig/log sections.
+
+The prototype rejects unsupported statements and expressions explicitly. Its
+integer operations preserve the interpreter's signed 32-bit conversion at
+assignment boundaries, including saturation for addition results outside the
+signed range.
 
 Regenerate the fixture and run from the repository root:
 
