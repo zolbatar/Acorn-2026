@@ -1,9 +1,11 @@
+use std::sync::mpsc::{Receiver, Sender};
+
 use crate::{
     error::RuntimeError,
     graphics::GraphicsService,
     host::HostConsole,
     memory::{GUEST_MEMORY_BASE, Task},
-    swi::{OS_CLI, OS_READ_LINE, OS_WRITE_C, SwiContext, SwiDispatcher},
+    swi::{DisplayEvent, OS_CLI, OS_READ_LINE, OS_WRITE_C, SwiContext, SwiDispatcher},
 };
 
 const TASK_ID: u64 = 1;
@@ -20,6 +22,13 @@ impl Runtime {
         Self::new(HostConsole::stdio())
     }
 
+    pub fn windowed(input: Receiver<u8>, display_events: Sender<DisplayEvent>) -> Self {
+        Self {
+            task: Task::new(TASK_ID),
+            dispatcher: SwiDispatcher::windowed(HostConsole::windowed(input), display_events),
+        }
+    }
+
     pub fn new(console: HostConsole) -> Self {
         Self {
             task: Task::new(TASK_ID),
@@ -32,49 +41,51 @@ impl Runtime {
     }
 
     pub fn run(&mut self) -> Result<(), RuntimeError> {
+        self.write_prompt()?;
         loop {
-            let mut prompt = SwiContext::default();
-            prompt.registers[0] = u32::from(b'*');
-            self.dispatcher
-                .dispatch(OS_WRITE_C, &mut self.task, &mut prompt)?;
-            self.dispatcher.flush()?;
-
-            let mut input = SwiContext::default();
-            input.registers[0] = LINE_BUFFER;
-            input.registers[1] = LINE_BUFFER_SIZE - 1;
-            input.registers[2] = u32::from(b' ');
-            input.registers[3] = u32::from(b'~');
-
-            match self
-                .dispatcher
-                .dispatch(OS_READ_LINE, &mut self.task, &mut input)
-            {
+            match self.execute_console_line() {
                 Err(RuntimeError::EndOfInput) => return Ok(()),
                 Err(error) => return Err(error),
                 Ok(()) => {}
             }
 
-            if input.carry {
-                continue;
-            }
-
-            let length = input.registers[1];
-            if length == 0 {
-                continue;
-            }
-            let terminator = LINE_BUFFER
-                .checked_add(length)
-                .ok_or(crate::memory::MemoryError::AddressOverflow)?;
-            self.task.memory.write_byte(terminator, 0)?;
-
-            let mut command = SwiContext::default();
-            command.registers[0] = LINE_BUFFER;
-            self.dispatcher
-                .dispatch(OS_CLI, &mut self.task, &mut command)?;
             if self.dispatcher.quit_requested() {
                 return Ok(());
             }
+            self.write_prompt()?;
         }
+    }
+
+    fn write_prompt(&mut self) -> Result<(), RuntimeError> {
+        let mut prompt = SwiContext::default();
+        prompt.registers[0] = u32::from(b'*');
+        self.dispatcher
+            .dispatch(OS_WRITE_C, &mut self.task, &mut prompt)?;
+        self.dispatcher.flush()
+    }
+
+    fn execute_console_line(&mut self) -> Result<(), RuntimeError> {
+        let mut input = SwiContext::default();
+        input.registers[0] = LINE_BUFFER;
+        input.registers[1] = LINE_BUFFER_SIZE - 1;
+        input.registers[2] = u32::from(b' ');
+        input.registers[3] = u32::from(b'~');
+        self.dispatcher
+            .dispatch(OS_READ_LINE, &mut self.task, &mut input)?;
+
+        if input.carry || input.registers[1] == 0 {
+            return Ok(());
+        }
+
+        let terminator = LINE_BUFFER
+            .checked_add(input.registers[1])
+            .ok_or(crate::memory::MemoryError::AddressOverflow)?;
+        self.task.memory.write_byte(terminator, 0)?;
+
+        let mut command = SwiContext::default();
+        command.registers[0] = LINE_BUFFER;
+        self.dispatcher
+            .dispatch(OS_CLI, &mut self.task, &mut command)
     }
 
     pub fn report_error(&mut self, error: &RuntimeError) -> Result<(), RuntimeError> {

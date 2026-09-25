@@ -1,6 +1,7 @@
 use std::{
     io::{self, Read, Write},
     process::{Command, Stdio},
+    sync::mpsc::Receiver,
 };
 
 /// Host terminal access. Guest-visible input and output still pass through SWIs.
@@ -8,6 +9,7 @@ pub struct HostConsole {
     input: Box<dyn Read>,
     output: Box<dyn Write>,
     terminal_mode: TerminalMode,
+    window_input: Option<Receiver<u8>>,
 }
 
 impl HostConsole {
@@ -17,10 +19,26 @@ impl HostConsole {
             input: Box::new(io::stdin()),
             output: Box::new(io::stdout()),
             terminal_mode,
+            window_input: None,
+        }
+    }
+
+    /// In-window console. Input is queued by window events; guest line reads
+    /// still consume it through OS_ReadC and OS_ReadLine.
+    pub fn windowed(input: Receiver<u8>) -> Self {
+        Self {
+            input: Box::new(io::empty()),
+            output: Box::new(io::sink()),
+            terminal_mode: TerminalMode { original: None },
+            window_input: Some(input),
         }
     }
 
     pub fn read_byte(&mut self) -> io::Result<Option<u8>> {
+        if let Some(input) = &self.window_input {
+            return Ok(input.recv().ok());
+        }
+
         let mut byte = [0_u8; 1];
         match self.input.read(&mut byte)? {
             0 => Ok(None),
@@ -38,7 +56,7 @@ impl HostConsole {
 
     /// Raw terminal input needs software echo; a cooked terminal echoes itself.
     pub fn software_echo(&self) -> bool {
-        self.terminal_mode.enabled()
+        self.window_input.is_some() || self.terminal_mode.enabled()
     }
 }
 

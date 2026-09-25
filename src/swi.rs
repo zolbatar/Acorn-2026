@@ -4,6 +4,7 @@ use crate::{
     host::HostConsole,
     memory::{GUEST_MEMORY_BASE, Task},
 };
+use std::sync::mpsc::Sender;
 
 pub const OS_WRITE_C: u32 = 0x00;
 pub const OS_WRITE_S: u32 = 0x01;
@@ -13,6 +14,13 @@ pub const OS_READ_C: u32 = 0x04;
 pub const OS_CLI: u32 = 0x05;
 pub const OS_READ_LINE: u32 = 0x0E;
 pub const OS_PLOT: u32 = 0x45;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DisplayEvent {
+    WriteByte(u8),
+    Plot { code: u8, x: i32, y: i32 },
+    RuntimeExited,
+}
 
 const R0: usize = 0;
 const R1: usize = 1;
@@ -41,14 +49,27 @@ pub struct SwiDispatcher {
     console: HostConsole,
     graphics: GraphicsService,
     quit_requested: bool,
+    display_events: Option<Sender<DisplayEvent>>,
 }
 
 impl SwiDispatcher {
     pub fn new(console: HostConsole) -> Self {
+        Self::with_display_events(console, None)
+    }
+
+    pub fn windowed(console: HostConsole, display_events: Sender<DisplayEvent>) -> Self {
+        Self::with_display_events(console, Some(display_events))
+    }
+
+    fn with_display_events(
+        console: HostConsole,
+        display_events: Option<Sender<DisplayEvent>>,
+    ) -> Self {
         Self {
             console,
             graphics: GraphicsService::default(),
             quit_requested: false,
+            display_events,
         }
     }
 
@@ -68,7 +89,10 @@ impl SwiDispatcher {
     ) -> Result<(), RuntimeError> {
         match number {
             OS_WRITE_C => {
-                if let Some(byte) = self.graphics.write_byte(context.registers[R0] as u8)? {
+                let character = context.registers[R0] as u8;
+                let output_byte = self.graphics.write_byte(character)?;
+                self.publish_display_event(DisplayEvent::WriteByte(character));
+                if let Some(byte) = output_byte {
                     self.console.write_byte(byte)?;
                 }
                 self.console.flush().map_err(RuntimeError::from)
@@ -82,11 +106,14 @@ impl SwiDispatcher {
             OS_READ_C => self.read_character(context),
             OS_CLI => self.execute_cli(task, context),
             OS_READ_LINE => self.read_line(task, context),
-            OS_PLOT => self.graphics.plot(
-                context.registers[R0] as u8,
-                context.registers[R1] as i32,
-                context.registers[R2] as i32,
-            ),
+            OS_PLOT => {
+                let code = context.registers[R0] as u8;
+                let x = context.registers[R1] as i32;
+                let y = context.registers[R2] as i32;
+                self.graphics.plot(code, x, y)?;
+                self.publish_display_event(DisplayEvent::Plot { code, x, y });
+                Ok(())
+            }
             other => Err(RuntimeError::InvalidSwi(other)),
         }
     }
@@ -118,6 +145,12 @@ impl SwiDispatcher {
 
     pub fn flush(&mut self) -> Result<(), RuntimeError> {
         self.console.flush().map_err(RuntimeError::from)
+    }
+
+    pub fn publish_display_event(&self, event: DisplayEvent) {
+        if let Some(sender) = &self.display_events {
+            let _ = sender.send(event);
+        }
     }
 
     pub fn write_inline(&mut self, task: &mut Task, text: &[u8]) -> Result<(), RuntimeError> {

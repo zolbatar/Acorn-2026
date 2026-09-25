@@ -2,11 +2,11 @@
 
 ## Purpose
 
-Define a small, reviewable contract for the first hosted prototype: a Rust command line that reaches the MOS `*` prompt and accepts `HELP` and `QUIT`. BASIC64 is deferred until after this bring-up milestone. The long-term architecture in the design brief remains the project direction.
+Define a small, reviewable contract for the first hosted prototype: a Rust runtime that reaches the MOS `*` prompt and accepts `HELP` and `QUIT`. The initial implementation used a terminal command line; the default frontend has since advanced to a single graphics-capable window, while `cargo run -- --stdio` retains the original terminal adapter. BASIC64 was deferred until after the prompt bring-up milestone. The long-term architecture in the design brief remains the project direction.
 
 ## First milestone
 
-The hosted Rust executable starts one command task, shows `*`, reads a line through the MOS console SWI path, and sends the command through `OS_CLI`. The built-in commands are `HELP` and `QUIT`. `HELP` prints the command list through the output SWIs; `QUIT` ends the runtime without printing another prompt. An unrecognized command reports `Bad command` and returns to the prompt. End-of-input also exits the hosted process.
+The hosted Rust executable starts one command task, shows `*`, reads a line through `OS_ReadLine`, and sends the command through `OS_CLI`. The built-in commands are `HELP` and `QUIT`. `HELP` prints the command list through the output SWIs; `QUIT` ends the runtime without printing another prompt. An unrecognized command reports `Bad command` and returns to the prompt. End-of-input also exits the hosted process. In windowed mode keyboard input is captured by the window and visible output is rendered from the same SWI-driven display state.
 
 The user types `HELP` after the `*` prompt; the asterisk is the prompt marker and is not part of the command text.
 

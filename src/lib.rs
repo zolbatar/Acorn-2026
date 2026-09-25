@@ -5,6 +5,8 @@ pub mod font;
 pub mod graphics;
 pub mod host;
 pub mod memory;
+pub mod renderer;
 pub mod runtime;
 pub mod swi;
 pub mod tokenized_basic;
+pub mod window;

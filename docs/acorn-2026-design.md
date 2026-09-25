@@ -211,13 +211,17 @@ The needed ARM versions and edge cases (including 26-bit-era behavior) should be
 
 The Rust runtime should expose a modern drawing/composition service. The first hosted display uses one `winit` window and a `pixels` framebuffer so the MOS/BASIC text display and graphics share the same visible surface. This is the initial compatibility renderer; it does not constrain the later desktop composition service. BASIC graphics, Wimp-like controls, Filer content, and applications should converge on the same service.
 
+Window keyboard bytes feed the hosted console input source. The runtime reads them on its own thread through `OS_ReadC` and `OS_ReadLine`, while display events update the window's graphics scene. This allows a synchronous BASIC `INPUT` statement to wait for a line without stopping window event processing; visible text continues to use the normal SWI output path.
+
 ### First compatibility graphics slice
 
 The hosted compatibility path begins with a stateful VDU stream at `OS_WriteC` and the standard `OS_Plot` SWI (`&45`). `OS_WriteS`, `OS_Write0`, and `OS_NewLine` continue to reach the same byte stream through `OS_WriteC`. The stream parser retains partial VDU commands across calls, so the command byte and its parameters may arrive separately. The contracts follow the [RISC OS VDU driver](https://www.riscos.com/support/developers/prm/vdu.html) and [VDU code table](https://www.riscos.com/support/developers/prm/vducodes.html).
 
 The initial BASIC V/VI surface adds `MODE`, `VDU`, `LINE`, `MOVE`, `DRAW`, `PLOT`, `GCOL`, and `PRINT TAB(x,y)`. `MODE` and `VDU` send their control bytes through `OS_WriteC`; `LINE` and the related plot statements use `OS_Plot`. The hosted profile models BBC modes 0–7, logical coordinates, text and graphics windows, graphics origin and cursor, basic colour state, a text-cell surface, and retained line/point primitives. It handles VDU 12, 17, 18, 22, 24, 25, 26, 28, 29, 30, and 31, plus common text cursor controls. The BASIC syntax follows the [simple graphics](https://www.riscos.com/support/developers/bbcbasic/part2/simplegraphics.html), [complex graphics](https://www.riscos.com/support/developers/bbcbasic/part2/complexgraphics.html), and [VDU control](https://www.riscos.com/support/developers/bbcbasic/part2/vducontrol.html) chapters. Other VDU commands are not claimed as implemented merely because the stream parser consumes their documented parameter count.
 
-The scene is retained as logical commands for a host renderer; this slice does not rasterize to a fixed pixel buffer or open a graphics window. Connecting a renderer remains part of Phase 4. Legacy saved-file decoding remains shared, but execution semantics are selected by the compatibility profile. In particular, graphics support does not imply machine-code execution. `CALL` needs a separately selected processor compatibility service; no 6502 emulator is introduced by this graphics work.
+The retained scene is now rasterized into a 640×256 framebuffer and shown in the same `winit`/`pixels` window as MOS and BASIC output. The starter renderer draws the supplied BBC glyph bitmap plus retained points and lines, maps the logical graphics coordinates into the frame, clips drawing to the graphics window, and scales the result with nearest-neighbour pixels. `cargo run` opens the window; `cargo run -- --stdio` keeps the terminal host available for command-line use. The palette and raster-operation behavior are still a small hosted subset. Legacy saved-file decoding remains shared, but execution semantics are selected by the compatibility profile. Graphics support does not imply machine-code execution. `CALL` needs a separately selected processor compatibility service; no 6502 emulator is introduced by this graphics work.
+
+The first end-to-end display milestone accepts `HELP` and `QUIT` at the in-window MOS prompt and runs [`examples/graphics/text-and-pixels.bas`](../examples/graphics/text-and-pixels.bas) from its tokenised companion file. The program prints text and plots points on the same framebuffer. This is an initial compatibility display, not the completed desktop graphics service.
 
 The authentic TDU-01 file remains the working source for the common graphics slice and useful evidence for a real BBC Micro saved-program layout. Develop the language-level `MODE`, VDU, and drawing behavior it contains through the standard SWI services. TDU-01 itself is not a required release-compatibility or whole-program acceptance target: its procedure flow, direct memory operations, and machine-code routines extend beyond this slice. The compatibility corpus records this distinction in [`docs/tokenized-basic-compatibility.md`](tokenized-basic-compatibility.md).
 
@@ -314,7 +318,7 @@ Load BASIC64 modules through the shared namespace. Establish messaging, windows,
 
 ### Phase 4 — Graphics and typography
 
-Connect a host rendering backend to the retained graphics scene and text-cell surface established by the first compatibility slice. Add system text shaping, font fallback, measurement/layout, modern text, and a legacy compatibility profile. Keep text measurement and drawing on one coherent path.
+The first compatibility renderer is in place: one `winit` window backed by `pixels` renders the MOS prompt, BASIC text, and pixel/line primitives together. Next, improve palette and plot-action fidelity, display modes and pixel geometry, and program-driven screen updates. Add RISC OS native font loading, text shaping, font fallback, measurement/layout, and modern text. Keep text measurement and drawing on one coherent path.
 
 **Exit:** the desktop and BASIC64 programs use the same service for text and graphics, with profile behavior selectable per application.
 
@@ -350,12 +354,12 @@ Work through these in order; preserve open questions rather than silently conver
 8. **Task and module lifetime:** Are modules reentrant? How is module workspace allocated per call or per task? What happens to retained references when a task or module exits?
 9. **Address layout:** What logical ranges and alignment rules are visible in each personality? Which historical BASIC memory variables/operators must retain exact meaning?
 10. **ARM compatibility scope:** Which ARM ISA generations and legacy modes are required? Is an interpreter sufficient initially, and what semantics must a translator preserve for memory and SWIs?
-11. **Rendering backend:** Which host library best fits the first prototype's platforms, 2D drawing, text, and compositing needs? How will rendering and windowing remain replaceable?
+11. **Rendering backend — settled for the first hosted display:** use `winit` for one window and `pixels` for the compatibility framebuffer; keep the rendering boundary replaceable as the desktop composition service grows.
 12. **Text profiles:** Which legacy metrics and layout behaviors can be reproduced? How does an application declare a profile, and how are profile changes prevented from breaking measurement/painting consistency?
 13. **Desktop input:** How should Select/Menu/Adjust work on a trackpad or two-button mouse, and what accessibility remapping is needed?
 14. **Application bundles:** What is the directory layout and manifest format? How are file types, launch behavior, permissions, updates, and resource lookup described while keeping the bundle inspectable?
 15. **Trust boundary:** Which services are safe for every task, which require capabilities, and which components are trusted? How does BASIC64 system code receive privileges without giving every application access to system memory?
-16. **First host target:** The first prototype targets a hosted macOS terminal. Which additional host systems and runtime backends should follow? The initial end-to-end demonstration is the MOS `*` prompt with `HELP` and `QUIT`; broader demonstrations can add the BASIC64 REPL, file handling, graphics, and desktop components.
+16. **First host target:** The initial host is macOS with a single in-window display. `--stdio` retains the terminal adapter. Which additional host systems and runtime backends should follow?
 17. **Guest path syntax:** What is the complete RISC OS-style path grammar, including roots, parent/current-directory notation, device names, file-type metadata, and mapping to host paths?
 
 ## 13. Working principles

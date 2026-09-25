@@ -9,3 +9,5 @@ license = "MIT"
 [dependencies]
 pest = "2.8"
 pest_derive = "2.8"
+pixels = "0.15.0"
+winit = { version = "0.30.13", features = ["rwh_06"] }

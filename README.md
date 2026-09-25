@@ -6,7 +6,7 @@ Acorn-2026 is a design and implementation project for a modern, tinkerable compu
 
 ## Project status
 
-The hosted Rust MOS prompt milestone is verified: `HELP` displays help and returns to `*`, and `QUIT` exits. The first BASIC64 source slice runs `INPUT` and `PRINT` string variables from plain UTF-8 `.bas64` files using a pest grammar. `BASICLOAD` accepts two observed tokenized saved-program record layouts and preserves their token bytes. `BASICRUN` supports the string echo fixture, a narrow shared-boundary legacy core, and the ClockSP5 program-version-5.08 compatibility slice. ClockSP5 completes its benchmark sections and returns to `*`; this does not establish broad BASIC V/VI compatibility. See the [tokenized BASIC compatibility matrix](docs/tokenized-basic-compatibility.md) for evidence and gaps.
+The hosted Rust MOS prompt is available in one graphics-capable window: `HELP` displays help and returns to `*`, and `QUIT` exits. The initial display renders MOS/BASIC text and plotted points/lines together using the supplied BBC Micro bitmap font. The tokenised [`text-and-pixels` demo](examples/graphics) prints and plots on the same screen. The first BASIC64 source slice runs `INPUT` and `PRINT` string variables from plain UTF-8 `.bas64` files using a pest grammar. `BASICLOAD` accepts two observed tokenized saved-program record layouts and preserves their token bytes. `BASICRUN` supports the string echo fixture, a narrow shared-boundary legacy core, and the ClockSP5 program-version-5.08 compatibility slice. ClockSP5 completes its benchmark sections and returns to `*`; this does not establish broad BASIC V/VI compatibility. See the [tokenized BASIC compatibility matrix](docs/tokenized-basic-compatibility.md) for evidence and gaps.
 
 ## Start here
 
@@ -38,7 +38,18 @@ Open the repository root (the folder containing `Cargo.toml`) in RustRover, then
 cargo run
 ```
 
-At the `*` prompt, enter `HELP` to list the built-in commands. Enter `QUIT` to exit the runtime. End-of-input also exits the process.
+The app opens one window and displays the `*` prompt. Enter `HELP` to list the built-in commands. Enter `QUIT` to exit the runtime. Closing the window also exits.
+
+To keep using the terminal frontend, run `cargo run -- --stdio`.
+
+To see text and plotted pixels together, enter:
+
+```text
+BASICLOAD examples/graphics/text-and-pixels.bbc
+BASICRUN
+```
+
+The program selects MODE 1, prints two lines, and plots a red plus below the text. See [`examples/graphics`](examples/graphics) for source and fixture details.
 
 To run the string echo example, enter:
 
