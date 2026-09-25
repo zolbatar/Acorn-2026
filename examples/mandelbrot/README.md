@@ -1,0 +1,7 @@
+# Mandelbrot graphics example
+
+[`mandelbrot.bas`](mandelbrot.bas) is copied from the RISC OS 5.22 listing in [“Mandelbrot plotters for BBC BASIC”](https://barrowbiker.wordpress.com/2016/12/25/mandelbrot-plotters-for-bbc-basic/) on Barrowbiker's Blog, posted December 25, 2016. The post says it may work on earlier RISC OS versions and invites readers to use the code; it does not state a formal license. It is kept as a prospective BBC BASIC V/VI RISC OS graphics integration case, but has not been independently run or confirmed against a named interpreter release. This is readable text, not a tokenized file produced by a BBC BASIC `SAVE`.
+
+The program exercises extended `MODE` blocks, `SYS` calls to `ColourTrans`, HSV-to-RGB conversion, palette setup, integer and string memory buffers, per-pixel `MOVE`/`DRAW`, numeric functions, nested loops, and `INKEY(0)`. It asks for a 1680 × 1050 display and up to 8192 Mandelbrot iterations per pixel.
+
+It is not runnable end-to-end in the current hosted profile. The compatibility runner only supports a small common graphics statement subset, the hosted `MODE` path accepts numbered modes rather than this extended mode block, `ColourTrans` SWIs are not implemented, and graphics are retained as a scene without a host renderer. The full workload also visits 1,764,000 pixels, so it should be treated as a future rendering/performance case rather than routine CI input. A reduced-resolution, lower-iteration variant can be derived later for faster interpreter checks while this source remains intact.

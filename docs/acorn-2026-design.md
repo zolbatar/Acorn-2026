@@ -209,7 +209,7 @@ The needed ARM versions and edge cases (including 26-bit-era behavior) should be
 
 ## 8. Graphics and system-owned typography
 
-The Rust runtime should expose a modern drawing/composition service and use capable host rendering libraries rather than treating the display as a pixel array. The concrete library and host backends are implementation choices for a later prototype. BASIC graphics, Wimp-like controls, Filer content, and applications should converge on the same service.
+The Rust runtime should expose a modern drawing/composition service. The first hosted display uses one `winit` window and a `pixels` framebuffer so the MOS/BASIC text display and graphics share the same visible surface. This is the initial compatibility renderer; it does not constrain the later desktop composition service. BASIC graphics, Wimp-like controls, Filer content, and applications should converge on the same service.
 
 ### First compatibility graphics slice
 
@@ -220,6 +220,14 @@ The initial BASIC V/VI surface adds `MODE`, `VDU`, `LINE`, `MOVE`, `DRAW`, `PLOT
 The scene is retained as logical commands for a host renderer; this slice does not rasterize to a fixed pixel buffer or open a graphics window. Connecting a renderer remains part of Phase 4. Legacy saved-file decoding remains shared, but execution semantics are selected by the compatibility profile. In particular, graphics support does not imply machine-code execution. `CALL` needs a separately selected processor compatibility service; no 6502 emulator is introduced by this graphics work.
 
 The authentic TDU-01 file remains the working source for the common graphics slice and useful evidence for a real BBC Micro saved-program layout. Develop the language-level `MODE`, VDU, and drawing behavior it contains through the standard SWI services. TDU-01 itself is not a required release-compatibility or whole-program acceptance target: its procedure flow, direct memory operations, and machine-code routines extend beyond this slice. The compatibility corpus records this distinction in [`docs/tokenized-basic-compatibility.md`](tokenized-basic-compatibility.md).
+
+### Font sources and rendering
+
+The BBC Micro compatibility display uses the supplied 8x8 MOS character bitmap for character codes 32–127. Preserve these glyph bytes and draw them directly into the shared framebuffer for classic BBC text modes; this bitmap is distinct from the RISC OS desktop fonts. Codes below 32 remain VDU control characters, and handling of additional character sets can be added when a real program requires them. The table is available to the renderer in [`src/font.rs`](../src/font.rs).
+
+RISC OS system faces such as Corpus, Homerton, and Trinity use their native Font Manager resources as the authoritative assets: `IntMetrics`, `Outlines`, encoding data, and any supplied size-specific bitmap files. Read the native metrics and outlines, rasterize glyphs for the requested size, and cache the resulting bitmaps for drawing. This keeps the Acorn outlines and spacing while avoiding outline rasterization on every frame. Do not make TrueType/OpenType conversion a required asset-preparation step; generated derivatives may be used for interoperability or comparison, but are not the source of truth. The native RISC OS font files have not yet been added to this checkout.
+
+The two paths remain selectable by rendering profile: BBC compatibility text uses the fixed 8x8 bitmap; RISC OS system text uses Font Manager metrics and scalable outlines. Both are rendered into the same window and framebuffer as graphics.
 
 Text is a first-class graphics primitive alongside paths, images, surfaces, transforms, clipping, and paint. The system owns text shaping and measurement so applications do not each choose a separate text stack.
 

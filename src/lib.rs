@@ -1,6 +1,7 @@
 pub mod basic64;
 pub mod basic_compat;
 pub mod error;
+pub mod font;
 pub mod graphics;
 pub mod host;
 pub mod memory;

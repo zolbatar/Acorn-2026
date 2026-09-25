@@ -14,6 +14,7 @@ The hosted Rust MOS prompt milestone is verified: `HELP` displays help and retur
 - [`docs/phase-0-mos-prompt-plan.md`](docs/phase-0-mos-prompt-plan.md) — the saved Phase 0 prompt contract and initial SWI catalog.
 - [`docs/clocksp5-run-plan.md`](docs/clocksp5-run-plan.md) — implementation sequence and acceptance criteria for running the ClockSP5 fixture.
 - [`docs/tokenized-basic-compatibility.md`](docs/tokenized-basic-compatibility.md) — decoder, token-profile, and execution coverage by saved-program evidence.
+- [`examples/mandelbrot`](examples/mandelbrot) — prospective BBC BASIC V/VI graphics integration case; the current hosted profile cannot run it end-to-end yet.
 
 ## Current direction
 
