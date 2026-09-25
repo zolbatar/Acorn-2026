@@ -86,6 +86,20 @@ Treat clean as a property established by analysis or validation, not merely a pr
 
 This could give the JIT a conservative path first and make ahead-of-time or native compilation practical for a sufficiently analyzable subset later. It is especially relevant to the WIMP, Filer, and other OS components intended to be written in BASIC64: those components could stay inspectable and modifiable while their stable, clean portions receive acceleration. Any compiled path must preserve the same observable BASIC and service behavior as interpretation.
 
+### Compilation units and execution paths
+
+Keep BASIC64 source as the editable source of truth, and compile from a stable internal representation rather than directly from syntax to host instructions. A bytecode or other portable IR interpreter can remain the universal path and reference implementation. The same representation can feed a JIT and, later, an ahead-of-time (AOT) compiler; source locations and runtime checks should survive lowering for debugging, errors, interruption, and service calls.
+
+Separate the unit that is compiled from the unit used to package or cache it. A procedure or function is a useful first native compilation unit: cold or ineligible routines can stay interpreted while clean hot routines are compiled incrementally. A source file, BASIC64 module, or application bundle can be the build/cache unit, containing compiled routines plus dependency metadata. Keep `.bas64` source visible and editable; any native output should be a derived, target-specific artifact keyed by source and dependency hashes plus the compiler/runtime ABI, and should be rebuildable when stale. A bundle suits a closed application with resources and dependencies; a single source file is convenient when it is self-contained. Neither choice requires every routine in that file or bundle to compile.
+
+A practical progression is to establish one IR and interpreted behavior first, then add a hybrid JIT that compiles eligible procedures on demand or after they become hot, falling back to interpretation for unsupported operations. Consider AOT later for stable BASIC64 modules and bundled system components, where known dependencies can be built in advance and startup or repeated JIT cost matters. Keep calls to dynamic services and unresolved imports behind runtime dispatch unless the compiler can prove their targets stable. Native code must still execute as the task, use the caller-aware SWI boundary, and access guest memory through the runtime; native compilation does not grant host pointers or extra privileges.
+
+Cranelift is the preferred initial compiler backend because its Rust-embeddable integration is lighter. Keep the BASIC64 IR and compiler boundary backend-neutral, and validate Cranelift's compile latency, generated-code quality, target coverage, artifact support, and maintenance cost against real workloads. Reconsider [LLVM ORC](https://llvm.org/docs/ORCv2.html) only if those measurements or a required feature justify its larger integration.
+
+### BBC BASIC V procedure libraries
+
+BBC BASIC V's `LIBRARY` and `INSTALL` commands load separate saved BASIC programs that normally contain `PROC` and `FN` definitions. RISC OS BASIC V also has `OVERLAY` libraries, loaded on demand when a named procedure or function is called. Procedure lookup searches the main program first, then `LIBRARY` files (most recently loaded first), `INSTALL` files (in reverse load order), and finally the overlay list. These are name-searched procedure libraries rather than isolated modules with a declared ABI: resolution depends on the active library set, and library code may rely on the caller's BASIC variables and runtime state. The guide also warns that line-number references in a library refer to the main program, and recommends keeping library routines self-contained. Preserve these loading and lookup rules in the compatibility personality. They can still be compilation inputs: analyze and compile individual resolved definitions when eligible, while retaining runtime name resolution and invalidating compiled entries when the active definition or its dependencies change. Do not treat a library file's boundary as proof that all its routines are clean or statically closed. The [BASIC V procedures and libraries guide](https://www.riscos.com/support/developers/basicv/chap05.htm) describes the library model and its `LIBRARY`, `INSTALL`, and `OVERLAY` behavior.
+
 ### Possible additive language evolution
 
 The earlier language discussion explored features that could make BASIC64 feel like a modern continuation of BBC BASIC. These are options for Codex to evaluate, not a settled feature list. They must not silently change V/VI source semantics:
@@ -342,7 +356,7 @@ Expand BBC BASIC V/VI source coverage and the stable SWI surface according to th
 
 Add a JIT behind the interpreter's established semantics and logical-memory interfaces. Preserve the interpreter as a debugging and reference path. Use representative BASIC64 and desktop workloads to guide optimization, and evaluate clean-code analysis as a way to identify code suitable for JIT or, later, native compilation.
 
-**Exit:** interpreted and JIT execution share observable behavior for the supported language and service contracts.
+**Exit:** interpreted and compiled execution share observable behavior for the supported language and service contracts; compiled artifacts can be tied to the source and runtime dependencies they were built from.
 
 ### Phase 7 — Portability and broader hardware ambition
 
@@ -372,6 +386,7 @@ Work through these in order; preserve open questions rather than silently conver
 16. **First host target:** The initial host is macOS with a single in-window display. `--stdio` retains the terminal adapter. Which additional host systems and runtime backends should follow?
 17. **Guest path syntax:** What is the complete RISC OS-style path grammar, including roots, parent/current-directory notation, device names, file-type metadata, and mapping to host paths?
 18. **Clean-code eligibility:** Which operations and effects disqualify code from the clean subset, at what granularity is eligibility established, and how are dynamic calls or changed dependencies revalidated? Which BASIC64 system components are good initial workloads for this analysis?
+19. **Compilation units and artifacts:** Should the first native unit be a procedure, BASIC64 module, or whole file? Does the preferred Cranelift backend meet real JIT/AOT workload needs, and how should source, dependencies, runtime ABI, target, and BASIC V library lookup affect compilation and cache invalidation?
 
 ## 13. Working principles
 
