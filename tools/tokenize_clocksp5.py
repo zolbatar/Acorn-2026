@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Encode the ClockSP5 text fixture as an ARM BBC BASIC V saved program.
+"""Encode selected project text fixtures as ARM BBC BASIC V saved programs.
 
-This deliberately covers the tokens and source conventions used by this
-fixture. It is not a general BBC BASIC tokenizer or syntax checker.
+This deliberately covers only the tokens and source conventions used by the
+ClockSP5 and reduced Mandelbrot fixtures. It is not a general BBC BASIC
+tokenizer or syntax checker.
 """
 
 from __future__ import annotations
@@ -62,6 +63,9 @@ TOKENS = {
     "DIM": 0xE2,
     "SOUND": 0xD4,
     "CALL": 0xD6,
+    "GCOL": 0xE6,
+    "MODE": 0xEB,
+    "PLOT": 0xF0,
     "DATA": 0xDC,
     "DEF": 0xDD,
     "END": 0xE0,

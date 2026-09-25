@@ -32,7 +32,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         .name("acorn-window-events".into())
         .spawn(move || {
             while let Ok(event) = display_receiver.recv() {
-                let finished = event == DisplayEvent::RuntimeExited;
+                let finished = matches!(&event, DisplayEvent::RuntimeExited);
                 if proxy.send_event(WindowUserEvent::Display(event)).is_err() || finished {
                     break;
                 }
@@ -167,6 +167,9 @@ impl WindowApp {
                 if let Err(error) = self.graphics.plot(code, x, y) {
                     eprintln!("Acorn-2026 graphics state error: {error}");
                 }
+            }
+            DisplayEvent::GraphicsSnapshot(snapshot) => {
+                self.graphics.replace_snapshot(snapshot);
             }
             DisplayEvent::RuntimeExited => {
                 event_loop.exit();

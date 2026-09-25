@@ -208,6 +208,12 @@ impl GraphicsService {
         &self.snapshot
     }
 
+    /// Replace the visible scene with a snapshot produced by the runtime.
+    pub fn replace_snapshot(&mut self, snapshot: GraphicsSnapshot) {
+        self.snapshot = snapshot;
+        self.pending_vdu = None;
+    }
+
     fn apply_vdu(&mut self, command: u8, parameters: &[u8]) -> Result<Option<u8>, RuntimeError> {
         match command {
             1 => return Ok(None),

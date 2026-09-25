@@ -1,10 +1,15 @@
 use crate::{
     error::RuntimeError,
-    graphics::GraphicsService,
+    graphics::{GraphicsService, GraphicsSnapshot},
     host::HostConsole,
     memory::{GUEST_MEMORY_BASE, Task},
 };
-use std::sync::mpsc::Sender;
+use std::{
+    sync::mpsc::Sender,
+    time::{Duration, Instant},
+};
+
+const DISPLAY_BATCH_FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
 
 pub const OS_WRITE_C: u32 = 0x00;
 pub const OS_WRITE_S: u32 = 0x01;
@@ -15,10 +20,11 @@ pub const OS_CLI: u32 = 0x05;
 pub const OS_READ_LINE: u32 = 0x0E;
 pub const OS_PLOT: u32 = 0x45;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DisplayEvent {
     WriteByte(u8),
     Plot { code: u8, x: i32, y: i32 },
+    GraphicsSnapshot(GraphicsSnapshot),
     RuntimeExited,
 }
 
@@ -50,6 +56,8 @@ pub struct SwiDispatcher {
     graphics: GraphicsService,
     quit_requested: bool,
     display_events: Option<Sender<DisplayEvent>>,
+    display_batch_active: bool,
+    last_display_batch_publish: Option<Instant>,
 }
 
 impl SwiDispatcher {
@@ -70,6 +78,8 @@ impl SwiDispatcher {
             graphics: GraphicsService::default(),
             quit_requested: false,
             display_events,
+            display_batch_active: false,
+            last_display_batch_publish: None,
         }
     }
 
@@ -91,7 +101,9 @@ impl SwiDispatcher {
             OS_WRITE_C => {
                 let character = context.registers[R0] as u8;
                 let output_byte = self.graphics.write_byte(character)?;
-                self.publish_display_event(DisplayEvent::WriteByte(character));
+                if !self.display_batch_active || output_byte.is_some() {
+                    self.publish_display_event(DisplayEvent::WriteByte(character));
+                }
                 if let Some(byte) = output_byte {
                     self.console.write_byte(byte)?;
                 }
@@ -111,7 +123,11 @@ impl SwiDispatcher {
                 let x = context.registers[R1] as i32;
                 let y = context.registers[R2] as i32;
                 self.graphics.plot(code, x, y)?;
-                self.publish_display_event(DisplayEvent::Plot { code, x, y });
+                if self.display_batch_active {
+                    self.publish_display_batch_snapshot_if_due();
+                } else {
+                    self.publish_display_event(DisplayEvent::Plot { code, x, y });
+                }
                 Ok(())
             }
             other => Err(RuntimeError::InvalidSwi(other)),
@@ -151,6 +167,38 @@ impl SwiDispatcher {
         if let Some(sender) = &self.display_events {
             let _ = sender.send(event);
         }
+    }
+
+    pub(crate) fn begin_display_batch(&mut self) {
+        self.display_batch_active = true;
+        self.last_display_batch_publish = Some(Instant::now());
+    }
+
+    pub(crate) fn finish_display_batch(&mut self) {
+        if !self.display_batch_active {
+            return;
+        }
+        self.display_batch_active = false;
+        self.last_display_batch_publish = None;
+        if self.display_events.is_some() {
+            self.publish_display_event(DisplayEvent::GraphicsSnapshot(
+                self.graphics.snapshot().clone(),
+            ));
+        }
+    }
+
+    fn publish_display_batch_snapshot_if_due(&mut self) {
+        if self.display_events.is_none()
+            || !self
+                .last_display_batch_publish
+                .is_some_and(|last| last.elapsed() >= DISPLAY_BATCH_FRAME_INTERVAL)
+        {
+            return;
+        }
+
+        let snapshot = self.graphics.snapshot().clone();
+        self.publish_display_event(DisplayEvent::GraphicsSnapshot(snapshot));
+        self.last_display_batch_publish = Some(Instant::now());
     }
 
     pub fn write_inline(&mut self, task: &mut Task, text: &[u8]) -> Result<(), RuntimeError> {
@@ -414,7 +462,9 @@ impl SwiDispatcher {
                 )?;
                 return self.write_new_line(task);
             };
+            self.begin_display_batch();
             let result = crate::basic_compat::run_program(&program, task, self);
+            self.finish_display_batch();
             task.loaded_tokenized_program = Some(program);
             match result {
                 Ok(()) => Ok(()),

@@ -14,7 +14,7 @@ The hosted Rust MOS prompt is available in one graphics-capable window: `HELP` d
 - [`docs/phase-0-mos-prompt-plan.md`](docs/phase-0-mos-prompt-plan.md) — the saved Phase 0 prompt contract and initial SWI catalog.
 - [`docs/clocksp5-run-plan.md`](docs/clocksp5-run-plan.md) — implementation sequence and acceptance criteria for running the ClockSP5 fixture.
 - [`docs/tokenized-basic-compatibility.md`](docs/tokenized-basic-compatibility.md) — decoder, token-profile, and execution coverage by saved-program evidence.
-- [`examples/mandelbrot`](examples/mandelbrot) — prospective BBC BASIC V/VI graphics integration case; the current hosted profile cannot run it end-to-end yet.
+- [`examples/mandelbrot`](examples/mandelbrot) — reduced, tokenized Mandelbrot example for the hosted graphics path, alongside the original prospective BBC BASIC V/VI integration case.
 
 ## Current direction
 
@@ -52,6 +52,15 @@ BASICRUN
 ```
 
 The program selects MODE 1, prints two lines, and plots a red plus below the text. See [`examples/graphics`](examples/graphics) for source and fixture details.
+
+To run the reduced Mandelbrot in the windowed app, enter:
+
+```text
+BASICLOAD examples/mandelbrot/reduced.bbc
+BASICRUN
+```
+
+The 640 × 256 image appears progressively with display snapshots capped at about 60 Hz. See [`examples/mandelbrot`](examples/mandelbrot) for source, generation, and compatibility details.
 
 To run the string echo example, enter:
 
