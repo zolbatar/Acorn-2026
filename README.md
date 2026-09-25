@@ -6,7 +6,7 @@ Acorn-2026 is a design and implementation project for a modern, tinkerable compu
 
 ## Project status
 
-The hosted Rust MOS prompt milestone is verified: `HELP` displays help and returns to `*`, and `QUIT` exits. The first BASIC64 source slice runs `INPUT` and `PRINT` string variables from plain UTF-8 `.bas64` files using a pest grammar. `BASICLOAD` accepts two observed tokenized saved-program record layouts and preserves their token bytes. `BASICRUN` supports the string echo fixture and the ClockSP5 program-version-5.08 compatibility slice. ClockSP5 completes its benchmark sections and returns to `*`; this does not establish broad BASIC V/VI compatibility. See the [tokenized BASIC compatibility matrix](docs/tokenized-basic-compatibility.md) for evidence and gaps.
+The hosted Rust MOS prompt milestone is verified: `HELP` displays help and returns to `*`, and `QUIT` exits. The first BASIC64 source slice runs `INPUT` and `PRINT` string variables from plain UTF-8 `.bas64` files using a pest grammar. `BASICLOAD` accepts two observed tokenized saved-program record layouts and preserves their token bytes. `BASICRUN` supports the string echo fixture, a narrow shared-boundary legacy core, and the ClockSP5 program-version-5.08 compatibility slice. ClockSP5 completes its benchmark sections and returns to `*`; this does not establish broad BASIC V/VI compatibility. See the [tokenized BASIC compatibility matrix](docs/tokenized-basic-compatibility.md) for evidence and gaps.
 
 ## Start here
 
@@ -55,6 +55,15 @@ BASICRUN
 ```
 
 Type a line when the program shows `? `; it prints that line back and returns to the MOS prompt.
+
+To run the shared-boundary legacy smoke fixture, enter:
+
+```text
+BASICLOAD examples/tokenized-compat/classic-core-smoke.bbc
+BASICRUN
+```
+
+It prints `LEGACY` and returns to `*`. This project-generated fixture validates a deliberately small profile for leading `REM`, literal-string `PRINT`, and `END`; it is not a saved program from a named historical ROM.
 
 To run ClockSP5, enter:
 

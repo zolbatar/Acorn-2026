@@ -29,6 +29,14 @@ fn decodes_tokenized_compatibility_fixture_corpus() {
             first_line_bytes: Some(b"\xF4 >MTETRIZ15"),
         },
         Fixture {
+            name: "synthetic shared-boundary PRINT/END core fixture",
+            bytes: include_bytes!("../examples/tokenized-compat/classic-core-smoke.bbc"),
+            layout: TokenizedBasicRecordLayout::SharedBoundaryCarriageReturn,
+            lines: 2,
+            references: 0,
+            first_line_bytes: Some(b"\xF1 \"LEGACY\""),
+        },
+        Fixture {
             name: "ClockSP5 ARM BASIC V compatibility program",
             bytes: include_bytes!("../examples/clocksp5/ClockSP5.bbc"),
             layout: TokenizedBasicRecordLayout::SeparateLineCarriageReturn,

@@ -15,12 +15,15 @@ pub fn run_program(
     task: &mut Task,
     dispatcher: &mut SwiDispatcher,
 ) -> Result<(), RuntimeError> {
-    if program.record_layout == Some(TokenizedBasicRecordLayout::SharedBoundaryCarriageReturn) {
-        return Err(RuntimeError::Program(
-            "BASICRUN can load this saved-program layout, but execution currently supports the ARM BASIC V token profile only".into(),
-        ));
-    }
+    let profile = match program.record_layout {
+        Some(TokenizedBasicRecordLayout::SharedBoundaryCarriageReturn) => {
+            parser::TokenProfile::SharedBoundaryCore
+        }
+        Some(TokenizedBasicRecordLayout::SeparateLineCarriageReturn) | None => {
+            parser::TokenProfile::ArmBasicV
+        }
+    };
 
-    let parsed = parser::parse_program(program)?;
+    let parsed = parser::parse_program(program, profile)?;
     runtime::Interpreter::new(parsed).run(task, dispatcher)
 }

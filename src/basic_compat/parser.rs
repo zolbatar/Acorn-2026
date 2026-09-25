@@ -172,16 +172,32 @@ pub(crate) struct ParsedProgram {
     pub functions: std::collections::HashMap<String, usize>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TokenProfile {
+    /// Safe common subset for legacy files with shared-boundary records.
+    /// Exact BASIC ROM version is not inferred from the record layout.
+    SharedBoundaryCore,
+    /// Token assignments used by the project's ARM BASIC V fixtures.
+    ArmBasicV,
+}
+
 pub(crate) fn parse_program(
     program: &TokenizedBasicProgram,
+    profile: TokenProfile,
 ) -> Result<ParsedProgram, RuntimeError> {
     let mut parsed = ParsedProgram::default();
     for line in &program.lines {
+        if profile == TokenProfile::SharedBoundaryCore {
+            validate_shared_boundary_core(line)?;
+        }
         parsed
             .line_entries
             .insert(line.number, parsed.instructions.len());
         let statements = parse_line(line)?;
         for statement in statements {
+            if profile == TokenProfile::SharedBoundaryCore {
+                validate_shared_boundary_statement(&statement, line.number)?;
+            }
             let index = parsed.instructions.len();
             match &statement {
                 Statement::DefineProcedure(name) => {
@@ -199,6 +215,61 @@ pub(crate) fn parse_program(
         }
     }
     Ok(parsed)
+}
+
+fn validate_shared_boundary_statement(
+    statement: &Statement,
+    line_number: u16,
+) -> Result<(), RuntimeError> {
+    let supported = match statement {
+        Statement::End | Statement::NoOp => true,
+        Statement::Print(items) => items.iter().all(|item| {
+            matches!(
+                item,
+                PrintItem::Value(Expr::String(_)) | PrintItem::Semicolon | PrintItem::NewLine
+            )
+        }),
+        _ => false,
+    };
+    if supported {
+        Ok(())
+    } else {
+        Err(syntax_error(
+            line_number,
+            "only leading REM comments, literal-string PRINT and END statements are supported by the shared-boundary core",
+        ))
+    }
+}
+
+fn validate_shared_boundary_core(line: &TokenizedBasicLine) -> Result<(), RuntimeError> {
+    if line.bytes.first() == Some(&b'*') {
+        return Err(syntax_error(
+            line.number,
+            "MOS commands are outside the shared-boundary core subset",
+        ));
+    }
+    if line.bytes.first() == Some(&TOKEN_REM) {
+        return Ok(());
+    }
+
+    let mut quoted = false;
+    let mut offset = 0;
+    while let Some(&byte) = line.bytes.get(offset) {
+        if byte == b'"' {
+            if quoted && line.bytes.get(offset + 1) == Some(&b'"') {
+                offset += 2;
+                continue;
+            }
+            quoted = !quoted;
+        } else if !quoted && byte >= 0x7F && !matches!(byte, TOKEN_PRINT | TOKEN_END) {
+            return Err(syntax_error(
+                line.number,
+                &format!("token &{byte:02X} is outside the shared-boundary core subset"),
+            ));
+        }
+        offset += 1;
+    }
+    Ok(())
 }
 
 fn parse_line(line: &TokenizedBasicLine) -> Result<Vec<Statement>, RuntimeError> {
@@ -868,7 +939,7 @@ fn syntax_error(line_number: u16, message: &str) -> RuntimeError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Statement, parse_program};
+    use super::{Statement, TokenProfile, parse_program};
     use crate::tokenized_basic::TokenizedBasicProgram;
 
     #[test]
@@ -876,7 +947,8 @@ mod tests {
         let program =
             TokenizedBasicProgram::decode(include_bytes!("../../examples/clocksp5/ClockSP5.bbc"))
                 .expect("ClockSP5 fixture should decode");
-        let parsed = parse_program(&program).expect("ClockSP5 token stream should parse");
+        let parsed = parse_program(&program, TokenProfile::ArmBasicV)
+            .expect("ClockSP5 token stream should parse");
 
         assert_eq!(parsed.instructions.len(), 335);
         assert!(parsed.procedures.contains_key("S"));
@@ -887,6 +959,47 @@ mod tests {
                 .instructions
                 .iter()
                 .any(|instruction| { matches!(instruction.statement, Statement::Goto(60)) })
+        );
+    }
+
+    #[test]
+    fn parses_shared_boundary_print_end_core_fixture() {
+        let program = TokenizedBasicProgram::decode(include_bytes!(
+            "../../examples/tokenized-compat/classic-core-smoke.bbc"
+        ))
+        .expect("shared-boundary core fixture should decode");
+        let parsed = parse_program(&program, TokenProfile::SharedBoundaryCore)
+            .expect("common PRINT and END tokens should parse");
+
+        assert_eq!(parsed.instructions.len(), 2);
+        assert!(matches!(
+            parsed.instructions[0].statement,
+            Statement::Print(_)
+        ));
+        assert!(matches!(parsed.instructions[1].statement, Statement::End));
+    }
+
+    #[test]
+    fn shared_boundary_core_rejects_tokens_outside_its_subset() {
+        let bytes = [0x0D, 0x00, 0x0A, 0x05, 0xC7, 0x0D, 0xFF];
+        let program = TokenizedBasicProgram::decode(&bytes).expect("shared record should decode");
+
+        let error = parse_program(&program, TokenProfile::SharedBoundaryCore)
+            .expect_err("unsupported classic tokens must not be parsed as ARM BASIC V");
+        assert!(error.to_string().contains("token &C7"));
+    }
+
+    #[test]
+    fn shared_boundary_core_rejects_non_literal_statements() {
+        let bytes = [0x0D, 0x00, 0x0A, 0x07, b'A', b'=', b'1', 0x0D, 0xFF];
+        let program = TokenizedBasicProgram::decode(&bytes).expect("shared record should decode");
+
+        let error = parse_program(&program, TokenProfile::SharedBoundaryCore)
+            .expect_err("non-core statements must be rejected for now");
+        assert!(
+            error
+                .to_string()
+                .contains("literal-string PRINT and END statements")
         );
     }
 }
