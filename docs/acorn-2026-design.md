@@ -78,6 +78,14 @@ BASIC64 is the system's native language; earlier BASIC syntax defines compatibil
 
 The runtime is written in Rust. Start with an interpreter because it makes the language semantics, memory model, and debugger approachable. Add a JIT later without changing program-visible behavior. Any future compilation strategy should target a stable internal representation and keep the REPL and interpreted path useful.
 
+### Clean BASIC64 and optimization eligibility
+
+Consider a future “clean” classification for BASIC64 code that the compiler can analyze and optimize with fewer unknown effects. Clean code would use managed BASIC values and memory, avoid arbitrary address-based reads and writes, and not modify its own executable code. Other checks may exclude inline assembler, dynamic code generation, or calls whose memory and control-flow effects cannot be described. Ordinary variables, arrays, procedures, and services with known contracts can remain eligible.
+
+Treat clean as a property established by analysis or validation, not merely a promise in a source annotation. The useful unit—procedure, module, or whole program—and the handling of dynamic calls and dependencies remain open. An unknown or disqualifying operation can keep the affected code interpreted, or require an explicit runtime boundary; it must not silently make unsafe assumptions in compiled code. A clean classification indicates optimization eligibility, not trust or isolation: logical addresses, SWI caller context, and runtime protection rules still apply.
+
+This could give the JIT a conservative path first and make ahead-of-time or native compilation practical for a sufficiently analyzable subset later. It is especially relevant to the WIMP, Filer, and other OS components intended to be written in BASIC64: those components could stay inspectable and modifiable while their stable, clean portions receive acceleration. Any compiled path must preserve the same observable BASIC and service behavior as interpretation.
+
 ### Possible additive language evolution
 
 The earlier language discussion explored features that could make BASIC64 feel like a modern continuation of BBC BASIC. These are options for Codex to evaluate, not a settled feature list. They must not silently change V/VI source semantics:
@@ -332,7 +340,7 @@ Expand BBC BASIC V/VI source coverage and the stable SWI surface according to th
 
 ### Phase 6 — JIT and performance
 
-Add a JIT behind the interpreter's established semantics and logical-memory interfaces. Preserve the interpreter as a debugging and reference path. Optimize only after representative BASIC64 and desktop workloads are known.
+Add a JIT behind the interpreter's established semantics and logical-memory interfaces. Preserve the interpreter as a debugging and reference path. Use representative BASIC64 and desktop workloads to guide optimization, and evaluate clean-code analysis as a way to identify code suitable for JIT or, later, native compilation.
 
 **Exit:** interpreted and JIT execution share observable behavior for the supported language and service contracts.
 
@@ -363,6 +371,7 @@ Work through these in order; preserve open questions rather than silently conver
 15. **Trust boundary:** Which services are safe for every task, which require capabilities, and which components are trusted? How does BASIC64 system code receive privileges without giving every application access to system memory?
 16. **First host target:** The initial host is macOS with a single in-window display. `--stdio` retains the terminal adapter. Which additional host systems and runtime backends should follow?
 17. **Guest path syntax:** What is the complete RISC OS-style path grammar, including roots, parent/current-directory notation, device names, file-type metadata, and mapping to host paths?
+18. **Clean-code eligibility:** Which operations and effects disqualify code from the clean subset, at what granularity is eligibility established, and how are dynamic calls or changed dependencies revalidated? Which BASIC64 system components are good initial workloads for this analysis?
 
 ## 13. Working principles
 
