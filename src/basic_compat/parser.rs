@@ -9,7 +9,9 @@ const TOKEN_AND: u8 = 0x80;
 const TOKEN_DIV: u8 = 0x81;
 const TOKEN_MOD: u8 = 0x83;
 const TOKEN_OR: u8 = 0x84;
+const TOKEN_LINE: u8 = 0x86;
 const TOKEN_SPC: u8 = 0x89;
+const TOKEN_TAB: u8 = 0x8A;
 const TOKEN_THEN: u8 = 0x8C;
 const TOKEN_ELSE: u8 = 0x8B;
 const TOKEN_STEP: u8 = 0x88;
@@ -36,6 +38,7 @@ const TOKEN_RIGHT: u8 = 0xC2;
 const TOKEN_STR: u8 = 0xC3;
 const TOKEN_STRING: u8 = 0xC4;
 const TOKEN_CALL: u8 = 0xD6;
+const TOKEN_DRAW: u8 = 0xDF;
 const TOKEN_DATA: u8 = 0xDC;
 const TOKEN_DEF: u8 = 0xDD;
 const TOKEN_END: u8 = 0xE0;
@@ -46,15 +49,20 @@ const TOKEN_GOSUB: u8 = 0xE4;
 const TOKEN_GOTO: u8 = 0xE5;
 const TOKEN_IF: u8 = 0xE7;
 const TOKEN_INPUT: u8 = 0xE8;
+const TOKEN_GCOL: u8 = 0xE6;
+const TOKEN_MOVE: u8 = 0xEC;
+const TOKEN_MODE: u8 = 0xEB;
 const TOKEN_NEXT: u8 = 0xED;
 const TOKEN_PRINT: u8 = 0xF1;
 const TOKEN_PROC: u8 = 0xF2;
+const TOKEN_PLOT: u8 = 0xF0;
 const TOKEN_READ: u8 = 0xF3;
 const TOKEN_REM: u8 = 0xF4;
 const TOKEN_REPEAT: u8 = 0xF5;
 const TOKEN_RESTORE: u8 = 0xF7;
 const TOKEN_RETURN: u8 = 0xF8;
 const TOKEN_UNTIL: u8 = 0xFD;
+const TOKEN_VDU: u8 = 0xEF;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Expr {
@@ -113,9 +121,23 @@ pub(crate) enum LValue {
 pub(crate) enum PrintItem {
     Value(Expr),
     Spaces(Expr),
+    Tab(Expr, Expr),
     Comma,
     Semicolon,
     NewLine,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VduFormat {
+    Byte,
+    Word,
+    Padded,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct VduArgument {
+    pub value: Expr,
+    pub format: VduFormat,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -130,6 +152,13 @@ pub(crate) enum Statement {
     Assign(LValue, Expr),
     Input(LValue),
     Print(Vec<PrintItem>),
+    Mode(Expr),
+    Vdu(Vec<VduArgument>),
+    Line(Expr, Expr, Expr, Expr),
+    Move(Expr, Expr),
+    Draw(Expr, Expr),
+    Plot(Expr, Expr, Expr),
+    Gcol(Expr, Expr),
     If(Expr, Vec<Statement>, Vec<Statement>),
     Goto(u16),
     Gosub(u16),
@@ -227,8 +256,26 @@ fn validate_shared_boundary_statement(
             matches!(
                 item,
                 PrintItem::Value(Expr::String(_)) | PrintItem::Semicolon | PrintItem::NewLine
-            )
+            ) || matches!(item, PrintItem::Tab(x, y) if shared_expression_supported(x) && shared_expression_supported(y))
         }),
+        Statement::Mode(mode) => shared_expression_supported(mode),
+        Statement::Vdu(arguments) => arguments
+            .iter()
+            .all(|argument| shared_expression_supported(&argument.value)),
+        Statement::Line(x1, y1, x2, y2) => [x1, y1, x2, y2]
+            .into_iter()
+            .all(shared_expression_supported),
+        Statement::Move(x, y) | Statement::Draw(x, y) => {
+            shared_expression_supported(x) && shared_expression_supported(y)
+        }
+        Statement::Plot(code, x, y) => {
+            shared_expression_supported(code)
+                && shared_expression_supported(x)
+                && shared_expression_supported(y)
+        }
+        Statement::Gcol(action, colour) => {
+            shared_expression_supported(action) && shared_expression_supported(colour)
+        }
         _ => false,
     };
     if supported {
@@ -236,8 +283,19 @@ fn validate_shared_boundary_statement(
     } else {
         Err(syntax_error(
             line_number,
-            "only leading REM comments, literal-string PRINT and END statements are supported by the shared-boundary core",
+            "only leading REM comments, literal-string PRINT and END statements, plus simple graphics statements are supported by the shared-boundary core",
         ))
+    }
+}
+
+fn shared_expression_supported(expression: &Expr) -> bool {
+    match expression {
+        Expr::Number(_) | Expr::Variable(_) => true,
+        Expr::Unary(_, operand) => shared_expression_supported(operand),
+        Expr::Binary(left, _, right) => {
+            shared_expression_supported(left) && shared_expression_supported(right)
+        }
+        _ => false,
     }
 }
 
@@ -261,7 +319,22 @@ fn validate_shared_boundary_core(line: &TokenizedBasicLine) -> Result<(), Runtim
                 continue;
             }
             quoted = !quoted;
-        } else if !quoted && byte >= 0x7F && !matches!(byte, TOKEN_PRINT | TOKEN_END) {
+        } else if !quoted
+            && byte >= 0x7F
+            && !matches!(
+                byte,
+                TOKEN_PRINT
+                    | TOKEN_END
+                    | TOKEN_MODE
+                    | TOKEN_VDU
+                    | TOKEN_LINE
+                    | TOKEN_MOVE
+                    | TOKEN_DRAW
+                    | TOKEN_PLOT
+                    | TOKEN_GCOL
+                    | TOKEN_TAB
+            )
+        {
             return Err(syntax_error(
                 line.number,
                 &format!("token &{byte:02X} is outside the shared-boundary core subset"),
@@ -474,6 +547,13 @@ impl Parser {
         match token {
             Token::Keyword(TOKEN_IF) => self.parse_if(),
             Token::Keyword(TOKEN_PRINT) => self.parse_print(),
+            Token::Keyword(TOKEN_MODE) => Ok(Statement::Mode(self.parse_expression(0)?)),
+            Token::Keyword(TOKEN_VDU) => self.parse_vdu(),
+            Token::Keyword(TOKEN_LINE) => self.parse_line_statement(),
+            Token::Keyword(TOKEN_MOVE) => self.parse_move_statement(false),
+            Token::Keyword(TOKEN_DRAW) => self.parse_move_statement(true),
+            Token::Keyword(TOKEN_PLOT) => self.parse_plot_statement(),
+            Token::Keyword(TOKEN_GCOL) => self.parse_gcol_statement(),
             Token::Keyword(TOKEN_INPUT) => Ok(Statement::Input(self.parse_lvalue()?)),
             Token::Keyword(TOKEN_GOTO) => {
                 Ok(Statement::Goto(self.expect_line_reference("GOTO target")?))
@@ -578,11 +658,81 @@ impl Parser {
                 items.push(PrintItem::NewLine);
             } else if self.consume_keyword(TOKEN_SPC) {
                 items.push(PrintItem::Spaces(self.parse_expression(0)?));
+            } else if self.consume_keyword(TOKEN_TAB) {
+                self.expect_symbol(b'(')?;
+                let x = self.parse_expression(0)?;
+                self.expect_symbol(b',')?;
+                let y = self.parse_expression(0)?;
+                self.expect_symbol(b')')?;
+                items.push(PrintItem::Tab(x, y));
             } else {
                 items.push(PrintItem::Value(self.parse_expression(0)?));
             }
         }
         Ok(Statement::Print(items))
+    }
+
+    fn parse_vdu(&mut self) -> Result<Statement, RuntimeError> {
+        let mut arguments = Vec::new();
+        while !self.is_end() && !self.peek_symbol(b':') && !self.peek_keyword(TOKEN_ELSE) {
+            let value = self.parse_expression(0)?;
+            let (format, more_arguments) = if self.consume_symbol(b';') {
+                (VduFormat::Word, true)
+            } else if self.consume_symbol(b'|') {
+                (VduFormat::Padded, true)
+            } else if self.consume_symbol(b',') {
+                (VduFormat::Byte, true)
+            } else {
+                (VduFormat::Byte, false)
+            };
+            arguments.push(VduArgument { value, format });
+            if !more_arguments {
+                break;
+            }
+            self.consume_symbol(b',');
+        }
+        if arguments.is_empty() {
+            return self.error("VDU requires at least one argument");
+        }
+        Ok(Statement::Vdu(arguments))
+    }
+
+    fn parse_line_statement(&mut self) -> Result<Statement, RuntimeError> {
+        let x1 = self.parse_expression(0)?;
+        self.expect_symbol(b',')?;
+        let y1 = self.parse_expression(0)?;
+        self.expect_symbol(b',')?;
+        let x2 = self.parse_expression(0)?;
+        self.expect_symbol(b',')?;
+        let y2 = self.parse_expression(0)?;
+        Ok(Statement::Line(x1, y1, x2, y2))
+    }
+
+    fn parse_move_statement(&mut self, draw: bool) -> Result<Statement, RuntimeError> {
+        let x = self.parse_expression(0)?;
+        self.expect_symbol(b',')?;
+        let y = self.parse_expression(0)?;
+        Ok(if draw {
+            Statement::Draw(x, y)
+        } else {
+            Statement::Move(x, y)
+        })
+    }
+
+    fn parse_plot_statement(&mut self) -> Result<Statement, RuntimeError> {
+        let code = self.parse_expression(0)?;
+        self.expect_symbol(b',')?;
+        let x = self.parse_expression(0)?;
+        self.expect_symbol(b',')?;
+        let y = self.parse_expression(0)?;
+        Ok(Statement::Plot(code, x, y))
+    }
+
+    fn parse_gcol_statement(&mut self) -> Result<Statement, RuntimeError> {
+        let action = self.parse_expression(0)?;
+        self.expect_symbol(b',')?;
+        let colour = self.parse_expression(0)?;
+        Ok(Statement::Gcol(action, colour))
     }
 
     fn parse_dim(&mut self) -> Result<Statement, RuntimeError> {

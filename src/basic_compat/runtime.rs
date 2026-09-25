@@ -8,7 +8,7 @@ use crate::{
 
 use super::parser::{
     BinaryOp, DimDeclaration, Expr, LValue, MemoryWidth, ParsedProgram, PrintItem, Statement,
-    UnaryOp,
+    UnaryOp, VduFormat,
 };
 
 const INPUT_BUFFER: u32 = GUEST_MEMORY_BASE + 0x3000;
@@ -168,6 +168,83 @@ impl Interpreter {
                 self.print(items, line, task, dispatcher)?;
                 Ok(Flow::Next)
             }
+            Statement::Mode(expression) => {
+                let mode = self.evaluate(expression, line, task)?.number(line)?.trunc() as u8;
+                dispatcher.write_via_os_write_c(task, &[22, mode])?;
+                Ok(Flow::Next)
+            }
+            Statement::Vdu(arguments) => {
+                let mut bytes = Vec::new();
+                for argument in arguments {
+                    let value = self
+                        .evaluate(&argument.value, line, task)?
+                        .number(line)?
+                        .trunc() as i64;
+                    match argument.format {
+                        VduFormat::Byte => bytes.push(value as u8),
+                        VduFormat::Word => bytes.extend_from_slice(&(value as u16).to_le_bytes()),
+                        VduFormat::Padded => {
+                            bytes.push(value as u8);
+                            bytes.extend_from_slice(&[0; 9]);
+                        }
+                    }
+                }
+                dispatcher.write_via_os_write_c(task, &bytes)?;
+                Ok(Flow::Next)
+            }
+            Statement::Line(x1, y1, x2, y2) => {
+                let x1 = self.evaluate(x1, line, task)?.number(line)?;
+                let y1 = self.evaluate(y1, line, task)?.number(line)?;
+                let x2 = self.evaluate(x2, line, task)?.number(line)?;
+                let y2 = self.evaluate(y2, line, task)?.number(line)?;
+                dispatcher.plot(
+                    task,
+                    4,
+                    graphics_coordinate(x1, line)?,
+                    graphics_coordinate(y1, line)?,
+                )?;
+                dispatcher.plot(
+                    task,
+                    5,
+                    graphics_coordinate(x2, line)?,
+                    graphics_coordinate(y2, line)?,
+                )?;
+                Ok(Flow::Next)
+            }
+            Statement::Move(x, y) | Statement::Draw(x, y) => {
+                let plot_code = if matches!(statement, Statement::Move(_, _)) {
+                    4
+                } else {
+                    5
+                };
+                let x = self.evaluate(x, line, task)?.number(line)?;
+                let y = self.evaluate(y, line, task)?.number(line)?;
+                dispatcher.plot(
+                    task,
+                    plot_code,
+                    graphics_coordinate(x, line)?,
+                    graphics_coordinate(y, line)?,
+                )?;
+                Ok(Flow::Next)
+            }
+            Statement::Plot(code, x, y) => {
+                let code = self.evaluate(code, line, task)?.number(line)?.trunc() as u8;
+                let x = self.evaluate(x, line, task)?.number(line)?;
+                let y = self.evaluate(y, line, task)?.number(line)?;
+                dispatcher.plot(
+                    task,
+                    code,
+                    graphics_coordinate(x, line)?,
+                    graphics_coordinate(y, line)?,
+                )?;
+                Ok(Flow::Next)
+            }
+            Statement::Gcol(action, colour) => {
+                let action = self.evaluate(action, line, task)?.number(line)?.trunc() as u8;
+                let colour = self.evaluate(colour, line, task)?.number(line)?.trunc() as u8;
+                dispatcher.write_via_os_write_c(task, &[18, action, colour])?;
+                Ok(Flow::Next)
+            }
             Statement::If(condition, then_body, else_body) => {
                 let selected = if self.evaluate(condition, line, task)?.number(line)? != 0.0 {
                     then_body
@@ -261,7 +338,7 @@ impl Interpreter {
             Statement::End => Ok(Flow::Stop),
             Statement::Call(_) => Err(program_error(
                 line,
-                "CALL requires an ARM compatibility service not available in the hosted profile",
+                "machine-code CALL requires a matching processor compatibility service not available in the hosted profile",
             )),
             Statement::StarCommand(command) => {
                 self.execute_star_command(command, line)?;
@@ -848,6 +925,12 @@ impl Interpreter {
                     let count = bounded_string_length(count, line)?;
                     self.emit(&vec![b' '; count], task, dispatcher)?;
                 }
+                PrintItem::Tab(x, y) => {
+                    let x = self.evaluate(x, line, task)?.number(line)?.trunc() as u8;
+                    let y = self.evaluate(y, line, task)?.number(line)?.trunc() as u8;
+                    dispatcher.write_via_os_write_c(task, &[31, x, y])?;
+                    self.print_column = usize::from(x);
+                }
                 PrintItem::Comma => {
                     let remainder = self.print_column % PRINT_ZONE_WIDTH;
                     let count = PRINT_ZONE_WIDTH - remainder;
@@ -987,6 +1070,17 @@ fn bounded_string_length(number: f64, line: u16) -> Result<usize, RuntimeError> 
         ));
     }
     Ok(number.trunc() as usize)
+}
+
+fn graphics_coordinate(number: f64, line: u16) -> Result<i32, RuntimeError> {
+    let coordinate = number.trunc();
+    if !(i16::MIN as f64..=i16::MAX as f64).contains(&coordinate) {
+        return Err(program_error(
+            line,
+            "graphics coordinate is outside the signed 16-bit range",
+        ));
+    }
+    Ok(coordinate as i32)
 }
 
 fn value_to_bytes(value: Value) -> Vec<u8> {

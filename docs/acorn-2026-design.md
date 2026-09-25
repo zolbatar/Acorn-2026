@@ -211,6 +211,16 @@ The needed ARM versions and edge cases (including 26-bit-era behavior) should be
 
 The Rust runtime should expose a modern drawing/composition service and use capable host rendering libraries rather than treating the display as a pixel array. The concrete library and host backends are implementation choices for a later prototype. BASIC graphics, Wimp-like controls, Filer content, and applications should converge on the same service.
 
+### First compatibility graphics slice
+
+The hosted compatibility path begins with a stateful VDU stream at `OS_WriteC` and the standard `OS_Plot` SWI (`&45`). `OS_WriteS`, `OS_Write0`, and `OS_NewLine` continue to reach the same byte stream through `OS_WriteC`. The stream parser retains partial VDU commands across calls, so the command byte and its parameters may arrive separately. The contracts follow the [RISC OS VDU driver](https://www.riscos.com/support/developers/prm/vdu.html) and [VDU code table](https://www.riscos.com/support/developers/prm/vducodes.html).
+
+The initial BASIC V/VI surface adds `MODE`, `VDU`, `LINE`, `MOVE`, `DRAW`, `PLOT`, `GCOL`, and `PRINT TAB(x,y)`. `MODE` and `VDU` send their control bytes through `OS_WriteC`; `LINE` and the related plot statements use `OS_Plot`. The hosted profile models BBC modes 0–7, logical coordinates, text and graphics windows, graphics origin and cursor, basic colour state, a text-cell surface, and retained line/point primitives. It handles VDU 12, 17, 18, 22, 24, 25, 26, 28, 29, 30, and 31, plus common text cursor controls. The BASIC syntax follows the [simple graphics](https://www.riscos.com/support/developers/bbcbasic/part2/simplegraphics.html), [complex graphics](https://www.riscos.com/support/developers/bbcbasic/part2/complexgraphics.html), and [VDU control](https://www.riscos.com/support/developers/bbcbasic/part2/vducontrol.html) chapters. Other VDU commands are not claimed as implemented merely because the stream parser consumes their documented parameter count.
+
+The scene is retained as logical commands for a host renderer; this slice does not rasterize to a fixed pixel buffer or open a graphics window. Connecting a renderer remains part of Phase 4. Legacy saved-file decoding remains shared, but execution semantics are selected by the compatibility profile. In particular, graphics support does not imply machine-code execution. `CALL` needs a separately selected processor compatibility service; no 6502 emulator is introduced by this graphics work.
+
+The authentic TDU-01 file remains useful for verifying a real BBC Micro saved-program layout and the common graphics statements it contains. It is not the graphics execution acceptance program: its remaining procedure flow, direct memory operations, and BBC Micro machine-code routines exceed this language/service slice.
+
 Text is a first-class graphics primitive alongside paths, images, surfaces, transforms, clipping, and paint. The system owns text shaping and measurement so applications do not each choose a separate text stack.
 
 ```text
@@ -296,7 +306,7 @@ Load BASIC64 modules through the shared namespace. Establish messaging, windows,
 
 ### Phase 4 — Graphics and typography
 
-Connect a host rendering backend to shared graphics primitives. Add system text shaping, font fallback, measurement/layout, modern text, and a legacy compatibility profile. Keep text measurement and drawing on one coherent path.
+Connect a host rendering backend to the retained graphics scene and text-cell surface established by the first compatibility slice. Add system text shaping, font fallback, measurement/layout, modern text, and a legacy compatibility profile. Keep text measurement and drawing on one coherent path.
 
 **Exit:** the desktop and BASIC64 programs use the same service for text and graphics, with profile behavior selectable per application.
 

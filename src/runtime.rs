@@ -1,5 +1,6 @@
 use crate::{
     error::RuntimeError,
+    graphics::GraphicsService,
     host::HostConsole,
     memory::{GUEST_MEMORY_BASE, Task},
     swi::{OS_CLI, OS_READ_LINE, OS_WRITE_C, SwiContext, SwiDispatcher},
@@ -24,6 +25,10 @@ impl Runtime {
             task: Task::new(TASK_ID),
             dispatcher: SwiDispatcher::new(console),
         }
+    }
+
+    pub fn graphics(&self) -> &GraphicsService {
+        self.dispatcher.graphics()
     }
 
     pub fn run(&mut self) -> Result<(), RuntimeError> {

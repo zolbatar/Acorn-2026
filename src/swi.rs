@@ -1,5 +1,6 @@
 use crate::{
     error::RuntimeError,
+    graphics::GraphicsService,
     host::HostConsole,
     memory::{GUEST_MEMORY_BASE, Task},
 };
@@ -11,6 +12,7 @@ pub const OS_NEW_LINE: u32 = 0x03;
 pub const OS_READ_C: u32 = 0x04;
 pub const OS_CLI: u32 = 0x05;
 pub const OS_READ_LINE: u32 = 0x0E;
+pub const OS_PLOT: u32 = 0x45;
 
 const R0: usize = 0;
 const R1: usize = 1;
@@ -37,6 +39,7 @@ pub struct SwiContext {
 
 pub struct SwiDispatcher {
     console: HostConsole,
+    graphics: GraphicsService,
     quit_requested: bool,
 }
 
@@ -44,12 +47,17 @@ impl SwiDispatcher {
     pub fn new(console: HostConsole) -> Self {
         Self {
             console,
+            graphics: GraphicsService::default(),
             quit_requested: false,
         }
     }
 
     pub fn quit_requested(&self) -> bool {
         self.quit_requested
+    }
+
+    pub fn graphics(&self) -> &GraphicsService {
+        &self.graphics
     }
 
     pub fn dispatch(
@@ -60,7 +68,9 @@ impl SwiDispatcher {
     ) -> Result<(), RuntimeError> {
         match number {
             OS_WRITE_C => {
-                self.console.write_byte(context.registers[R0] as u8)?;
+                if let Some(byte) = self.graphics.write_byte(context.registers[R0] as u8)? {
+                    self.console.write_byte(byte)?;
+                }
                 self.console.flush().map_err(RuntimeError::from)
             }
             OS_WRITE_S => self.write_inline_string(task, context),
@@ -72,8 +82,38 @@ impl SwiDispatcher {
             OS_READ_C => self.read_character(context),
             OS_CLI => self.execute_cli(task, context),
             OS_READ_LINE => self.read_line(task, context),
+            OS_PLOT => self.graphics.plot(
+                context.registers[R0] as u8,
+                context.registers[R1] as i32,
+                context.registers[R2] as i32,
+            ),
             other => Err(RuntimeError::InvalidSwi(other)),
         }
+    }
+
+    pub(crate) fn write_via_os_write_c(
+        &mut self,
+        task: &mut Task,
+        bytes: &[u8],
+    ) -> Result<(), RuntimeError> {
+        for byte in bytes {
+            self.emit_via_write_c(task, *byte)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn plot(
+        &mut self,
+        task: &mut Task,
+        plot_code: u8,
+        x: i32,
+        y: i32,
+    ) -> Result<(), RuntimeError> {
+        let mut context = SwiContext::default();
+        context.registers[R0] = u32::from(plot_code);
+        context.registers[R1] = x as u32;
+        context.registers[R2] = y as u32;
+        self.dispatch(OS_PLOT, task, &mut context)
     }
 
     pub fn flush(&mut self) -> Result<(), RuntimeError> {
