@@ -10,6 +10,8 @@ use std::{
 };
 
 const DISPLAY_BATCH_FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
+const INKEY_POLL_INTERVAL: Duration = Duration::from_millis(8);
+const MAX_EXTENDED_MODE_PIXELS: u64 = 4_194_304;
 
 pub const OS_WRITE_C: u32 = 0x00;
 pub const OS_WRITE_S: u32 = 0x01;
@@ -42,6 +44,23 @@ const OUTPUT_BUFFER: u32 = GUEST_MEMORY_BASE + 0x1000;
 const HELP_TEXT: &[u8] =
     b"Acorn-2026 MOS commands:\n\r  HELP       Show this help.\n\r  RUN        Run a .bas64 source file.\n\r  BASICLOAD  Load a tokenised BASIC file.\n\r  BASICRUN   Run the loaded compatibility subset.\n\r  QUIT       Exit the runtime.";
 
+fn hsv_to_rgb(hue: f64, saturation: f64, value: f64) -> (u8, u8, u8) {
+    let hue = hue.rem_euclid(360.0) / 60.0;
+    let chroma = value * saturation.clamp(0.0, 1.0);
+    let secondary = chroma * (1.0 - (hue.rem_euclid(2.0) - 1.0).abs());
+    let (red, green, blue) = match hue as u8 {
+        0 => (chroma, secondary, 0.0),
+        1 => (secondary, chroma, 0.0),
+        2 => (0.0, chroma, secondary),
+        3 => (0.0, secondary, chroma),
+        4 => (secondary, 0.0, chroma),
+        _ => (chroma, 0.0, secondary),
+    };
+    let match_value = value - chroma;
+    let component = |channel: f64| ((channel + match_value) * 255.0).round() as u8;
+    (component(red), component(green), component(blue))
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SwiContext {
     pub registers: [u32; 16],
@@ -58,6 +77,7 @@ pub struct SwiDispatcher {
     display_events: Option<Sender<DisplayEvent>>,
     display_batch_active: bool,
     last_display_batch_publish: Option<Instant>,
+    last_inkey_poll: Instant,
 }
 
 impl SwiDispatcher {
@@ -80,6 +100,7 @@ impl SwiDispatcher {
             display_events,
             display_batch_active: false,
             last_display_batch_publish: None,
+            last_inkey_poll: Instant::now(),
         }
     }
 
@@ -89,6 +110,92 @@ impl SwiDispatcher {
 
     pub fn graphics(&self) -> &GraphicsService {
         &self.graphics
+    }
+
+    pub(crate) fn poll_key(&mut self) -> Option<u8> {
+        if self.last_inkey_poll.elapsed() < INKEY_POLL_INTERVAL {
+            return None;
+        }
+        self.last_inkey_poll = Instant::now();
+        self.console.try_read_byte()
+    }
+
+    pub(crate) fn set_mode_from_block(
+        &mut self,
+        task: &Task,
+        address: u32,
+    ) -> Result<(), RuntimeError> {
+        let read_word = |offset: u32| -> Result<i32, RuntimeError> {
+            let word_address = address
+                .checked_add(offset)
+                .ok_or(crate::memory::MemoryError::AddressOverflow)?;
+            let bytes = [
+                task.memory.read_byte(word_address)?,
+                task.memory.read_byte(word_address + 1)?,
+                task.memory.read_byte(word_address + 2)?,
+                task.memory.read_byte(word_address + 3)?,
+            ];
+            Ok(i32::from_le_bytes(bytes))
+        };
+        if read_word(0)? != 1 || read_word(36)? != -1 {
+            return Err(RuntimeError::Program(
+                "unsupported extended mode block format".into(),
+            ));
+        }
+        let width = read_word(4)?;
+        let height = read_word(8)?;
+        let depth = read_word(12)?;
+        let y_eigenfactor = read_word(24)?;
+        let x_eigenfactor = read_word(32)?;
+        if depth != 5 {
+            return Err(RuntimeError::Program(
+                "the hosted extended mode currently supports 32-bit colour".into(),
+            ));
+        }
+        if width <= 0
+            || height <= 0
+            || u64::try_from(width).unwrap_or(u64::MAX) * u64::try_from(height).unwrap_or(u64::MAX)
+                > MAX_EXTENDED_MODE_PIXELS
+            || !(0..=4).contains(&x_eigenfactor)
+            || !(0..=4).contains(&y_eigenfactor)
+        {
+            return Err(RuntimeError::Program(
+                "extended mode dimensions or eigenfactors are outside the hosted profile".into(),
+            ));
+        }
+        self.graphics.set_extended_mode(
+            width as u32,
+            height as u32,
+            x_eigenfactor as u8,
+            y_eigenfactor as u8,
+        )
+    }
+
+    pub(crate) fn dispatch_named_swi(
+        &mut self,
+        name: &str,
+        context: &mut SwiContext,
+    ) -> Result<(), RuntimeError> {
+        match name {
+            "COLOURTRANS_CONVERTHSVTORGB" => {
+                let hue = f64::from(context.registers[R0] as i32) / 65_536.0;
+                let saturation = f64::from(context.registers[R1]) / 65_280.0;
+                let value = f64::from(context.registers[R2] & 0xFF) / 255.0;
+                let (red, green, blue) = hsv_to_rgb(hue, saturation, value);
+                context.registers[R0] = u32::from(red);
+                context.registers[R1] = u32::from(green);
+                context.registers[R2] = u32::from(blue);
+                Ok(())
+            }
+            "COLOURTRANS_SETGCOL" => {
+                self.graphics.set_rgb_gcol(context.registers[R0]);
+                Ok(())
+            }
+            "COLOURTRANS_WRITEPALETTE" => Ok(()),
+            _ => Err(RuntimeError::Program(format!(
+                "named SWI {name} is not available in the hosted profile"
+            ))),
+        }
     }
 
     pub fn dispatch(

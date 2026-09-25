@@ -1,13 +1,28 @@
 # Mandelbrot graphics example
 
-[`mandelbrot.bas`](mandelbrot.bas) is copied from the RISC OS 5.22 listing in [“Mandelbrot plotters for BBC BASIC”](https://barrowbiker.wordpress.com/2016/12/25/mandelbrot-plotters-for-bbc-basic/) on Barrowbiker's Blog, posted December 25, 2016. The post says it may work on earlier RISC OS versions and invites readers to use the code; it does not state a formal license. It is kept as a prospective BBC BASIC V/VI RISC OS graphics integration case, but has not been independently run or confirmed against a named interpreter release. This is readable text, not a tokenized file produced by a BBC BASIC `SAVE`.
+[`mandelbrot.bas`](mandelbrot.bas) is copied from the RISC OS 5.22 listing in [“Mandelbrot plotters for BBC BASIC”](https://barrowbiker.wordpress.com/2016/12/25/mandelbrot-plotters-for-bbc-basic/) on Barrowbiker's Blog, posted December 25, 2016. The post says it may work on earlier RISC OS versions and invites readers to use the code; it does not state a formal license. It is readable source, not a tokenized file produced by a BBC BASIC `SAVE`.
 
-The program exercises extended `MODE` blocks, `SYS` calls to `ColourTrans`, HSV-to-RGB conversion, palette setup, integer and string memory buffers, per-pixel `MOVE`/`DRAW`, numeric functions, nested loops, and `INKEY(0)`. It asks for a 1680 × 1050 display and up to 8192 Mandelbrot iterations per pixel.
+The checked-in [`mandelbrot.bbc`](mandelbrot.bbc) is generated from that source with sequential line numbers and the project's ARM BASIC V token encoder. It runs this listing's selected C16M path: extended 32-bit `MODE`, task-local integer and string indirection, parameterized procedures and functions, the `ColourTrans_ConvertHSVToRGB` and `ColourTrans_SetGCOL` calls, per-pixel `MOVE`/`DRAW`, nested loops, and `INKEY(0)`. This demonstrates the source features used by this program, not broad BASIC V/VI or RISC OS compatibility.
+
+Regenerate the saved-program fixture from the unchanged listing with:
+
+```sh
+python3 tools/tokenize_full_mandelbrot.py
+```
+
+Run it in the windowed app from the repository root:
+
+```text
+BASICLOAD examples/mandelbrot/mandelbrot.bbc
+BASICRUN
+```
+
+The listing asks for a 1680 × 1050 display and up to 8192 iterations per pixel, so its interpreted run can take a while. The window uses a shared RGBA raster surface and 60 Hz display updates; plot history does not grow with the number of pixels. Press a key after the image completes to return to the prompt.
 
 
 ## Reduced hosted example
 
-[`reduced.bas`](reduced.bas) is a small project-authored derivative for the currently hosted MODE 2 graphics path. It visits the renderer's 640 × 256 pixels, caps each point at 48 iterations, uses the existing eight logical colors, and plots one point per pixel. It avoids the original's extended MODE block, `ColourTrans`, RGB/HSV palette, and keyboard wait. The original listing remains unchanged as the future compatibility and performance case.
+[`reduced.bas`](reduced.bas) remains a quick project-authored derivative for the MODE 2 graphics path. It visits 640 × 256 pixels, caps each point at 48 iterations, uses the eight logical colors, and avoids the original's extended mode and `ColourTrans` path.
 
 The checked-in [`reduced.bbc`](reduced.bbc) is generated from that numbered source with:
 
@@ -24,4 +39,4 @@ BASICLOAD examples/mandelbrot/reduced.bbc
 BASICRUN
 ```
 
-While `BASICRUN` plots, the runtime publishes accumulated graphics snapshots no more than once per 16.667 ms (about 60 Hz), then sends a final snapshot when execution ends. This bounds display-update traffic while the image is being drawn; it does not reduce the interpreter's pixel or iteration work. Use the windowed app to see graphics; the stdio frontend can confirm that the fixture runs but cannot display the rendered image.
+The reduced program publishes scene snapshots no more than once per 16.667 ms (about 60 Hz). The windowed app is required to see graphics; the stdio frontend runs the BASIC interpreter without a visible display.

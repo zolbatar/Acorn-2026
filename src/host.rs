@@ -1,25 +1,42 @@
 use std::{
     io::{self, Read, Write},
     process::{Command, Stdio},
-    sync::mpsc::Receiver,
+    sync::mpsc::{self, Receiver},
+    thread,
 };
 
 /// Host terminal access. Guest-visible input and output still pass through SWIs.
 pub struct HostConsole {
-    input: Box<dyn Read>,
+    input: Receiver<u8>,
     output: Box<dyn Write>,
-    terminal_mode: TerminalMode,
-    window_input: Option<Receiver<u8>>,
+    _terminal_mode: TerminalMode,
+    echo_input: bool,
 }
 
 impl HostConsole {
     pub fn stdio() -> Self {
         let terminal_mode = TerminalMode::try_enable_character_input();
+        let echo_input = terminal_mode.enabled();
+        let (sender, input) = mpsc::channel();
+        let _ = thread::Builder::new()
+            .name("acorn-stdio-input".into())
+            .spawn(move || {
+                let stdin = io::stdin();
+                let mut stdin = stdin.lock();
+                let mut byte = [0_u8; 1];
+                loop {
+                    match stdin.read(&mut byte) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) if sender.send(byte[0]).is_err() => break,
+                        Ok(_) => {}
+                    }
+                }
+            });
         Self {
-            input: Box::new(io::stdin()),
+            input,
             output: Box::new(io::stdout()),
-            terminal_mode,
-            window_input: None,
+            _terminal_mode: terminal_mode,
+            echo_input,
         }
     }
 
@@ -27,23 +44,19 @@ impl HostConsole {
     /// still consume it through OS_ReadC and OS_ReadLine.
     pub fn windowed(input: Receiver<u8>) -> Self {
         Self {
-            input: Box::new(io::empty()),
+            input,
             output: Box::new(io::sink()),
-            terminal_mode: TerminalMode { original: None },
-            window_input: Some(input),
+            _terminal_mode: TerminalMode { original: None },
+            echo_input: true,
         }
     }
 
     pub fn read_byte(&mut self) -> io::Result<Option<u8>> {
-        if let Some(input) = &self.window_input {
-            return Ok(input.recv().ok());
-        }
+        Ok(self.input.recv().ok())
+    }
 
-        let mut byte = [0_u8; 1];
-        match self.input.read(&mut byte)? {
-            0 => Ok(None),
-            _ => Ok(Some(byte[0])),
-        }
+    pub fn try_read_byte(&self) -> Option<u8> {
+        self.input.try_recv().ok()
     }
 
     pub fn write_byte(&mut self, byte: u8) -> io::Result<()> {
@@ -56,7 +69,7 @@ impl HostConsole {
 
     /// Raw terminal input needs software echo; a cooked terminal echoes itself.
     pub fn software_echo(&self) -> bool {
-        self.window_input.is_some() || self.terminal_mode.enabled()
+        self.echo_input
     }
 }
 

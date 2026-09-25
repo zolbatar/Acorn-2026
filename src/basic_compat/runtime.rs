@@ -14,7 +14,9 @@ use super::parser::{
 const INPUT_BUFFER: u32 = GUEST_MEMORY_BASE + 0x3000;
 const INPUT_BUFFER_SIZE: u32 = 4096;
 const FIRST_HEAP_ADDRESS: u32 = GUEST_MEMORY_BASE + 0x8000;
-const MAX_EXECUTION_STEPS: usize = 1_000_000_000;
+// The source-derived full Mandelbrot fixture can execute several billion
+// statements with its original dimensions and iteration cap.
+const MAX_EXECUTION_STEPS: u64 = 100_000_000_000;
 const PRINT_ZONE_WIDTH: usize = 14;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -45,10 +47,11 @@ enum ReturnKind {
     Subroutine,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ReturnFrame {
     kind: ReturnKind,
     address: usize,
+    saved_variables: Vec<(String, Option<Value>)>,
 }
 
 struct ForFrame {
@@ -75,10 +78,12 @@ pub(super) struct Interpreter {
     for_loops: Vec<ForFrame>,
     repeat_loops: Vec<usize>,
     for_pairs: HashMap<usize, usize>,
+    if_blocks: HashMap<usize, usize>,
     started: Instant,
-    steps: usize,
+    steps: u64,
     print_column: usize,
     next_heap_address: u32,
+    pending_key: Option<u8>,
 }
 
 impl Interpreter {
@@ -98,6 +103,7 @@ impl Interpreter {
             .flatten()
             .collect();
         let for_pairs = match_for_loops(&program);
+        let if_blocks = match_if_blocks(&program);
 
         Self {
             program,
@@ -109,10 +115,12 @@ impl Interpreter {
             for_loops: Vec::new(),
             repeat_loops: Vec::new(),
             for_pairs,
+            if_blocks,
             started: Instant::now(),
             steps: 0,
             print_column: 0,
             next_heap_address: FIRST_HEAP_ADDRESS,
+            pending_key: None,
         }
     }
 
@@ -124,6 +132,11 @@ impl Interpreter {
         let mut address = 0_usize;
         while address < self.program.instructions.len() {
             self.steps += 1;
+            if self.steps & 0x3FF == 0 {
+                if let Some(key) = dispatcher.poll_key() {
+                    self.pending_key = Some(key);
+                }
+            }
             if self.steps > MAX_EXECUTION_STEPS {
                 let line = self.program.instructions[address].line_number;
                 return Err(program_error(line, "execution step limit reached"));
@@ -169,8 +182,12 @@ impl Interpreter {
                 Ok(Flow::Next)
             }
             Statement::Mode(expression) => {
-                let mode = self.evaluate(expression, line, task)?.number(line)?.trunc() as u8;
-                dispatcher.write_via_os_write_c(task, &[22, mode])?;
+                let mode = self.evaluate(expression, line, task)?.number(line)?.trunc();
+                if mode >= f64::from(GUEST_MEMORY_BASE) {
+                    dispatcher.set_mode_from_block(task, checked_guest_address(mode, line)?)?;
+                } else {
+                    dispatcher.write_via_os_write_c(task, &[22, mode as u8])?;
+                }
                 Ok(Flow::Next)
             }
             Statement::Vdu(arguments) => {
@@ -259,12 +276,26 @@ impl Interpreter {
                 }
                 Ok(Flow::Next)
             }
+            Statement::IfBlock(condition) => {
+                if self.evaluate(condition, line, task)?.number(line)? != 0.0 {
+                    Ok(Flow::Next)
+                } else {
+                    let end = self
+                        .if_blocks
+                        .get(&address)
+                        .copied()
+                        .ok_or_else(|| program_error(line, "IF has no matching ENDIF"))?;
+                    Ok(Flow::Jump(end + 1))
+                }
+            }
+            Statement::EndIf => Ok(Flow::Next),
             Statement::Goto(target) => self.jump_to_line(*target, line),
             Statement::Gosub(target) => {
                 let destination = self.line_address(*target, line)?;
                 self.returns.push(ReturnFrame {
                     kind: ReturnKind::Subroutine,
                     address: address + 1,
+                    saved_variables: Vec::new(),
                 });
                 Ok(Flow::Jump(destination))
             }
@@ -285,7 +316,9 @@ impl Interpreter {
                 }
                 Ok(Flow::Next)
             }
-            Statement::Data(_) | Statement::NoOp | Statement::DefineProcedure(_) => Ok(Flow::Next),
+            Statement::Data(_) | Statement::NoOp | Statement::DefineProcedure(_, _) => {
+                Ok(Flow::Next)
+            }
             Statement::Restore(target) => {
                 self.data_cursor = match target {
                     Some(line) => self.data.partition_point(|(data_line, _)| data_line < line),
@@ -315,20 +348,29 @@ impl Interpreter {
                     Ok(Flow::Jump(repeat_address))
                 }
             }
-            Statement::ProcedureCall(name) => {
-                let Some(destination) = self.program.procedures.get(name).copied() else {
+            Statement::ProcedureCall(name, arguments) => {
+                let Some(definition) = self.program.procedures.get(name).cloned() else {
                     return Err(program_error(
                         line,
                         format!("unknown procedure PROC {name}"),
                     ));
                 };
+                let values = self.evaluate_arguments(arguments, line, task)?;
+                if values.len() != definition.parameters.len() {
+                    return Err(program_error(
+                        line,
+                        format!("PROC {name} argument count mismatch"),
+                    ));
+                }
+                let saved_variables = self.bind_parameters(&definition.parameters, values, line)?;
                 self.returns.push(ReturnFrame {
                     kind: ReturnKind::Procedure,
                     address: address + 1,
+                    saved_variables,
                 });
-                Ok(Flow::Jump(destination))
+                Ok(Flow::Jump(definition.entry))
             }
-            Statement::DefineFunction(_) => Ok(Flow::Next),
+            Statement::DefineFunction(_, _) => Ok(Flow::Next),
             Statement::FunctionReturn(_) => Err(program_error(
                 line,
                 "function return was reached outside a function call",
@@ -336,6 +378,30 @@ impl Interpreter {
             Statement::Return => self.return_from(ReturnKind::Subroutine, line),
             Statement::EndProcedure => self.return_from(ReturnKind::Procedure, line),
             Statement::End => Ok(Flow::Stop),
+            Statement::Sys {
+                name,
+                arguments,
+                results,
+            } => {
+                let swi_name = String::from_utf8_lossy(name).to_ascii_uppercase();
+                let mut context = SwiContext::default();
+                for (register, argument) in arguments.iter().enumerate().take(10) {
+                    if let Some(argument) = argument {
+                        context.registers[register] =
+                            self.evaluate(argument, line, task)?.number(line)?.trunc() as i32
+                                as u32;
+                    }
+                }
+                dispatcher.dispatch_named_swi(&swi_name, &mut context)?;
+                for (register, target) in results.iter().enumerate() {
+                    self.set_variable(
+                        target,
+                        Value::Number(f64::from(context.registers[register] as i32)),
+                        line,
+                    )?;
+                }
+                Ok(Flow::Next)
+            }
             Statement::Call(_) => Err(program_error(
                 line,
                 "machine-code CALL requires a matching processor compatibility service not available in the hosted profile",
@@ -360,7 +426,7 @@ impl Interpreter {
     }
 
     fn return_from(&mut self, expected: ReturnKind, line: u16) -> Result<Flow, RuntimeError> {
-        let Some(frame) = self.returns.last().copied() else {
+        let Some(frame) = self.returns.last().cloned() else {
             return Err(program_error(line, "RETURN or ENDPROC has no active call"));
         };
         let matches = matches!(
@@ -372,7 +438,74 @@ impl Interpreter {
             return Err(program_error(line, "mismatched RETURN and ENDPROC"));
         }
         self.returns.pop();
+        self.restore_variables(frame.saved_variables);
         Ok(Flow::Jump(frame.address))
+    }
+
+    fn evaluate_arguments(
+        &mut self,
+        arguments: &[Expr],
+        line: u16,
+        task: &Task,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        arguments
+            .iter()
+            .map(|argument| self.evaluate(argument, line, task))
+            .collect()
+    }
+
+    fn bind_parameters(
+        &mut self,
+        parameters: &[String],
+        values: Vec<Value>,
+        line: u16,
+    ) -> Result<Vec<(String, Option<Value>)>, RuntimeError> {
+        if parameters.len() != values.len() {
+            return Err(program_error(
+                line,
+                "procedure or function argument count mismatch",
+            ));
+        }
+        let saved = parameters
+            .iter()
+            .map(|name| (name.clone(), self.variables.get(name).cloned()))
+            .collect::<Vec<_>>();
+        for (name, value) in parameters.iter().zip(values) {
+            if let Err(error) = self.set_variable(name, value, line) {
+                self.restore_variables(saved);
+                return Err(error);
+            }
+        }
+        Ok(saved)
+    }
+
+    fn restore_variables(&mut self, saved: Vec<(String, Option<Value>)>) {
+        for (name, value) in saved.into_iter().rev() {
+            if let Some(value) = value {
+                self.variables.insert(name, value);
+            } else {
+                self.variables.remove(&name);
+            }
+        }
+    }
+
+    fn function_expression(
+        &self,
+        definition: &super::parser::Definition,
+        name: &str,
+        line: u16,
+    ) -> Result<Expr, RuntimeError> {
+        for instruction in self.program.instructions.iter().skip(definition.entry) {
+            match &instruction.statement {
+                Statement::FunctionReturn(expression) => return Ok(expression.clone()),
+                Statement::DefineFunction(_, _) | Statement::DefineProcedure(_, _) => break,
+                _ => {}
+            }
+        }
+        Err(program_error(
+            line,
+            format!("FN {name} has no expression body"),
+        ))
     }
 
     fn start_for(
@@ -485,8 +618,12 @@ impl Interpreter {
         if declaration.byte_block {
             let byte_count =
                 u32::try_from(length).map_err(|_| program_error(line, "DIM block is too large"))?;
-            let block_end = self
+            let block_start = self
                 .next_heap_address
+                .checked_add(3)
+                .map(|address| address & !3)
+                .ok_or_else(|| program_error(line, "DIM block address overflowed"))?;
+            let block_end = block_start
                 .checked_add(byte_count)
                 .ok_or_else(|| program_error(line, "DIM block address overflowed"))?;
             let memory_end = GUEST_MEMORY_BASE
@@ -499,7 +636,7 @@ impl Interpreter {
                 .write_bytes(self.next_heap_address, &vec![0; length])?;
             self.set_variable(
                 &declaration.name,
-                Value::Number(f64::from(self.next_heap_address)),
+                Value::Number(f64::from(block_start)),
                 line,
             )?;
             self.next_heap_address = block_end;
@@ -525,7 +662,6 @@ impl Interpreter {
                 let ticks = self.started.elapsed().as_millis() / 10;
                 Ok(Value::Number(ticks as f64))
             }
-            Expr::Variable(name) if name == "INKEY" => Ok(Value::Number(-256.0)),
             Expr::Variable(name) => Ok(self.get_variable(name)),
             Expr::ArrayElement(name, index) => {
                 let index = self.evaluate(index, line, task)?.number(line)?;
@@ -555,16 +691,22 @@ impl Interpreter {
                 self.evaluate_binary(left, *operator, right, line)
             }
             Expr::Builtin(token, arguments) => self.evaluate_builtin(*token, arguments, line, task),
-            Expr::UserFunction(name, _arguments) => {
-                if !self.program.functions.contains_key(name) {
+            Expr::UserFunction(name, arguments) => {
+                let Some(definition) = self.program.functions.get(name).cloned() else {
                     return Err(program_error(line, format!("unknown function FN {name}")));
+                };
+                let values = self.evaluate_arguments(arguments, line, task)?;
+                if values.len() != definition.parameters.len() {
+                    return Err(program_error(
+                        line,
+                        format!("FN {name} argument count mismatch"),
+                    ));
                 }
-                Err(program_error(
-                    line,
-                    format!(
-                        "FN {name} requires a hardware or compatibility path not active in this run"
-                    ),
-                ))
+                let expression = self.function_expression(&definition, name, line)?;
+                let saved = self.bind_parameters(&definition.parameters, values, line)?;
+                let result = self.evaluate(&expression, line, task);
+                self.restore_variables(saved.clone());
+                result
             }
             Expr::MemoryRead(width, address) => {
                 let address = self.evaluate(address, line, task)?.number(line)?;
@@ -652,6 +794,7 @@ impl Interpreter {
             BinaryOp::Power => left.powf(right),
             BinaryOp::And => f64::from((left as i32) & (right as i32)),
             BinaryOp::Or => f64::from((left as i32) | (right as i32)),
+            BinaryOp::ShiftLeft => f64::from((left as i32).wrapping_shl((right as u32) & 31)),
             BinaryOp::Equal
             | BinaryOp::NotEqual
             | BinaryOp::Less
@@ -684,6 +827,18 @@ impl Interpreter {
         };
 
         match token {
+            0x97 => {
+                if values.len() != 1 {
+                    return Err(program_error(line, "ASC expects one argument"));
+                }
+                Ok(Value::Number(
+                    values[0]
+                        .string(line)?
+                        .first()
+                        .copied()
+                        .map_or(-1.0, f64::from),
+                ))
+            }
             0x94 => Ok(Value::Number(one_number()?.abs())),
             0x9B => Ok(Value::Number(one_number()?.cos())),
             0xA8 => Ok(Value::Number(one_number()?.floor())),
@@ -695,8 +850,48 @@ impl Interpreter {
             }
             0xAA => Ok(Value::Number(one_number()?.ln())),
             0xAB => Ok(Value::Number(one_number()?.log10())),
+            0xA6 => {
+                if values.len() > 1 {
+                    return Err(program_error(line, "INKEY expects zero or one argument"));
+                }
+                let no_key = if values.is_empty() { -256.0 } else { -1.0 };
+                Ok(Value::Number(
+                    self.pending_key.take().map_or(no_key, f64::from),
+                ))
+            }
+            0xA7 => {
+                if !(2..=3).contains(&values.len()) {
+                    return Err(program_error(line, "INSTR expects two or three arguments"));
+                }
+                let text = values[0].string(line)?;
+                let pattern = values[1].string(line)?;
+                let start = if values.len() == 3 {
+                    bounded_string_length(values[2].number(line)?, line)?.saturating_sub(1)
+                } else {
+                    0
+                };
+                let position = if start > text.len() {
+                    None
+                } else {
+                    text[start..]
+                        .windows(pattern.len().max(1))
+                        .position(|window| !pattern.is_empty() && window == pattern)
+                        .map(|offset| start + offset + 1)
+                };
+                Ok(Value::Number(position.map_or(0.0, |index| index as f64)))
+            }
             0xB6 => Ok(Value::Number(one_number()?.sqrt())),
             0xB7 => Ok(Value::Number(one_number()?.tan())),
+            0xBC => {
+                if values.len() != 1 {
+                    return Err(program_error(line, "VAL expects one argument"));
+                }
+                Ok(Value::Number(parse_basic_val(values[0].string(line)?)))
+            }
+            0xBD => {
+                let byte = one_number()?.trunc() as i32 as u8;
+                Ok(Value::String(vec![byte]))
+            }
             0xC0 => {
                 require_argument_count(&values, 2, line, "LEFT$")?;
                 let text = values[0].string(line)?;
@@ -806,6 +1001,46 @@ impl Interpreter {
                 let offset = self.evaluate(offset, line, task)?.number(line)?;
                 let address = checked_guest_address(base + offset, line)?;
                 self.write_memory(MemoryWidth::Byte, address, value, line, task)
+            }
+            LValue::MemoryOffset(width, base, offset) => {
+                let base = self.evaluate(base, line, task)?.number(line)?;
+                let offset = self.evaluate(offset, line, task)?.number(line)?;
+                let address = checked_guest_address(base + offset, line)?;
+                self.write_memory(*width, address, value, line, task)
+            }
+            LValue::MemoryString(address) => {
+                let address = self.address_value(address, line, task)?;
+                let bytes = value.string(line)?;
+                if bytes.len() > 4096 {
+                    return Err(program_error(line, "indirect string exceeds 4096 bytes"));
+                }
+                task.memory.write_bytes(address, bytes)?;
+                let terminator =
+                    address
+                        .checked_add(u32::try_from(bytes.len()).map_err(|_| {
+                            program_error(line, "indirect string address overflowed")
+                        })?)
+                        .ok_or_else(|| program_error(line, "indirect string address overflowed"))?;
+                task.memory.write_byte(terminator, b'\r')?;
+                Ok(())
+            }
+            LValue::StringSlice(name, start, length) => {
+                let start = self.evaluate(start, line, task)?.number(line)?;
+                let length =
+                    bounded_string_length(self.evaluate(length, line, task)?.number(line)?, line)?;
+                let replacement = value.string(line)?.to_vec();
+                let start = start.trunc().max(1.0) as usize - 1;
+                let Some(Value::String(target)) = self.variables.get_mut(name) else {
+                    return Err(program_error(
+                        line,
+                        format!("{name} is not a string variable"),
+                    ));
+                };
+                let start = start.min(target.len());
+                let end = start.saturating_add(length).min(target.len());
+                let replacement = &replacement[..replacement.len().min(length)];
+                target.splice(start..end, replacement.iter().copied());
+                Ok(())
             }
         }
     }
@@ -1015,6 +1250,23 @@ fn match_for_loops(program: &ParsedProgram) -> HashMap<usize, usize> {
     matches
 }
 
+fn match_if_blocks(program: &ParsedProgram) -> HashMap<usize, usize> {
+    let mut stack = Vec::new();
+    let mut matches = HashMap::new();
+    for (address, instruction) in program.instructions.iter().enumerate() {
+        match &instruction.statement {
+            Statement::IfBlock(_) => stack.push(address),
+            Statement::EndIf => {
+                if let Some(start) = stack.pop() {
+                    matches.insert(start, address);
+                }
+            }
+            _ => {}
+        }
+    }
+    matches
+}
+
 fn default_value(name: &str) -> Value {
     if name.ends_with('$') {
         Value::String(Vec::new())
@@ -1070,6 +1322,47 @@ fn bounded_string_length(number: f64, line: u16) -> Result<usize, RuntimeError> 
         ));
     }
     Ok(number.trunc() as usize)
+}
+
+fn parse_basic_val(bytes: &[u8]) -> f64 {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim_start();
+    let mut end = 0;
+    let mut digits = 0;
+    let mut exponent = false;
+    let mut decimal = false;
+    for (index, byte) in text.bytes().enumerate() {
+        match byte {
+            b'+' | b'-'
+                if index == 0
+                    || (exponent
+                        && text
+                            .as_bytes()
+                            .get(index.wrapping_sub(1))
+                            .is_some_and(|previous| matches!(previous, b'E' | b'e'))) =>
+            {
+                end = index + 1;
+            }
+            b'0'..=b'9' => {
+                digits += 1;
+                end = index + 1;
+            }
+            b'.' if !decimal && !exponent => {
+                decimal = true;
+                end = index + 1;
+            }
+            b'E' | b'e' if !exponent && digits > 0 => {
+                exponent = true;
+                end = index + 1;
+            }
+            _ => break,
+        }
+    }
+    if digits == 0 {
+        0.0
+    } else {
+        text[..end].parse::<f64>().unwrap_or(0.0)
+    }
 }
 
 fn graphics_coordinate(number: f64, line: u16) -> Result<i32, RuntimeError> {

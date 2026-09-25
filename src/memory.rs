@@ -39,7 +39,11 @@ pub struct GuestMemory {
 impl Default for GuestMemory {
     fn default() -> Self {
         Self {
-            bytes: vec![0; GUEST_MEMORY_SIZE],
+            // Keep the compatibility zero page task-local. Legacy BASIC may
+            // use zero-valued variables with an indirection operator during
+            // initialisation, while managed allocations still begin at
+            // GUEST_MEMORY_BASE.
+            bytes: vec![0; GUEST_MEMORY_BASE as usize + GUEST_MEMORY_SIZE],
         }
     }
 }
@@ -79,10 +83,7 @@ impl GuestMemory {
     }
 
     fn index(&self, address: u32, length: usize) -> Result<usize, MemoryError> {
-        let Some(offset) = address.checked_sub(GUEST_MEMORY_BASE) else {
-            return Err(MemoryError::AddressOutsideSpace(address));
-        };
-        let start = usize::try_from(offset).map_err(|_| MemoryError::AddressOverflow)?;
+        let start = usize::try_from(address).map_err(|_| MemoryError::AddressOverflow)?;
         let end = start
             .checked_add(length)
             .ok_or(MemoryError::AddressOverflow)?;

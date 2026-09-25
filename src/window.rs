@@ -65,6 +65,7 @@ struct WindowApp {
     modifiers: ModifiersState,
     window: Option<Arc<Window>>,
     pixels: Option<Pixels<'static>>,
+    frame_size: (u32, u32),
 }
 
 impl WindowApp {
@@ -75,6 +76,7 @@ impl WindowApp {
             modifiers: ModifiersState::empty(),
             window: None,
             pixels: None,
+            frame_size: (renderer::SCREEN_WIDTH, renderer::SCREEN_HEIGHT),
         }
     }
 
@@ -169,7 +171,9 @@ impl WindowApp {
                 }
             }
             DisplayEvent::GraphicsSnapshot(snapshot) => {
+                let size = (snapshot.mode.pixel_width, snapshot.mode.pixel_height);
                 self.graphics.replace_snapshot(snapshot);
+                self.resize_buffer(size);
             }
             DisplayEvent::RuntimeExited => {
                 event_loop.exit();
@@ -177,6 +181,28 @@ impl WindowApp {
             }
         }
         self.request_redraw();
+    }
+
+    fn resize_buffer(&mut self, size: (u32, u32)) {
+        if self.frame_size == size || size.0 == 0 || size.1 == 0 {
+            return;
+        }
+        if let Some(pixels) = &mut self.pixels {
+            if let Err(error) = pixels.resize_buffer(size.0, size.1) {
+                eprintln!("Acorn-2026 could not resize its pixel buffer: {error}");
+                return;
+            }
+        }
+        self.frame_size = size;
+        if let Some(window) = &self.window {
+            let scale = (INITIAL_SCALE)
+                .min(960.0 / f64::from(size.0))
+                .min(720.0 / f64::from(size.1));
+            let _ = window.request_inner_size(LogicalSize::new(
+                f64::from(size.0) * scale,
+                f64::from(size.1) * scale,
+            ));
+        }
     }
 }
 
@@ -186,11 +212,15 @@ impl ApplicationHandler<WindowUserEvent> for WindowApp {
             return;
         }
 
+        let frame_size = self.frame_size;
+        let scale = INITIAL_SCALE
+            .min(960.0 / f64::from(frame_size.0))
+            .min(720.0 / f64::from(frame_size.1));
         let attributes = Window::default_attributes()
             .with_title("Acorn-2026")
             .with_inner_size(LogicalSize::new(
-                f64::from(renderer::SCREEN_WIDTH) * INITIAL_SCALE,
-                f64::from(renderer::SCREEN_HEIGHT) * INITIAL_SCALE,
+                f64::from(frame_size.0) * scale,
+                f64::from(frame_size.1) * scale,
             ))
             .with_min_inner_size(LogicalSize::new(
                 f64::from(renderer::SCREEN_WIDTH),
@@ -207,7 +237,7 @@ impl ApplicationHandler<WindowUserEvent> for WindowApp {
 
         let size = window.inner_size();
         let surface = SurfaceTexture::new(size.width, size.height, window.clone());
-        let pixels = match Pixels::new(renderer::SCREEN_WIDTH, renderer::SCREEN_HEIGHT, surface) {
+        let pixels = match Pixels::new(frame_size.0, frame_size.1, surface) {
             Ok(pixels) => pixels,
             Err(error) => {
                 eprintln!("Acorn-2026 could not create its pixel surface: {error}");

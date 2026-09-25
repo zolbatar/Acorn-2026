@@ -6,7 +6,7 @@ Acorn-2026 is a design and implementation project for a modern, tinkerable compu
 
 ## Project status
 
-The hosted Rust MOS prompt is available in one graphics-capable window: `HELP` displays help and returns to `*`, and `QUIT` exits. The initial display renders MOS/BASIC text and plotted points/lines together using the supplied BBC Micro bitmap font. The tokenised [`text-and-pixels` demo](examples/graphics) prints and plots on the same screen. The first BASIC64 source slice runs `INPUT` and `PRINT` string variables from plain UTF-8 `.bas64` files using a pest grammar. `BASICLOAD` accepts two observed tokenized saved-program record layouts and preserves their token bytes. `BASICRUN` supports the string echo fixture, a narrow shared-boundary legacy core, and the ClockSP5 program-version-5.08 compatibility slice. ClockSP5 completes its benchmark sections and returns to `*`; this does not establish broad BASIC V/VI compatibility. See the [tokenized BASIC compatibility matrix](docs/tokenized-basic-compatibility.md) for evidence and gaps.
+The hosted Rust MOS prompt is available in one graphics-capable window: `HELP` displays help and returns to `*`, and `QUIT` exits. The initial display renders MOS/BASIC text and plotted points/lines together using the supplied BBC Micro bitmap font. The tokenised [`text-and-pixels` demo](examples/graphics) prints and plots on the same screen. The first BASIC64 source slice runs `INPUT` and `PRINT` string variables from plain UTF-8 `.bas64` files using a pest grammar. `BASICLOAD` accepts two observed tokenized saved-program record layouts and preserves their token bytes. `BASICRUN` supports the string echo fixture, a narrow shared-boundary legacy core, ClockSP5 program version 5.08, and the source-derived full Mandelbrot listing through its selected 32-bit extended mode and `ColourTrans` path. These fixtures exercise specific compatibility slices; they do not establish broad BASIC V/VI compatibility. See the [tokenized BASIC compatibility matrix](docs/tokenized-basic-compatibility.md) for evidence and gaps.
 
 ## Start here
 
@@ -14,7 +14,7 @@ The hosted Rust MOS prompt is available in one graphics-capable window: `HELP` d
 - [`docs/phase-0-mos-prompt-plan.md`](docs/phase-0-mos-prompt-plan.md) — the saved Phase 0 prompt contract and initial SWI catalog.
 - [`docs/clocksp5-run-plan.md`](docs/clocksp5-run-plan.md) — implementation sequence and acceptance criteria for running the ClockSP5 fixture.
 - [`docs/tokenized-basic-compatibility.md`](docs/tokenized-basic-compatibility.md) — decoder, token-profile, and execution coverage by saved-program evidence.
-- [`examples/mandelbrot`](examples/mandelbrot) — reduced, tokenized Mandelbrot example for the hosted graphics path, alongside the original prospective BBC BASIC V/VI integration case.
+- [`examples/mandelbrot`](examples/mandelbrot) — the generated full-listing fixture and a reduced Mandelbrot run for quick graphics checks.
 
 ## Current direction
 
@@ -53,14 +53,23 @@ BASICRUN
 
 The program selects MODE 1, prints two lines, and plots a red plus below the text. See [`examples/graphics`](examples/graphics) for source and fixture details.
 
-To run the reduced Mandelbrot in the windowed app, enter:
+To run the full 1680 × 1050 Mandelbrot listing in the windowed app, enter:
+
+```text
+BASICLOAD examples/mandelbrot/mandelbrot.bbc
+BASICRUN
+```
+
+The program can take a while because it is interpreted and allows up to 8192 iterations per pixel. Press a key after it finishes to return to the prompt. Its source-derived tokenized file can be regenerated with `python3 tools/tokenize_full_mandelbrot.py`.
+
+For a faster 640 × 256 example, enter:
 
 ```text
 BASICLOAD examples/mandelbrot/reduced.bbc
 BASICRUN
 ```
 
-The 640 × 256 image appears progressively with display snapshots capped at about 60 Hz. See [`examples/mandelbrot`](examples/mandelbrot) for source, generation, and compatibility details.
+The reduced image appears progressively with display snapshots capped at about 60 Hz. See [`examples/mandelbrot`](examples/mandelbrot) for source, generation, and compatibility details.
 
 To run the string echo example, enter:
 
@@ -95,4 +104,4 @@ BASICLOAD examples/clocksp5/ClockSP5.bbc
 BASICRUN
 ```
 
-It runs three workload passes, printing the benchmark sections and comparison each time, then returns to `*`. In this hosted profile, `TIME` is monotonic centiseconds and `INKEY` returns the no-key value, so the program follows its own guarded path that skips native ARM and hardware setup. Its final hardware reset command is accepted as a no-op. The displayed MHz figures compare this hosted BASIC interpreter's performance against the program's BBC B reference data; they do not measure the host processor's physical clock speed.
+It runs three workload passes, printing the benchmark sections and comparison each time, then returns to `*`. In this hosted profile, `TIME` is monotonic centiseconds and `INKEY` reads queued host keys; with no key pending, bare `INKEY` returns -256 and `INKEY(0)` returns -1. ClockSP5 follows its guarded path when no key is pending, skipping native ARM and hardware setup. Its final hardware reset command is accepted as a no-op. The displayed MHz figures compare this hosted BASIC interpreter's performance against the program's BBC B reference data; they do not measure the host processor's physical clock speed.

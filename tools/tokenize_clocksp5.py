@@ -2,8 +2,8 @@
 """Encode selected project text fixtures as ARM BBC BASIC V saved programs.
 
 This deliberately covers only the tokens and source conventions used by the
-ClockSP5 and reduced Mandelbrot fixtures. It is not a general BBC BASIC
-tokenizer or syntax checker.
+ClockSP5 and Mandelbrot fixtures. It is not a general BBC BASIC tokenizer or
+syntax checker.
 """
 
 from __future__ import annotations
@@ -22,7 +22,6 @@ TOKENS = {
     "OR": 0x84,
     "ERROR": 0x85,
     "LINE": 0x86,
-    "OFF": 0x87,
     "STEP": 0x88,
     "SPC": 0x89,
     "ELSE": 0x8B,
@@ -39,6 +38,7 @@ TOKENS = {
     "FALSE": 0xA3,
     "FN": 0xA4,
     "INKEY": 0xA6,
+    "INSTR(": 0xA7,
     "INT": 0xA8,
     "LEN": 0xA9,
     "LN": 0xAA,
@@ -49,6 +49,7 @@ TOKENS = {
     "TAN": 0xB7,
     "TO": 0xB8,
     "TRUE": 0xB9,
+    "VAL": 0xBC,
     "CHR$": 0xBD,
     "GET$": 0xBE,
     "INKEY$": 0xBF,
@@ -57,6 +58,7 @@ TOKENS = {
     "RIGHT$(": 0xC2,
     "STR$": 0xC3,
     "STRING$(": 0xC4,
+    "SYS": b"\xC8\x99",
     "ENDCASE": 0xCB,
     "ENDIF": 0xCD,
     "ENDWHILE": 0xCE,
@@ -64,6 +66,8 @@ TOKENS = {
     "SOUND": 0xD4,
     "CALL": 0xD6,
     "GCOL": 0xE6,
+    "DRAW": 0xDF,
+    "MOVE": 0xEC,
     "MODE": 0xEB,
     "PLOT": 0xF0,
     "DATA": 0xDC,
@@ -156,6 +160,9 @@ def tokenise_line(text: str) -> bytes:
         upper_tail = text[index:].upper()
         for name in TOKEN_NAMES:
             if upper_tail.startswith(name):
+                suffix_index = index + len(name)
+                if not name.endswith("(") and suffix_index < len(text) and text[suffix_index] in "$%":
+                    break
                 matched = name
                 break
 
@@ -178,7 +185,10 @@ def tokenise_line(text: str) -> bytes:
             token = PSEUDO_VARIABLES[matched][1 if is_assignment_target else 0]
         else:
             token = TOKENS[matched]
-        output.append(token)
+        if isinstance(token, bytes):
+            output.extend(token)
+        else:
+            output.append(token)
         index = next_index
 
         if matched == "REM":
@@ -199,20 +209,28 @@ def tokenise_line(text: str) -> bytes:
     return bytes(output)
 
 
-def encode_program(source: str) -> tuple[bytes, int]:
+def encode_program(source: str, *, auto_number: bool = False) -> tuple[bytes, int]:
     output = bytearray()
     line_count = 0
+    next_line_number = 10
     for raw_line in source.splitlines():
         match = re.match(r"^\s*(\d+)(.*)$", raw_line)
         if match is None:
-            if raw_line.strip():
+            if raw_line.strip() and not auto_number:
                 raise ValueError(f"expected a numbered BASIC line: {raw_line!r}")
-            continue
+            if not raw_line.strip():
+                continue
+            line_number = next_line_number
+            body_text = raw_line
+            next_line_number += 10
+        else:
+            line_number = int(match.group(1))
+            body_text = match.group(2)
+            next_line_number = max(next_line_number, line_number + 10)
 
-        line_number = int(match.group(1))
         if not 0 <= line_number <= 0xFEFF:
             raise ValueError(f"line number out of BASIC V range: {line_number}")
-        body = tokenise_line(match.group(2))
+        body = tokenise_line(body_text)
         record_length = len(body) + 5  # four-byte preamble, body and final CR
         if record_length > 255:
             raise ValueError(f"line {line_number} is too long for BASIC V")

@@ -21,9 +21,11 @@ const TOKEN_TIME: u8 = 0x91;
 const TOKEN_LOMEM: u8 = 0x92;
 const TOKEN_HIMEM: u8 = 0x93;
 const TOKEN_ABS: u8 = 0x94;
+const TOKEN_ASC: u8 = 0x97;
 const TOKEN_COS: u8 = 0x9B;
 const TOKEN_FN: u8 = 0xA4;
 const TOKEN_INKEY: u8 = 0xA6;
+const TOKEN_INSTR: u8 = 0xA7;
 const TOKEN_INT: u8 = 0xA8;
 const TOKEN_LEN: u8 = 0xA9;
 const TOKEN_LN: u8 = 0xAA;
@@ -32,6 +34,8 @@ const TOKEN_NOT: u8 = 0xAC;
 const TOKEN_SQR: u8 = 0xB6;
 const TOKEN_TAN: u8 = 0xB7;
 const TOKEN_TO: u8 = 0xB8;
+const TOKEN_VAL: u8 = 0xBC;
+const TOKEN_CHR: u8 = 0xBD;
 const TOKEN_LEFT: u8 = 0xC0;
 const TOKEN_MID: u8 = 0xC1;
 const TOKEN_RIGHT: u8 = 0xC2;
@@ -43,6 +47,7 @@ const TOKEN_DATA: u8 = 0xDC;
 const TOKEN_DEF: u8 = 0xDD;
 const TOKEN_END: u8 = 0xE0;
 const TOKEN_ENDPROC: u8 = 0xE1;
+const TOKEN_ENDIF: u8 = 0xCD;
 const TOKEN_DIM: u8 = 0xE2;
 const TOKEN_FOR: u8 = 0xE3;
 const TOKEN_GOSUB: u8 = 0xE4;
@@ -93,6 +98,7 @@ pub(crate) enum BinaryOp {
     IntegerDivide,
     Modulo,
     Power,
+    ShiftLeft,
     And,
     Or,
     Equal,
@@ -115,6 +121,9 @@ pub(crate) enum LValue {
     ArrayElement(String, Expr),
     Memory(MemoryWidth, Expr),
     MemoryByteAt(Expr, Expr),
+    MemoryOffset(MemoryWidth, Expr, Expr),
+    MemoryString(Expr),
+    StringSlice(String, Expr, Expr),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -160,6 +169,8 @@ pub(crate) enum Statement {
     Plot(Expr, Expr, Expr),
     Gcol(Expr, Expr),
     If(Expr, Vec<Statement>, Vec<Statement>),
+    IfBlock(Expr),
+    EndIf,
     Goto(u16),
     Gosub(u16),
     Dim(Vec<DimDeclaration>),
@@ -175,9 +186,14 @@ pub(crate) enum Statement {
     Next(Option<String>),
     Repeat,
     Until(Expr),
-    ProcedureCall(String),
-    DefineProcedure(String),
-    DefineFunction(String),
+    ProcedureCall(String, Vec<Expr>),
+    DefineProcedure(String, Vec<String>),
+    DefineFunction(String, Vec<String>),
+    Sys {
+        name: Vec<u8>,
+        arguments: Vec<Option<Expr>>,
+        results: Vec<String>,
+    },
     FunctionReturn(Expr),
     Return,
     EndProcedure,
@@ -197,8 +213,14 @@ pub(crate) struct LocatedStatement {
 pub(crate) struct ParsedProgram {
     pub instructions: Vec<LocatedStatement>,
     pub line_entries: BTreeMap<u16, usize>,
-    pub procedures: std::collections::HashMap<String, usize>,
-    pub functions: std::collections::HashMap<String, usize>,
+    pub procedures: std::collections::HashMap<String, Definition>,
+    pub functions: std::collections::HashMap<String, Definition>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Definition {
+    pub entry: usize,
+    pub parameters: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -229,11 +251,23 @@ pub(crate) fn parse_program(
             }
             let index = parsed.instructions.len();
             match &statement {
-                Statement::DefineProcedure(name) => {
-                    parsed.procedures.insert(name.clone(), index + 1);
+                Statement::DefineProcedure(name, parameters) => {
+                    parsed.procedures.insert(
+                        name.clone(),
+                        Definition {
+                            entry: index + 1,
+                            parameters: parameters.clone(),
+                        },
+                    );
                 }
-                Statement::DefineFunction(name) => {
-                    parsed.functions.insert(name.clone(), index + 1);
+                Statement::DefineFunction(name, parameters) => {
+                    parsed.functions.insert(
+                        name.clone(),
+                        Definition {
+                            entry: index + 1,
+                            parameters: parameters.clone(),
+                        },
+                    );
                 }
                 _ => {}
             }
@@ -375,6 +409,7 @@ enum Token {
     String(Vec<u8>),
     Identifier(String),
     Keyword(u8),
+    Sys,
     LineReference(u16),
     Symbol(u8),
     End,
@@ -423,8 +458,15 @@ impl<'a> Lexer<'a> {
             self.offset += 4;
             return Ok(Token::LineReference(decode_line_reference(encoded)));
         }
+        if byte == 0xC8 && self.bytes.get(self.offset + 1) == Some(&0x99) {
+            self.offset += 2;
+            return Ok(Token::Sys);
+        }
         if byte >= 0x7F {
             self.offset += 1;
+            if byte == TOKEN_REM {
+                self.offset = self.bytes.len();
+            }
             return Ok(Token::Keyword(byte));
         }
         if byte == b'"' {
@@ -513,7 +555,7 @@ impl<'a> Lexer<'a> {
         while self
             .bytes
             .get(self.offset)
-            .is_some_and(u8::is_ascii_alphanumeric)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
         {
             self.offset += 1;
         }
@@ -584,12 +626,20 @@ impl Parser {
             }
             Token::Keyword(TOKEN_REPEAT) => Ok(Statement::Repeat),
             Token::Keyword(TOKEN_UNTIL) => Ok(Statement::Until(self.parse_expression(0)?)),
-            Token::Keyword(TOKEN_PROC) => Ok(Statement::ProcedureCall(
-                self.expect_identifier("procedure name")?,
-            )),
+            Token::Keyword(TOKEN_PROC) => {
+                let name = self.expect_routine_name("procedure name")?;
+                let arguments = if self.consume_symbol(b'(') {
+                    self.parse_call_arguments_after_open()?
+                } else {
+                    Vec::new()
+                };
+                Ok(Statement::ProcedureCall(name, arguments))
+            }
             Token::Keyword(TOKEN_DEF) => self.parse_definition(),
+            Token::Sys => self.parse_sys(),
             Token::Keyword(TOKEN_RETURN) => Ok(Statement::Return),
             Token::Keyword(TOKEN_ENDPROC) => Ok(Statement::EndProcedure),
+            Token::Keyword(TOKEN_ENDIF) => Ok(Statement::EndIf),
             Token::Keyword(TOKEN_END) => Ok(Statement::End),
             Token::Keyword(TOKEN_CALL) => Ok(Statement::Call(self.parse_expression(0)?)),
             Token::Keyword(TOKEN_REM) => Ok(Statement::NoOp),
@@ -603,6 +653,20 @@ impl Parser {
                 ))
             }
             Token::Symbol(b'=') => Ok(Statement::FunctionReturn(self.parse_expression(0)?)),
+            Token::Symbol(b'$') => {
+                let address = match self.next().clone() {
+                    Token::Keyword(TOKEN_MODE) => Expr::Variable("MODE".into()),
+                    Token::Identifier(name) => Expr::Variable(name),
+                    other => {
+                        return self.error(format!("expected string address, found {other:?}"));
+                    }
+                };
+                self.expect_symbol(b'=')?;
+                Ok(Statement::Assign(
+                    LValue::MemoryString(address),
+                    self.parse_expression(0)?,
+                ))
+            }
             Token::Symbol(b'!') => {
                 let address = self.parse_expression(4)?;
                 self.expect_symbol(b'=')?;
@@ -612,6 +676,7 @@ impl Parser {
                 ))
             }
             Token::Identifier(name) => self.parse_assignment_or_function_call(name),
+            Token::Keyword(TOKEN_MID) => self.parse_string_slice_assignment(),
             Token::LineReference(target) => Ok(Statement::Goto(target)),
             Token::End => self.error("expected a statement"),
             other => self.error(format!("unexpected token {other:?} at statement start")),
@@ -628,6 +693,9 @@ impl Parser {
             Vec::new()
         };
         if then_body.is_empty() {
+            if else_body.is_empty() {
+                return Ok(Statement::IfBlock(condition));
+            }
             return self.error("IF has no statement to execute");
         }
         Ok(Statement::If(condition, then_body, else_body))
@@ -799,16 +867,82 @@ impl Parser {
 
     fn parse_definition(&mut self) -> Result<Statement, RuntimeError> {
         if self.consume_keyword(TOKEN_PROC) {
-            Ok(Statement::DefineProcedure(
-                self.expect_identifier("procedure name")?,
-            ))
+            let name = self.expect_routine_name("procedure name")?;
+            let parameters = self.parse_parameter_list()?;
+            Ok(Statement::DefineProcedure(name, parameters))
         } else if self.consume_keyword(TOKEN_FN) {
-            Ok(Statement::DefineFunction(
-                self.expect_identifier("function name")?,
-            ))
+            let name = self.expect_identifier("function name")?;
+            let parameters = self.parse_parameter_list()?;
+            Ok(Statement::DefineFunction(name, parameters))
         } else {
             self.error("expected PROC or FN after DEF")
         }
+    }
+
+    fn parse_parameter_list(&mut self) -> Result<Vec<String>, RuntimeError> {
+        if !self.consume_symbol(b'(') {
+            return Ok(Vec::new());
+        }
+        let mut parameters = Vec::new();
+        if self.consume_symbol(b')') {
+            return Ok(parameters);
+        }
+        loop {
+            parameters.push(self.expect_identifier("parameter name")?);
+            if self.consume_symbol(b')') {
+                break;
+            }
+            self.expect_symbol(b',')?;
+        }
+        Ok(parameters)
+    }
+
+    fn parse_sys(&mut self) -> Result<Statement, RuntimeError> {
+        let Token::String(name) = self.next().clone() else {
+            return self.error("SYS requires a quoted SWI name");
+        };
+        let mut arguments = Vec::new();
+        if self.consume_symbol(b',') {
+            loop {
+                if self.peek_symbol(b',') || self.peek_keyword(TOKEN_TO) || self.is_end() {
+                    arguments.push(None);
+                } else {
+                    arguments.push(Some(self.parse_expression(0)?));
+                }
+                if !self.consume_symbol(b',') {
+                    break;
+                }
+            }
+        }
+        let mut results = Vec::new();
+        if self.consume_keyword(TOKEN_TO) {
+            loop {
+                results.push(self.expect_identifier("SYS result variable")?);
+                if !self.consume_symbol(b',') {
+                    break;
+                }
+            }
+        }
+        Ok(Statement::Sys {
+            name,
+            arguments,
+            results,
+        })
+    }
+
+    fn parse_string_slice_assignment(&mut self) -> Result<Statement, RuntimeError> {
+        let arguments = self.parse_call_arguments()?;
+        if arguments.len() != 3 {
+            return self.error("MID$ assignment requires three arguments");
+        }
+        let Expr::Variable(name) = arguments[0].clone() else {
+            return self.error("MID$ assignment requires a string variable");
+        };
+        self.expect_symbol(b'=')?;
+        Ok(Statement::Assign(
+            LValue::StringSlice(name, arguments[1].clone(), arguments[2].clone()),
+            self.parse_expression(0)?,
+        ))
     }
 
     fn parse_assignment_or_function_call(
@@ -823,6 +957,19 @@ impl Parser {
             LValue::Variable(name.clone())
         };
 
+        if self.consume_symbol(b'!') {
+            let offset = self.parse_expression(4)?;
+            self.expect_symbol(b'=')?;
+            let base = match &target {
+                LValue::Variable(base) => Expr::Variable(base.clone()),
+                _ => return self.error("word indirection requires a scalar base variable"),
+            };
+            return Ok(Statement::Assign(
+                LValue::MemoryOffset(MemoryWidth::Word, base, offset),
+                self.parse_expression(0)?,
+            ));
+        }
+
         if self.consume_symbol(b'?') {
             let offset = self.parse_expression(4)?;
             self.expect_symbol(b'=')?;
@@ -833,10 +980,23 @@ impl Parser {
             };
             return Ok(Statement::Assign(LValue::MemoryByteAt(base, offset), value));
         }
-        if !self.consume_symbol(b'=') {
+        let append = self.consume_symbol(b'+');
+        if append {
+            self.expect_symbol(b'=')?;
+        } else if !self.consume_symbol(b'=') {
             return self.error("expected '=' after variable name");
         }
-        Ok(Statement::Assign(target, self.parse_expression(0)?))
+        let value = self.parse_expression(0)?;
+        let value = if append {
+            let left = match &target {
+                LValue::Variable(name) => Expr::Variable(name.clone()),
+                _ => return self.error("+= is only supported for scalar variables"),
+            };
+            Expr::Binary(Box::new(left), BinaryOp::Add, Box::new(value))
+        } else {
+            value
+        };
+        Ok(Statement::Assign(target, value))
     }
 
     fn parse_lvalue(&mut self) -> Result<LValue, RuntimeError> {
@@ -902,17 +1062,29 @@ impl Parser {
             Token::Keyword(TOKEN_TIME) => Ok(Expr::Variable("TIME".into())),
             Token::Keyword(TOKEN_LOMEM) => Ok(Expr::Variable("LOMEM".into())),
             Token::Keyword(TOKEN_HIMEM) => Ok(Expr::Variable("HIMEM".into())),
-            Token::Keyword(TOKEN_INKEY) => Ok(Expr::Variable("INKEY".into())),
+            Token::Keyword(TOKEN_INKEY) => {
+                let arguments = if self.consume_symbol(b'(') {
+                    self.parse_call_arguments_after_open()?
+                } else {
+                    Vec::new()
+                };
+                Ok(Expr::Builtin(TOKEN_INKEY, arguments))
+            }
             Token::Keyword(
                 TOKEN_ABS | TOKEN_COS | TOKEN_INT | TOKEN_LEN | TOKEN_LN | TOKEN_LOG | TOKEN_SQR
-                | TOKEN_TAN | TOKEN_STR,
+                | TOKEN_TAN | TOKEN_STR | TOKEN_ASC | TOKEN_VAL | TOKEN_CHR,
             ) => {
                 let Token::Keyword(token) = token else {
                     unreachable!()
                 };
-                Ok(Expr::Builtin(token, vec![self.parse_expression(7)?]))
+                let arguments = if self.consume_symbol(b'(') {
+                    self.parse_call_arguments_after_open()?
+                } else {
+                    vec![self.parse_expression(7)?]
+                };
+                Ok(Expr::Builtin(token, arguments))
             }
-            Token::Keyword(TOKEN_LEFT | TOKEN_MID | TOKEN_RIGHT | TOKEN_STRING) => {
+            Token::Keyword(TOKEN_INSTR | TOKEN_LEFT | TOKEN_MID | TOKEN_RIGHT | TOKEN_STRING) => {
                 let Token::Keyword(token) = token else {
                     unreachable!()
                 };
@@ -968,11 +1140,27 @@ impl Parser {
         Ok(arguments)
     }
 
+    fn parse_call_arguments_after_open(&mut self) -> Result<Vec<Expr>, RuntimeError> {
+        let mut arguments = Vec::new();
+        if self.consume_symbol(b')') {
+            return Ok(arguments);
+        }
+        arguments.push(self.parse_expression(0)?);
+        while self.consume_symbol(b',') {
+            arguments.push(self.parse_expression(0)?);
+        }
+        self.expect_symbol(b')')?;
+        Ok(arguments)
+    }
+
     fn peek_binary_operator(&self) -> Option<(BinaryOp, u8, usize)> {
         match self.peek() {
             Token::Keyword(TOKEN_OR) => Some((BinaryOp::Or, 1, 1)),
             Token::Keyword(TOKEN_AND) => Some((BinaryOp::And, 2, 1)),
             Token::Symbol(b'=') => Some((BinaryOp::Equal, 3, 1)),
+            Token::Symbol(b'<') if self.peek_n(1) == &Token::Symbol(b'<') => {
+                Some((BinaryOp::ShiftLeft, 4, 2))
+            }
             Token::Symbol(b'<') if self.peek_n(1) == &Token::Symbol(b'=') => {
                 Some((BinaryOp::LessEqual, 3, 2))
             }
@@ -1008,6 +1196,14 @@ impl Parser {
             Ok(name)
         } else {
             self.error(format!("expected {description}"))
+        }
+    }
+
+    fn expect_routine_name(&mut self, description: &str) -> Result<String, RuntimeError> {
+        match self.next().clone() {
+            Token::Identifier(name) => Ok(name),
+            Token::Keyword(TOKEN_MODE) => Ok("MODE".into()),
+            other => self.error(format!("expected {description}, found {other:?}")),
         }
     }
 

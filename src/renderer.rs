@@ -2,78 +2,76 @@
 
 use crate::{
     font::bbc_micro_glyph,
-    graphics::{GraphicsPrimitive, GraphicsSnapshot, GraphicsWindow, Point},
+    graphics::{GraphicsPrimitive, GraphicsSnapshot, GraphicsWindow, Point, graphics_colour},
 };
 
 pub const SCREEN_WIDTH: u32 = 640;
 pub const SCREEN_HEIGHT: u32 = 256;
 const BYTES_PER_PIXEL: usize = 4;
 
-const PALETTE: [[u8; 4]; 8] = [
-    [0x00, 0x00, 0x00, 0xFF], // black
-    [0xFF, 0x00, 0x00, 0xFF], // red
-    [0x00, 0xFF, 0x00, 0xFF], // green
-    [0xFF, 0xFF, 0x00, 0xFF], // yellow
-    [0x00, 0x00, 0xFF, 0xFF], // blue
-    [0xFF, 0x00, 0xFF, 0xFF], // magenta
-    [0x00, 0xFF, 0xFF, 0xFF], // cyan
-    [0xFF, 0xFF, 0xFF, 0xFF], // white
-];
-
 /// Paint graphics and the BBC bitmap text into one RGBA frame.
 pub fn render(snapshot: &GraphicsSnapshot, frame: &mut [u8]) {
-    let expected_size = SCREEN_WIDTH as usize * SCREEN_HEIGHT as usize * BYTES_PER_PIXEL;
+    let width = snapshot.mode.pixel_width;
+    let height = snapshot.mode.pixel_height;
+    let expected_size = width as usize * height as usize * BYTES_PER_PIXEL;
     if frame.len() < expected_size {
         return;
     }
 
-    for pixel in frame[..expected_size].chunks_exact_mut(BYTES_PER_PIXEL) {
-        pixel.copy_from_slice(&PALETTE[0]);
-    }
+    if let Some(surface) = &snapshot.raster_surface {
+        surface.copy_to(&mut frame[..expected_size]);
+    } else {
+        for pixel in frame[..expected_size].chunks_exact_mut(BYTES_PER_PIXEL) {
+            pixel.copy_from_slice(&[0, 0, 0, 0xFF]);
+        }
 
-    for primitive in &snapshot.primitives {
-        match primitive {
-            GraphicsPrimitive::Line {
-                from,
-                to,
-                logical_colour,
-                clip,
-                ..
-            } => {
-                if let Some((from, to)) = clip_line(*from, *to, *clip, snapshot) {
-                    let from = screen_point(from, snapshot);
-                    let to = screen_point(to, snapshot);
-                    draw_line(frame, from, to, colour(*logical_colour));
+        for primitive in &snapshot.primitives {
+            match primitive {
+                GraphicsPrimitive::Line {
+                    from,
+                    to,
+                    logical_colour,
+                    clip,
+                    ..
+                } => {
+                    if let Some((from, to)) = clip_line(*from, *to, *clip, snapshot) {
+                        let from = screen_point(from, snapshot);
+                        let to = screen_point(to, snapshot);
+                        draw_line(frame, width, height, from, to, colour(*logical_colour));
+                    }
                 }
-            }
-            GraphicsPrimitive::Point {
-                at,
-                logical_colour,
-                clip,
-                ..
-            } => {
-                if inside(*at, *clip, snapshot) {
-                    let (x, y) = screen_point(*at, snapshot);
-                    set_pixel(frame, x, y, colour(*logical_colour));
+                GraphicsPrimitive::Point {
+                    at,
+                    logical_colour,
+                    clip,
+                    ..
+                } => {
+                    if inside(*at, *clip, snapshot) {
+                        let (x, y) = screen_point(*at, snapshot);
+                        set_pixel(frame, width, height, x, y, colour(*logical_colour));
+                    }
                 }
             }
         }
     }
 
-    draw_text(snapshot, frame);
-    draw_cursor(snapshot, frame);
+    draw_text(snapshot, frame, width, height);
+    draw_cursor(snapshot, frame, width, height);
 }
 
-fn draw_text(snapshot: &GraphicsSnapshot, frame: &mut [u8]) {
+fn draw_text(snapshot: &GraphicsSnapshot, frame: &mut [u8], width: u32, height: u32) {
     let columns = u32::from(snapshot.mode.text_columns);
     let rows = u32::from(snapshot.mode.text_rows);
     if columns == 0 || rows == 0 {
         return;
     }
 
-    let text_colour = colour(snapshot.text_colour);
+    let text_colour = colour(u32::from(snapshot.text_colour));
 
     for (index, character) in snapshot.text_cells.iter().copied().enumerate() {
+        if character == b' ' {
+            continue;
+        }
         let Some(glyph) = bbc_micro_glyph(character) else {
             continue;
         };
@@ -83,10 +81,10 @@ fn draw_text(snapshot: &GraphicsSnapshot, frame: &mut [u8]) {
             break;
         }
 
-        let left = column * SCREEN_WIDTH / columns;
-        let right = (column + 1) * SCREEN_WIDTH / columns;
-        let top = row * SCREEN_HEIGHT / rows;
-        let bottom = (row + 1) * SCREEN_HEIGHT / rows;
+        let left = column * width / columns;
+        let right = (column + 1) * width / columns;
+        let top = row * height / rows;
+        let bottom = (row + 1) * height / rows;
         let cell_width = right - left;
         let cell_height = bottom - top;
         for y in 0..cell_height {
@@ -95,14 +93,21 @@ fn draw_text(snapshot: &GraphicsSnapshot, frame: &mut [u8]) {
             for x in 0..cell_width {
                 let glyph_x = (x * 8 / cell_width) as u8;
                 if bits & (0x80 >> glyph_x) != 0 {
-                    set_pixel(frame, (left + x) as i32, (top + y) as i32, text_colour);
+                    set_pixel(
+                        frame,
+                        width,
+                        height,
+                        (left + x) as i32,
+                        (top + y) as i32,
+                        text_colour,
+                    );
                 }
             }
         }
     }
 }
 
-fn draw_cursor(snapshot: &GraphicsSnapshot, frame: &mut [u8]) {
+fn draw_cursor(snapshot: &GraphicsSnapshot, frame: &mut [u8], width: u32, height: u32) {
     let columns = u32::from(snapshot.mode.text_columns);
     let rows = u32::from(snapshot.mode.text_rows);
     if columns == 0 || rows == 0 {
@@ -115,15 +120,17 @@ fn draw_cursor(snapshot: &GraphicsSnapshot, frame: &mut [u8]) {
         return;
     }
 
-    let left = x * SCREEN_WIDTH / columns;
-    let right = (x + 1) * SCREEN_WIDTH / columns;
-    let bottom = (y + 1) * SCREEN_HEIGHT / rows - 1;
+    let left = x * width / columns;
+    let right = (x + 1) * width / columns;
+    let bottom = (y + 1) * height / rows - 1;
     for cursor_x in left..right {
         set_pixel(
             frame,
+            width,
+            height,
             cursor_x as i32,
             bottom as i32,
-            colour(snapshot.text_colour),
+            colour(u32::from(snapshot.text_colour)),
         );
     }
 }
@@ -223,16 +230,25 @@ fn out_code(x: f64, y: f64, left: f64, right: f64, bottom: f64, top: f64) -> u8 
 }
 
 fn screen_point(point: Point, snapshot: &GraphicsSnapshot) -> (i32, i32) {
-    let x = i64::from(point.x) * i64::from(SCREEN_WIDTH) / i64::from(snapshot.mode.logical_width);
-    let y = i64::from(snapshot.mode.logical_height - 1 - point.y) * i64::from(SCREEN_HEIGHT)
+    let width = snapshot.mode.pixel_width;
+    let height = snapshot.mode.pixel_height;
+    let x = i64::from(point.x) * i64::from(width) / i64::from(snapshot.mode.logical_width);
+    let y = i64::from(snapshot.mode.logical_height - 1 - point.y) * i64::from(height)
         / i64::from(snapshot.mode.logical_height);
     (
-        x.clamp(0, i64::from(SCREEN_WIDTH - 1)) as i32,
-        y.clamp(0, i64::from(SCREEN_HEIGHT - 1)) as i32,
+        x.clamp(0, i64::from(width - 1)) as i32,
+        y.clamp(0, i64::from(height - 1)) as i32,
     )
 }
 
-fn draw_line(frame: &mut [u8], (mut x0, mut y0): (i32, i32), (x1, y1): (i32, i32), rgba: [u8; 4]) {
+fn draw_line(
+    frame: &mut [u8],
+    width: u32,
+    height: u32,
+    (mut x0, mut y0): (i32, i32),
+    (x1, y1): (i32, i32),
+    rgba: [u8; 4],
+) {
     let dx = (x1 - x0).abs();
     let sx = if x0 < x1 { 1 } else { -1 };
     let dy = -(y1 - y0).abs();
@@ -240,7 +256,7 @@ fn draw_line(frame: &mut [u8], (mut x0, mut y0): (i32, i32), (x1, y1): (i32, i32
     let mut error = dx + dy;
 
     loop {
-        set_pixel(frame, x0, y0, rgba);
+        set_pixel(frame, width, height, x0, y0, rgba);
         if x0 == x1 && y0 == y1 {
             break;
         }
@@ -256,14 +272,14 @@ fn draw_line(frame: &mut [u8], (mut x0, mut y0): (i32, i32), (x1, y1): (i32, i32
     }
 }
 
-fn set_pixel(frame: &mut [u8], x: i32, y: i32, rgba: [u8; 4]) {
-    if x < 0 || y < 0 || x >= SCREEN_WIDTH as i32 || y >= SCREEN_HEIGHT as i32 {
+fn set_pixel(frame: &mut [u8], width: u32, height: u32, x: i32, y: i32, rgba: [u8; 4]) {
+    if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
         return;
     }
-    let offset = (y as usize * SCREEN_WIDTH as usize + x as usize) * BYTES_PER_PIXEL;
+    let offset = (y as usize * width as usize + x as usize) * BYTES_PER_PIXEL;
     frame[offset..offset + BYTES_PER_PIXEL].copy_from_slice(&rgba);
 }
 
-fn colour(logical_colour: u8) -> [u8; 4] {
-    PALETTE[usize::from(logical_colour & 7)]
+fn colour(logical_colour: u32) -> [u8; 4] {
+    graphics_colour(logical_colour)
 }

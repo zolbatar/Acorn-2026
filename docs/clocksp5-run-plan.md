@@ -14,7 +14,7 @@ The saved-program decoder remains shared across earlier BASIC versions. The exec
 
 ClockSP5 uses compact colon-separated tokenised lines; numeric, integer and string variables; arithmetic and comparison expressions; arrays; `DATA`/`READ`/`RESTORE`; `IF`; `GOTO`; nested `REPEAT`/`UNTIL` and `FOR`/`NEXT`; `PROC`/`ENDPROC`; `GOSUB`/`RETURN`; numeric and string built-ins; and the `TIME` and `INKEY` pseudo-variables.
 
-The checked-in program starts with `Z%=&0211`. With the hosted no-key result (`INKEY` returns -256), its own branch sets `Y%=2`. That selects the BBC B BASIC II comparison data and avoids its processor-memory probe. The set low bit in `Z%` also makes `PROC s` return before the `CALL &FFF1`, memory write, and `*FX` setup lines. The demo therefore needs an accurate, advancing BASIC `TIME` value and a no-key `INKEY`, but not host-pointer access, native ARM execution, or hardware/OS emulation for these guarded paths.
+The checked-in program starts with `Z%=&0211`. With no host key pending, bare `INKEY` returns -256 and its own branch sets `Y%=2`. That selects the BBC B BASIC II comparison data and avoids its processor-memory probe. The set low bit in `Z%` also makes `PROC s` return before the `CALL &FFF1`, memory write, and `*FX` setup lines. The demo therefore needs an accurate, advancing BASIC `TIME` value and a no-key result when the input queue is empty, but not host-pointer access, native ARM execution, or hardware/OS emulation for these guarded paths.
 
 ## Implementation sequence
 

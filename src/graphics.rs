@@ -1,4 +1,5 @@
 use crate::error::RuntimeError;
+use std::sync::{Arc, Mutex};
 
 const DEFAULT_GRAPHICS_WIDTH: i32 = 1280;
 const DEFAULT_GRAPHICS_HEIGHT: i32 = 1024;
@@ -30,6 +31,8 @@ pub struct ScreenMode {
     pub number: u8,
     pub logical_width: i32,
     pub logical_height: i32,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
     pub text_columns: u16,
     pub text_rows: u16,
     pub colours: u8,
@@ -42,14 +45,14 @@ pub enum GraphicsPrimitive {
         to: Point,
         plot_code: u8,
         action: u8,
-        logical_colour: u8,
+        logical_colour: u32,
         clip: GraphicsWindow,
     },
     Point {
         at: Point,
         plot_code: u8,
         action: u8,
-        logical_colour: u8,
+        logical_colour: u32,
         clip: GraphicsWindow,
     },
 }
@@ -64,9 +67,87 @@ pub struct GraphicsSnapshot {
     pub text_cursor: Point,
     pub text_colour: u8,
     pub graphics_action: u8,
-    pub graphics_colour: u8,
+    pub graphics_colour: u32,
     pub text_cells: Vec<u8>,
     pub primitives: Vec<GraphicsPrimitive>,
+    pub raster_surface: Option<SharedRasterSurface>,
+}
+
+#[derive(Clone)]
+pub struct SharedRasterSurface(Arc<Mutex<RasterData>>);
+
+#[derive(Debug)]
+struct RasterData {
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+}
+
+impl std::fmt::Debug for SharedRasterSurface {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let data = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        formatter
+            .debug_struct("SharedRasterSurface")
+            .field("width", &data.width)
+            .field("height", &data.height)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for SharedRasterSurface {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SharedRasterSurface {}
+
+impl SharedRasterSurface {
+    fn new(width: u32, height: u32) -> Self {
+        let mut pixels = vec![0; width as usize * height as usize * 4];
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel[3] = 0xFF;
+        }
+        Self(Arc::new(Mutex::new(RasterData {
+            width,
+            height,
+            pixels,
+        })))
+    }
+
+    fn set_pixel(&self, x: u32, y: u32, color: [u8; 4]) {
+        let mut data = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if x >= data.width || y >= data.height {
+            return;
+        }
+        let offset = (y as usize * data.width as usize + x as usize) * 4;
+        data.pixels[offset..offset + 4].copy_from_slice(&color);
+    }
+
+    fn clear(&self) {
+        let mut data = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for pixel in data.pixels.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[0, 0, 0, 0xFF]);
+        }
+    }
+
+    pub fn copy_to(&self, target: &mut [u8]) {
+        let data = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let length = target.len().min(data.pixels.len());
+        target[..length].copy_from_slice(&data.pixels[..length]);
+    }
 }
 
 struct PendingVdu {
@@ -106,6 +187,7 @@ impl Default for GraphicsService {
                     usize::from(mode.text_columns) * usize::from(mode.text_rows)
                 ],
                 primitives: Vec::new(),
+                raster_surface: None,
             },
             pending_vdu: None,
         }
@@ -170,14 +252,15 @@ impl GraphicsService {
                     self.snapshot.graphics_cursor = target;
                 } else {
                     let from = self.snapshot.graphics_cursor;
-                    self.snapshot.primitives.push(GraphicsPrimitive::Line {
+                    let primitive = GraphicsPrimitive::Line {
                         from,
                         to: target,
                         plot_code,
                         action: self.snapshot.graphics_action,
                         logical_colour: self.snapshot.graphics_colour,
                         clip: self.snapshot.graphics_window,
-                    });
+                    };
+                    self.record_primitive(primitive);
                     self.snapshot.graphics_cursor = target;
                 }
             }
@@ -185,13 +268,14 @@ impl GraphicsService {
                 if operation == 0 {
                     self.snapshot.graphics_cursor = target;
                 } else {
-                    self.snapshot.primitives.push(GraphicsPrimitive::Point {
+                    let primitive = GraphicsPrimitive::Point {
                         at: target,
                         plot_code,
                         action: self.snapshot.graphics_action,
                         logical_colour: self.snapshot.graphics_colour,
                         clip: self.snapshot.graphics_window,
-                    });
+                    };
+                    self.record_primitive(primitive);
                     self.snapshot.graphics_cursor = target;
                 }
             }
@@ -202,6 +286,59 @@ impl GraphicsService {
             }
         }
         Ok(())
+    }
+
+    pub fn set_rgb_gcol(&mut self, palette_entry: u32) {
+        self.snapshot.graphics_colour = palette_entry;
+    }
+
+    pub fn set_extended_mode(
+        &mut self,
+        pixel_width: u32,
+        pixel_height: u32,
+        x_eigenfactor: u8,
+        y_eigenfactor: u8,
+    ) -> Result<(), RuntimeError> {
+        let logical_width = pixel_width
+            .checked_mul(1_u32 << x_eigenfactor)
+            .and_then(|width| i32::try_from(width).ok())
+            .ok_or_else(|| RuntimeError::Program("extended mode width is too large".into()))?;
+        let logical_height = pixel_height
+            .checked_mul(1_u32 << y_eigenfactor)
+            .and_then(|height| i32::try_from(height).ok())
+            .ok_or_else(|| RuntimeError::Program("extended mode height is too large".into()))?;
+        let mode = ScreenMode {
+            number: u8::MAX,
+            logical_width,
+            logical_height,
+            pixel_width,
+            pixel_height,
+            text_columns: 80,
+            text_rows: 25,
+            colours: 16,
+        };
+        self.snapshot.mode = mode;
+        self.snapshot.text_window = default_text_window(mode);
+        self.snapshot.graphics_window = default_graphics_window(mode);
+        self.snapshot.graphics_origin = Point::default();
+        self.snapshot.graphics_cursor = Point::default();
+        self.snapshot.text_cursor = Point::default();
+        self.snapshot.text_cells =
+            vec![b' '; usize::from(mode.text_columns) * usize::from(mode.text_rows)];
+        self.snapshot.primitives.clear();
+        self.snapshot.raster_surface = Some(SharedRasterSurface::new(pixel_width, pixel_height));
+        self.snapshot.text_colour = 7;
+        self.snapshot.graphics_action = 0;
+        self.snapshot.graphics_colour = 7;
+        Ok(())
+    }
+
+    fn record_primitive(&mut self, primitive: GraphicsPrimitive) {
+        if let Some(surface) = &self.snapshot.raster_surface {
+            rasterize_primitive(surface, &self.snapshot, &primitive);
+        } else {
+            self.snapshot.primitives.push(primitive);
+        }
     }
 
     pub fn snapshot(&self) -> &GraphicsSnapshot {
@@ -230,11 +367,16 @@ impl GraphicsService {
                 self.snapshot.text_cursor.x = 0;
                 return Ok(Some(command));
             }
-            16 => self.snapshot.primitives.clear(),
+            16 => {
+                self.snapshot.primitives.clear();
+                if let Some(surface) = &self.snapshot.raster_surface {
+                    surface.clear();
+                }
+            }
             17 => self.snapshot.text_colour = parameters[0],
             18 => {
                 self.snapshot.graphics_action = parameters[0];
-                self.snapshot.graphics_colour = parameters[1];
+                self.snapshot.graphics_colour = u32::from(parameters[1]);
             }
             20 => {
                 self.snapshot.text_colour = 7;
@@ -288,6 +430,7 @@ impl GraphicsService {
         self.snapshot.text_cells =
             vec![b' '; usize::from(mode.text_columns) * usize::from(mode.text_rows)];
         self.snapshot.primitives.clear();
+        self.snapshot.raster_surface = None;
         self.snapshot.text_colour = 7;
         self.snapshot.graphics_action = 0;
         self.snapshot.graphics_colour = 7;
@@ -423,25 +566,209 @@ fn vdu_parameter_count(command: u8) -> usize {
 }
 
 fn screen_mode(number: u8) -> Option<ScreenMode> {
-    let (logical_height, text_columns, text_rows, colours) = match number {
-        0 => (DEFAULT_GRAPHICS_HEIGHT, 80, 32, 2),
-        1 => (DEFAULT_GRAPHICS_HEIGHT, 40, 32, 4),
-        2 => (DEFAULT_GRAPHICS_HEIGHT, 20, 32, 16),
-        3 => (1000, 80, 25, 2),
-        4 => (DEFAULT_GRAPHICS_HEIGHT, 40, 32, 2),
-        5 => (DEFAULT_GRAPHICS_HEIGHT, 20, 32, 4),
-        6 => (1000, 40, 25, 2),
-        7 => (1000, 40, 25, 16),
+    let (logical_height, pixel_height, text_columns, text_rows, colours) = match number {
+        0 => (DEFAULT_GRAPHICS_HEIGHT, 256, 80, 32, 2),
+        1 => (DEFAULT_GRAPHICS_HEIGHT, 256, 40, 32, 4),
+        2 => (DEFAULT_GRAPHICS_HEIGHT, 256, 20, 32, 16),
+        3 => (1000, 250, 80, 25, 2),
+        4 => (DEFAULT_GRAPHICS_HEIGHT, 256, 40, 32, 2),
+        5 => (DEFAULT_GRAPHICS_HEIGHT, 256, 20, 32, 4),
+        6 => (1000, 250, 40, 25, 2),
+        7 => (1000, 250, 40, 25, 16),
         _ => return None,
     };
     Some(ScreenMode {
         number,
         logical_width: DEFAULT_GRAPHICS_WIDTH,
         logical_height,
+        pixel_width: 640,
+        pixel_height,
         text_columns,
         text_rows,
         colours,
     })
+}
+
+fn rasterize_primitive(
+    surface: &SharedRasterSurface,
+    snapshot: &GraphicsSnapshot,
+    primitive: &GraphicsPrimitive,
+) {
+    match primitive {
+        GraphicsPrimitive::Point {
+            at,
+            clip,
+            logical_colour,
+            ..
+        } => {
+            if point_inside(*at, *clip, snapshot) {
+                let (x, y) = screen_point(*at, snapshot);
+                surface.set_pixel(x, y, graphics_colour(*logical_colour));
+            }
+        }
+        GraphicsPrimitive::Line {
+            from,
+            to,
+            clip,
+            logical_colour,
+            ..
+        } => {
+            let Some((from, to)) = clip_line(*from, *to, *clip, snapshot) else {
+                return;
+            };
+            let (x0_u, y0_u) = screen_point(from, snapshot);
+            let (x1_u, y1_u) = screen_point(to, snapshot);
+            let (mut x0, mut y0) = (x0_u as i32, y0_u as i32);
+            let (x1, y1) = (x1_u as i32, y1_u as i32);
+            let dx = (x1 as i64 - x0 as i64).abs() as i32;
+            let sx = if x0 < x1 { 1 } else { -1 };
+            let dy = -((y1 as i64 - y0 as i64).abs() as i32);
+            let sy = if y0 < y1 { 1 } else { -1 };
+            let mut error = dx + dy;
+            let color = graphics_colour(*logical_colour);
+            loop {
+                surface.set_pixel(x0 as u32, y0 as u32, color);
+                if x0 == x1 && y0 == y1 {
+                    break;
+                }
+                let twice_error = 2 * error;
+                if twice_error >= dy {
+                    error += dy;
+                    x0 += sx;
+                }
+                if twice_error <= dx {
+                    error += dx;
+                    y0 += sy;
+                }
+            }
+        }
+    }
+}
+
+fn point_inside(point: Point, clip: GraphicsWindow, snapshot: &GraphicsSnapshot) -> bool {
+    point.x >= clip.left
+        && point.x <= clip.right
+        && point.y >= clip.bottom
+        && point.y <= clip.top
+        && point.x >= 0
+        && point.x < snapshot.mode.logical_width
+        && point.y >= 0
+        && point.y < snapshot.mode.logical_height
+}
+
+fn screen_point(point: Point, snapshot: &GraphicsSnapshot) -> (u32, u32) {
+    let width = i64::from(snapshot.mode.pixel_width);
+    let height = i64::from(snapshot.mode.pixel_height);
+    let x = i64::from(point.x) * width / i64::from(snapshot.mode.logical_width);
+    let y = i64::from(snapshot.mode.logical_height - 1 - point.y) * height
+        / i64::from(snapshot.mode.logical_height);
+    (x.clamp(0, width - 1) as u32, y.clamp(0, height - 1) as u32)
+}
+
+fn clip_line(
+    from: Point,
+    to: Point,
+    clip: GraphicsWindow,
+    snapshot: &GraphicsSnapshot,
+) -> Option<(Point, Point)> {
+    let (left, right) = (
+        clip.left.max(0) as f64,
+        clip.right.min(snapshot.mode.logical_width - 1) as f64,
+    );
+    let (bottom, top) = (
+        clip.bottom.max(0) as f64,
+        clip.top.min(snapshot.mode.logical_height - 1) as f64,
+    );
+    if left > right || bottom > top {
+        return None;
+    }
+    let (mut x0, mut y0, mut x1, mut y1) = (from.x as f64, from.y as f64, to.x as f64, to.y as f64);
+    loop {
+        let c0 = line_out_code(x0, y0, left, right, bottom, top);
+        let c1 = line_out_code(x1, y1, left, right, bottom, top);
+        if c0 | c1 == 0 {
+            return Some((
+                Point {
+                    x: x0.round() as i32,
+                    y: y0.round() as i32,
+                },
+                Point {
+                    x: x1.round() as i32,
+                    y: y1.round() as i32,
+                },
+            ));
+        }
+        if c0 & c1 != 0 {
+            return None;
+        }
+        let outside = if c0 != 0 { c0 } else { c1 };
+        let (x, y) = if outside & 8 != 0 {
+            if y1 == y0 {
+                return None;
+            }
+            (x0 + (x1 - x0) * (top - y0) / (y1 - y0), top)
+        } else if outside & 4 != 0 {
+            if y1 == y0 {
+                return None;
+            }
+            (x0 + (x1 - x0) * (bottom - y0) / (y1 - y0), bottom)
+        } else if outside & 2 != 0 {
+            if x1 == x0 {
+                return None;
+            }
+            (right, y0 + (y1 - y0) * (right - x0) / (x1 - x0))
+        } else {
+            if x1 == x0 {
+                return None;
+            }
+            (left, y0 + (y1 - y0) * (left - x0) / (x1 - x0))
+        };
+        if outside == c0 {
+            x0 = x;
+            y0 = y;
+        } else {
+            x1 = x;
+            y1 = y;
+        }
+    }
+}
+
+fn line_out_code(x: f64, y: f64, left: f64, right: f64, bottom: f64, top: f64) -> u8 {
+    let mut code = 0;
+    if x < left {
+        code |= 1;
+    } else if x > right {
+        code |= 2;
+    }
+    if y < bottom {
+        code |= 4;
+    } else if y > top {
+        code |= 8;
+    }
+    code
+}
+
+pub(crate) fn graphics_colour(value: u32) -> [u8; 4] {
+    if value <= 0xFF {
+        const PALETTE: [[u8; 4]; 8] = [
+            [0x00, 0x00, 0x00, 0xFF],
+            [0xFF, 0x00, 0x00, 0xFF],
+            [0x00, 0xFF, 0x00, 0xFF],
+            [0xFF, 0xFF, 0x00, 0xFF],
+            [0x00, 0x00, 0xFF, 0xFF],
+            [0xFF, 0x00, 0xFF, 0xFF],
+            [0x00, 0xFF, 0xFF, 0xFF],
+            [0xFF, 0xFF, 0xFF, 0xFF],
+        ];
+        PALETTE[(value as usize) & 7]
+    } else {
+        [
+            ((value >> 8) & 0xFF) as u8,
+            ((value >> 16) & 0xFF) as u8,
+            (value >> 24) as u8,
+            0xFF,
+        ]
+    }
 }
 
 fn default_text_window(mode: ScreenMode) -> TextWindow {
