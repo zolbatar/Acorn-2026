@@ -7,6 +7,7 @@ description = "Hosted Acorn-2026 MOS and BASIC64 prototype"
 license = "MIT"
 
 [dependencies]
+arboard = { version = "3.6", default-features = false }
 pest = "2.8"
 pest_derive = "2.8"
 pixels = "0.15.0"

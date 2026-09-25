@@ -320,6 +320,8 @@ Load BASIC64 modules through the shared namespace. Establish messaging, windows,
 
 The first compatibility renderer is in place: one `winit` window backed by `pixels` renders the MOS prompt, BASIC text, and pixel/line primitives together. Next, improve palette and plot-action fidelity, display modes and pixel geometry, and program-driven screen updates. Add RISC OS native font loading, text shaping, font fallback, measurement/layout, and modern text. Keep text measurement and drawing on one coherent path.
 
+The hosted window accepts system clipboard text through Command+V on macOS (Control+V on other hosts). Pasted text follows the same input channel as keystrokes: CR, LF, and CRLF line endings submit lines through `OS_ReadLine`; tabs become spaces, printable ASCII is retained, and unsupported characters are ignored. This keeps console input inside the existing SWI path.
+
 **Exit:** the desktop and BASIC64 programs use the same service for text and graphics, with profile behavior selectable per application.
 
 ### Phase 5 — Compatibility depth

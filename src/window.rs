@@ -12,7 +12,7 @@ use winit::{
     dpi::LogicalSize,
     event::{ElementState, KeyEvent, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    keyboard::{Key, NamedKey},
+    keyboard::{Key, ModifiersState, NamedKey},
     window::{Window, WindowId},
 };
 
@@ -62,6 +62,7 @@ enum WindowUserEvent {
 struct WindowApp {
     graphics: GraphicsService,
     input: mpsc::Sender<u8>,
+    modifiers: ModifiersState,
     window: Option<Arc<Window>>,
     pixels: Option<Pixels<'static>>,
 }
@@ -71,6 +72,7 @@ impl WindowApp {
         Self {
             graphics: GraphicsService::default(),
             input,
+            modifiers: ModifiersState::empty(),
             window: None,
             pixels: None,
         }
@@ -78,6 +80,11 @@ impl WindowApp {
 
     fn handle_key(&self, event: KeyEvent) {
         if event.state != ElementState::Pressed {
+            return;
+        }
+
+        if self.is_paste_shortcut(&event.logical_key) {
+            self.paste_clipboard();
             return;
         }
 
@@ -94,6 +101,47 @@ impl WindowApp {
                         self.send_input(byte);
                     }
                 }
+            }
+        }
+    }
+
+    fn is_paste_shortcut(&self, key: &Key) -> bool {
+        let Key::Character(character) = key else {
+            return false;
+        };
+        if !character.eq_ignore_ascii_case("v") {
+            return false;
+        }
+
+        if cfg!(target_os = "macos") {
+            self.modifiers.super_key()
+        } else {
+            self.modifiers.control_key()
+        }
+    }
+
+    fn paste_clipboard(&self) {
+        let result = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text());
+        match result {
+            Ok(text) => self.send_pasted_text(&text),
+            Err(error) => eprintln!("Acorn-2026 clipboard paste failed: {error}"),
+        }
+    }
+
+    fn send_pasted_text(&self, text: &str) {
+        let mut characters = text.chars().peekable();
+        while let Some(character) = characters.next() {
+            match character {
+                '\r' => {
+                    if characters.peek() == Some(&'\n') {
+                        characters.next();
+                    }
+                    self.send_input(b'\r');
+                }
+                '\n' | '\u{2028}' | '\u{2029}' => self.send_input(b'\r'),
+                '\t' => self.send_input(b' '),
+                ' '..='~' => self.send_input(character as u8),
+                _ => {}
             }
         }
     }
@@ -195,6 +243,9 @@ impl ApplicationHandler<WindowUserEvent> for WindowApp {
                         }
                     }
                 }
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers.state();
             }
             WindowEvent::KeyboardInput { event, .. } => self.handle_key(event),
             WindowEvent::RedrawRequested => {

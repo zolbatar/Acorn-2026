@@ -40,6 +40,8 @@ cargo run
 
 The app opens one window and displays the `*` prompt. Enter `HELP` to list the built-in commands. Enter `QUIT` to exit the runtime. Closing the window also exits.
 
+Use **Command+V** on macOS to paste clipboard text into the window (Control+V on other hosts). Pasted line breaks act like pressing Enter, so multiple pasted command lines run in sequence. Printable ASCII is sent to the guest input path; tabs become spaces and unsupported characters are skipped.
+
 To keep using the terminal frontend, run `cargo run -- --stdio`.
 
 To see text and plotted pixels together, enter:
