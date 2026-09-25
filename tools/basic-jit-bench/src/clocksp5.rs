@@ -14,11 +14,7 @@ use acorn_2026::{
     tokenized_basic::TokenizedBasicProgram,
 };
 use cranelift_codegen::{
-    ir::{
-        AbiParam, InstBuilder, UserFuncName,
-        condcodes::{FloatCC, IntCC},
-        types,
-    },
+    ir::{AbiParam, InstBuilder, UserFuncName, condcodes::IntCC, types},
     settings::{self, Configurable},
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -26,16 +22,17 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
-const GRID_WIDTH: u32 = 80;
-const GRID_HEIGHT: u32 = 50;
-const ITERATION_LIMIT: i32 = 8192;
+const B_INCREMENT: i32 = 1;
+const I_START: i32 = 0;
+const INNER_LIMIT: i32 = 100;
+const OUTER_LIMIT: i32 = 10_000;
 const INTERPRETER_SAMPLES: usize = 3;
 const NATIVE_SAMPLES: usize = 7;
 
-type MandelbrotIteration = extern "C" fn(f64, f64, i32) -> i32;
+type IntegerRepeat = extern "C" fn(i32, i32, i32, i32) -> i32;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let fixture = repository_root().join("examples/mandelbrot/iteration-benchmark.bbc");
+    let fixture = repository_root().join("examples/clocksp5/integer-repeat-jit.bbc");
     let program = TokenizedBasicProgram::load_file(&fixture)?;
 
     let jit_started = Instant::now();
@@ -44,24 +41,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     let isa = isa_builder.finish(compiler_flags()?)?;
     let target = isa.triple().to_string();
     let mut jit_module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
-    let jit_function = define_iteration(&mut jit_module)?;
+    let function = define_integer_repeat(&mut jit_module)?;
     jit_module.finalize_definitions()?;
     let jit_compile_time = jit_started.elapsed();
 
-    // Cranelift returns executable memory for a function with this signature.
-    // The signature is defined above and the module remains alive through all calls.
-    let jit_address = jit_module.get_finalized_function(jit_function);
-    let iterate: MandelbrotIteration = unsafe { std::mem::transmute(jit_address) };
+    // SAFETY: the JIT function uses the matching extern "C" signature above,
+    // and its module stays alive until every sample has completed.
+    let address = jit_module.get_finalized_function(function);
+    let integer_repeat: IntegerRepeat = unsafe { std::mem::transmute(address) };
 
     let (object_path, object_bytes, object_compile_time) = emit_object()?;
     let mut interpreter_times = Vec::with_capacity(INTERPRETER_SAMPLES);
-    let mut interpreted_checksum = None;
+    let mut interpreter_checksum = None;
     for _ in 0..INTERPRETER_SAMPLES {
         let (elapsed, checksum) = run_interpreter(&program)?;
-        if interpreted_checksum.is_some_and(|previous| previous != checksum) {
+        if interpreter_checksum.is_some_and(|previous| previous != checksum) {
             return Err("interpreter checksum varied between runs".into());
         }
-        interpreted_checksum = Some(checksum);
+        interpreter_checksum = Some(checksum);
         interpreter_times.push(elapsed);
     }
 
@@ -69,7 +66,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut native_checksum = None;
     for _ in 0..NATIVE_SAMPLES {
         let started = Instant::now();
-        let checksum = run_native_grid(iterate);
+        let checksum = integer_repeat(
+            std::hint::black_box(B_INCREMENT),
+            std::hint::black_box(I_START),
+            std::hint::black_box(INNER_LIMIT),
+            std::hint::black_box(OUTER_LIMIT),
+        );
         let elapsed = started.elapsed();
         if native_checksum.is_some_and(|previous| previous != checksum) {
             return Err("JIT checksum varied between runs".into());
@@ -78,11 +80,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         native_times.push(elapsed);
     }
 
-    let interpreted_checksum = interpreted_checksum.expect("at least one interpreter sample");
-    let native_checksum = native_checksum.expect("at least one JIT sample");
-    if interpreted_checksum != native_checksum {
+    let interpreter_checksum = interpreter_checksum.expect("interpreter samples configured");
+    let native_checksum = native_checksum.expect("native samples configured");
+    if interpreter_checksum != native_checksum {
         return Err(format!(
-            "interpreter/JIT checksum mismatch: {interpreted_checksum} vs {native_checksum}"
+            "interpreter/JIT checksum mismatch: {interpreter_checksum} vs {native_checksum}"
         )
         .into());
     }
@@ -92,8 +94,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let speedup = interpreter_median.as_secs_f64() / native_median.as_secs_f64();
 
     println!("target: {target}");
-    println!("workload: {GRID_WIDTH} × {GRID_HEIGHT}, max {ITERATION_LIMIT} iterations per point");
-    println!("checksum: {interpreted_checksum} (interpreter and JIT agree)");
+    println!(
+        "workload: ClockSP5 integer REPEAT section, B%={B_INCREMENT}, I%={I_START}, D%={INNER_LIMIT}, E%={OUTER_LIMIT}"
+    );
+    println!("checksum: {interpreter_checksum} (interpreter and JIT agree)");
     println!(
         "JIT compile and finalize: {}",
         format_duration(jit_compile_time)
@@ -103,16 +107,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         format_duration(object_compile_time)
     );
     println!(
-        "tokenized BASIC program median (full grid/control flow): {}",
+        "tokenized BASIC fixture median (parse + full loop): {}",
         format_duration(interpreter_median)
     );
     println!(
-        "Cranelift iteration kernel + Rust grid loop median: {}",
+        "Cranelift integer loop median: {}",
         format_duration(native_median)
     );
     println!("measured speedup: {speedup:.1}×");
     println!("object: {} ({} bytes)", object_path.display(), object_bytes);
-    println!("note: BASIC grid/control flow remains interpreted in this spike.");
+    println!("note: Cranelift IR is hand-built for this one ClockSP5 section.");
     Ok(())
 }
 
@@ -122,14 +126,15 @@ fn compiler_flags() -> Result<settings::Flags, Box<dyn Error>> {
     Ok(settings::Flags::new(builder))
 }
 
-fn define_iteration<M: Module>(module: &mut M) -> Result<FuncId, Box<dyn Error>> {
+fn define_integer_repeat<M: Module>(module: &mut M) -> Result<FuncId, Box<dyn Error>> {
     let mut signature = module.make_signature();
-    signature.params.push(AbiParam::new(types::F64));
-    signature.params.push(AbiParam::new(types::F64));
-    signature.params.push(AbiParam::new(types::I32));
+    for _ in 0..4 {
+        signature.params.push(AbiParam::new(types::I32));
+    }
     signature.returns.push(AbiParam::new(types::I32));
 
-    let function = module.declare_function("mandelbrot_iteration", Linkage::Export, &signature)?;
+    let function =
+        module.declare_function("clocksp5_integer_repeat", Linkage::Export, &signature)?;
     let mut context = module.make_context();
     context.func.signature = signature;
     context.func.name = UserFuncName::user(0, function.as_u32());
@@ -139,60 +144,72 @@ fn define_iteration<M: Module>(module: &mut M) -> Result<FuncId, Box<dyn Error>>
     {
         let mut builder = FunctionBuilder::new(&mut context.func, &mut builder_context);
         let entry = builder.create_block();
-        let loop_block = builder.create_block();
+        let outer_loop = builder.create_block();
+        let inner_loop = builder.create_block();
+        let inner_exit = builder.create_block();
         let exit = builder.create_block();
 
         builder.append_block_params_for_function_params(entry);
-        builder.append_block_param(loop_block, types::F64);
-        builder.append_block_param(loop_block, types::F64);
-        builder.append_block_param(loop_block, types::I32);
+        builder.append_block_param(outer_loop, types::I32);
+        builder.append_block_param(inner_loop, types::I32);
+        builder.append_block_param(inner_loop, types::I32);
+        builder.append_block_param(inner_exit, types::I32);
+        builder.append_block_param(inner_exit, types::I32);
+        builder.append_block_param(exit, types::I32);
         builder.append_block_param(exit, types::I32);
 
         builder.switch_to_block(entry);
         builder.seal_block(entry);
         let arguments = builder.block_params(entry).to_vec();
-        let (real_c, imag_c, iteration_limit) = (arguments[0], arguments[1], arguments[2]);
-        let zero_f64 = builder.ins().f64const(0.0);
-        let zero_i32 = builder.ins().iconst(types::I32, 0);
-        builder.ins().jump(
-            loop_block,
-            &[zero_f64.into(), zero_f64.into(), zero_i32.into()],
+        let (increment, inner_start, inner_limit, outer_limit) =
+            (arguments[0], arguments[1], arguments[2], arguments[3]);
+        let zero = builder.ins().iconst(types::I32, 0);
+        builder.ins().jump(outer_loop, &[zero.into()]);
+
+        builder.switch_to_block(outer_loop);
+        let outer_count = builder.block_params(outer_loop)[0];
+        let next_outer_count = builder.ins().iadd(outer_count, increment);
+        builder
+            .ins()
+            .jump(inner_loop, &[next_outer_count.into(), inner_start.into()]);
+
+        builder.switch_to_block(inner_loop);
+        let inner_state = builder.block_params(inner_loop).to_vec();
+        let outer_count = inner_state[0];
+        let inner_count = inner_state[1];
+        let next_inner_count = builder.ins().iadd(inner_count, increment);
+        let inner_done =
+            builder
+                .ins()
+                .icmp(IntCC::SignedGreaterThan, next_inner_count, inner_limit);
+        builder.ins().brif(
+            inner_done,
+            inner_exit,
+            &[outer_count.into(), next_inner_count.into()],
+            inner_loop,
+            &[outer_count.into(), next_inner_count.into()],
         );
 
-        builder.switch_to_block(loop_block);
-        let state = builder.block_params(loop_block).to_vec();
-        let (real_z, imag_z, count) = (state[0], state[1], state[2]);
-
-        let real_squared = builder.ins().fmul(real_z, real_z);
-        let imag_squared = builder.ins().fmul(imag_z, imag_z);
-        let squared_real = builder.ins().fsub(real_squared, imag_squared);
-        let doubled_real = builder.ins().fadd(real_z, real_z);
-        let next_imag = builder.ins().fmul(doubled_real, imag_z);
-        let next_real = builder.ins().fadd(squared_real, real_c);
-        let next_imag = builder.ins().fadd(next_imag, imag_c);
-        let next_count = builder.ins().iadd_imm_s(count, 1);
-
-        let abs_real = builder.ins().fabs(next_real);
-        let abs_imag = builder.ins().fabs(next_imag);
-        let magnitude = builder.ins().fadd(abs_real, abs_imag);
-        let four = builder.ins().f64const(4.0);
-        let escaped = builder.ins().fcmp(FloatCC::GreaterThan, magnitude, four);
-        let finished = builder
+        builder.switch_to_block(inner_exit);
+        let completed = builder.block_params(inner_exit).to_vec();
+        let outer_count = completed[0];
+        let inner_count = completed[1];
+        let outer_done = builder
             .ins()
-            .icmp(IntCC::Equal, next_count, iteration_limit);
-        let done = builder.ins().bor(escaped, finished);
+            .icmp(IntCC::SignedGreaterThan, outer_count, outer_limit);
         builder.ins().brif(
-            done,
+            outer_done,
             exit,
-            &[next_count.into()],
-            loop_block,
-            &[next_real.into(), next_imag.into(), next_count.into()],
+            &[outer_count.into(), inner_count.into()],
+            outer_loop,
+            &[outer_count.into()],
         );
 
         builder.switch_to_block(exit);
         builder.seal_all_blocks();
-        let result = builder.block_params(exit)[0];
-        builder.ins().return_(&[result]);
+        let result_state = builder.block_params(exit).to_vec();
+        let checksum = builder.ins().iadd(result_state[0], result_state[1]);
+        builder.ins().return_(&[checksum]);
         builder.finalize(frontend_config);
     }
 
@@ -208,18 +225,18 @@ fn emit_object() -> Result<(PathBuf, usize, Duration), Box<dyn Error>> {
     let isa = isa_builder.finish(compiler_flags()?)?;
     let object_builder = ObjectBuilder::new(
         isa,
-        "mandelbrot_iteration_benchmark",
+        "clocksp5_integer_repeat_benchmark",
         default_libcall_names(),
     )?;
     let mut module = ObjectModule::new(object_builder);
-    define_iteration(&mut module)?;
+    define_integer_repeat(&mut module)?;
     let product = module.finish();
     let bytes = product.object.write()?;
 
     let output_path = repository_root()
         .join("target")
-        .join("mandelbrot-jit-bench")
-        .join("mandelbrot_iteration.o");
+        .join("basic-jit-bench")
+        .join("clocksp5_integer_repeat.o");
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -227,7 +244,7 @@ fn emit_object() -> Result<(PathBuf, usize, Duration), Box<dyn Error>> {
     Ok((output_path, bytes.len(), started.elapsed()))
 }
 
-fn run_interpreter(program: &TokenizedBasicProgram) -> Result<(Duration, i64), Box<dyn Error>> {
+fn run_interpreter(program: &TokenizedBasicProgram) -> Result<(Duration, i32), Box<dyn Error>> {
     let (_input_sender, input_receiver) = mpsc::channel();
     let (display_sender, display_receiver) = mpsc::channel();
     let mut task = Task::new(1);
@@ -246,40 +263,10 @@ fn run_interpreter(program: &TokenizedBasicProgram) -> Result<(Duration, i64), B
     let text = String::from_utf8_lossy(&output);
     let checksum = text
         .split(|character: char| !character.is_ascii_digit())
-        .filter_map(|digits| digits.parse::<i64>().ok())
+        .filter_map(|digits| digits.parse::<i32>().ok())
         .last()
-        .ok_or_else(|| format!("interpreter did not print a checksum: {text:?}"))?;
+        .ok_or_else(|| format!("ClockSP5 fixture did not print a checksum: {text:?}"))?;
     Ok((elapsed, checksum))
-}
-
-fn run_native_grid(iterate: MandelbrotIteration) -> i64 {
-    let x_size = f64::from(GRID_WIDTH);
-    let y_size = f64::from(GRID_HEIGHT);
-    let aspect = y_size / x_size;
-    let x_centre = -1.44251;
-    let y_centre = -0.13409;
-    let scale = 0.52707;
-    let x_min = x_centre - (scale / 2.0);
-    let x_max = x_centre + (scale / 2.0);
-    let x_width = x_max - x_min;
-    let y_min = y_centre + (scale * aspect / 2.0);
-    let y_max = y_centre - (scale * aspect / 2.0);
-    let y_width = y_max - y_min;
-
-    let mut checksum = 0_i64;
-    for x in 0..GRID_WIDTH {
-        for y in 0..GRID_HEIGHT {
-            let real_c = (x_width * f64::from(x) / x_size) + x_min;
-            let imag_c = (y_width * f64::from(y) / y_size) + y_min;
-            let count = iterate(
-                std::hint::black_box(real_c),
-                std::hint::black_box(imag_c),
-                ITERATION_LIMIT,
-            );
-            checksum += i64::from(count);
-        }
-    }
-    std::hint::black_box(checksum)
 }
 
 fn median(mut samples: Vec<Duration>) -> Duration {

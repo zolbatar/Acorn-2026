@@ -1,8 +1,16 @@
 [package]
-name = "mandelbrot-jit-bench"
+name = "basic-jit-bench"
 version = "0.1.0"
 edition = "2024"
 publish = false
+
+[[bin]]
+name = "mandelbrot-jit-bench"
+path = "src/mandelbrot.rs"
+
+[[bin]]
+name = "clocksp5-jit-bench"
+path = "src/clocksp5.rs"
 
 [dependencies]
 acorn-2026 = { path = "../.." }
