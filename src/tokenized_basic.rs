@@ -7,13 +7,13 @@ const PROGRAM_END: u8 = 0xFF;
 const LINE_REFERENCE: u8 = 0x8D;
 const TOKENIZED_REM: u8 = 0xF4;
 const TOKENIZED_DATA: u8 = 0xDC;
-const MIN_RECORD_LENGTH: usize = 5;
+const MIN_RECORD_LENGTH: usize = 4;
 const MAX_LINE_NUMBER: u16 = 0xFEFF;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TokenizedBasicLine {
     pub number: u16,
-    /// Tokenized statements, excluding the record's final carriage return.
+    /// Opaque tokenized statements, excluding a record terminator when present.
     pub bytes: Vec<u8>,
     pub line_references: Vec<u16>,
 }
@@ -21,6 +21,18 @@ pub struct TokenizedBasicLine {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TokenizedBasicProgram {
     pub lines: Vec<TokenizedBasicLine>,
+    /// Record boundary style inferred from the saved file. Empty programs do
+    /// not contain enough information to infer a style.
+    pub record_layout: Option<TokenizedBasicRecordLayout>,
+}
+
+/// Saved-program record boundary styles supported by the shared decoder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TokenizedBasicRecordLayout {
+    /// The boundary CR ends one line and also marks the next record.
+    SharedBoundaryCarriageReturn,
+    /// A CR terminates each record, followed by another CR marking the next.
+    SeparateLineCarriageReturn,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,6 +63,9 @@ pub enum DecodeError {
     MissingLineCarriageReturn {
         line_number: u16,
     },
+    InconsistentRecordLayout {
+        line_number: u16,
+    },
     NonIncreasingLineNumber {
         previous: u16,
         current: u16,
@@ -72,6 +87,7 @@ impl TokenizedBasicProgram {
         let mut cursor = 0_usize;
         let mut lines = Vec::new();
         let mut previous_line = None;
+        let mut record_layout = None;
 
         loop {
             if cursor >= file.len() {
@@ -90,7 +106,10 @@ impl TokenizedBasicProgram {
                 if cursor + 2 != file.len() {
                     return Err(DecodeError::TrailingBytes { offset: cursor + 2 });
                 }
-                return Ok(Self { lines });
+                return Ok(Self {
+                    lines,
+                    record_layout,
+                });
             }
             if file.len() - cursor < 4 {
                 return Err(DecodeError::TruncatedHeader { offset: cursor });
@@ -123,21 +142,33 @@ impl TokenizedBasicProgram {
                     file_length: file.len(),
                 },
             )?;
-            if record_end > file.len() {
+            if record_end >= file.len() {
                 return Err(DecodeError::TruncatedRecord {
                     line_number,
-                    expected_end: record_end,
+                    expected_end: record_end.saturating_add(1),
                     file_length: file.len(),
                 });
             }
-            if file[record_end - 1] != LINE_MARKER {
+            if file[record_end] != LINE_MARKER {
                 return Err(DecodeError::MissingLineCarriageReturn { line_number });
             }
 
+            let has_line_carriage_return = file[record_end - 1] == LINE_MARKER;
+            let current_layout = if has_line_carriage_return {
+                TokenizedBasicRecordLayout::SeparateLineCarriageReturn
+            } else {
+                TokenizedBasicRecordLayout::SharedBoundaryCarriageReturn
+            };
+            if record_layout.is_some_and(|previous| previous != current_layout) {
+                return Err(DecodeError::InconsistentRecordLayout { line_number });
+            }
+            record_layout = Some(current_layout);
+
             let body_start = cursor + 4;
-            let body_end = record_end - 1;
+            let body_end = record_end - usize::from(has_line_carriage_return);
             let body = file[body_start..body_end].to_vec();
-            let line_references = scan_line_references(&body, line_number, body_start)?;
+            let line_references =
+                scan_line_references(&body, line_number, body_start, current_layout)?;
             lines.push(TokenizedBasicLine {
                 number: line_number,
                 bytes: body,
@@ -184,6 +215,7 @@ fn scan_line_references(
     bytes: &[u8],
     line_number: u16,
     file_offset: usize,
+    record_layout: TokenizedBasicRecordLayout,
 ) -> Result<Vec<u16>, DecodeError> {
     if bytes.first() == Some(&b'*') {
         return Ok(Vec::new());
@@ -255,7 +287,9 @@ fn scan_line_references(
             index += 4;
             continue;
         }
-        if matches!(byte, 0xC6..=0xC8) {
+        if record_layout == TokenizedBasicRecordLayout::SeparateLineCarriageReturn
+            && matches!(byte, 0xC6..=0xC8)
+        {
             if index + 1 >= bytes.len() {
                 return Err(DecodeError::TruncatedExtendedToken {
                     line_number,
@@ -317,11 +351,12 @@ impl fmt::Display for DecodeError {
                 "line {line_number} extends to byte {expected_end}, past end of file ({file_length})"
             ),
             Self::MissingLineCarriageReturn { line_number } => {
-                write!(
-                    f,
-                    "line {line_number} is missing its final 0D carriage return"
-                )
+                write!(f, "line {line_number} is missing its 0D record boundary")
             }
+            Self::InconsistentRecordLayout { line_number } => write!(
+                f,
+                "line {line_number} uses a different record layout from earlier lines"
+            ),
             Self::NonIncreasingLineNumber { previous, current } => write!(
                 f,
                 "line numbers are not increasing: {current} follows {previous}"
@@ -348,7 +383,7 @@ impl Error for DecodeError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{DecodeError, TokenizedBasicProgram};
+    use super::{DecodeError, TokenizedBasicProgram, TokenizedBasicRecordLayout};
 
     #[test]
     fn decodes_clocksp5_records_and_line_references() {
@@ -358,6 +393,10 @@ mod tests {
 
         assert_eq!(fixture[3], 16, "record length includes the 4-byte preamble");
         assert_eq!(program.line_count(), 143);
+        assert_eq!(
+            program.record_layout,
+            Some(TokenizedBasicRecordLayout::SeparateLineCarriageReturn)
+        );
         assert_eq!(program.line_reference_count(), 37);
         assert_eq!(program.unresolved_line_reference_count(), 0);
         assert_eq!(program.line(50).expect("line 50").line_references, [60]);
@@ -385,10 +424,66 @@ mod tests {
             b'"', 0x8D, 0x40, 0x40, 0x40, b'"', b':', 0xDC, b'1', b',', 0x8D, b':', 0xF4, 0x8D,
         ];
         assert!(
-            super::scan_line_references(&body, 10, 4)
-                .expect("opaque text must be skipped")
-                .is_empty()
+            super::scan_line_references(
+                &body,
+                10,
+                4,
+                TokenizedBasicRecordLayout::SeparateLineCarriageReturn,
+            )
+            .expect("opaque text must be skipped")
+            .is_empty()
         );
+    }
+
+    #[test]
+    fn scans_classic_delete_line_reference_without_arm_extended_token_rules() {
+        // BBC BASIC II DELETE 100: C7 is a keyword, not an ARM extended-token
+        // prefix. The same bytes have a different interpretation in ARM BASIC.
+        let delete_line_100 = [0xC7, 0x8D, 0x44, 0x64, 0x40];
+        assert_eq!(
+            super::scan_line_references(
+                &delete_line_100,
+                10,
+                4,
+                TokenizedBasicRecordLayout::SharedBoundaryCarriageReturn,
+            )
+            .expect("classic BASIC line reference"),
+            [100]
+        );
+        assert!(
+            super::scan_line_references(
+                &delete_line_100,
+                10,
+                4,
+                TokenizedBasicRecordLayout::SeparateLineCarriageReturn,
+            )
+            .expect("ARM extended token")
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn decodes_public_domain_bbc_micro_saved_program_layout() {
+        let fixture = include_bytes!("../examples/tokenized-compat/tdu-01-test.bbc");
+        let program = TokenizedBasicProgram::decode(fixture)
+            .expect("TDU-01 TEST should use the BBC Micro saved-program records");
+
+        assert_eq!(
+            program.record_layout,
+            Some(TokenizedBasicRecordLayout::SharedBoundaryCarriageReturn)
+        );
+        assert_eq!(
+            program
+                .lines
+                .iter()
+                .map(|line| line.number)
+                .collect::<Vec<_>>(),
+            [20, 150, 200, 250]
+        );
+        assert_eq!(program.line(20).expect("line 20").bytes.len(), 250);
+        assert_eq!(program.line(20).expect("line 20").bytes, fixture[4..254]);
+        assert_eq!(program.line_reference_count(), 0);
+        assert_eq!(program.unresolved_line_reference_count(), 0);
     }
 
     #[test]
@@ -397,7 +492,7 @@ mod tests {
             TokenizedBasicProgram::decode(&[0x0D, 0x00, 0x01, 6, 0xF4]),
             Err(DecodeError::TruncatedRecord {
                 line_number: 1,
-                expected_end: 6,
+                expected_end: 7,
                 file_length: 5,
             })
         );
