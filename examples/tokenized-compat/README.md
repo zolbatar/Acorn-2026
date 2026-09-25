@@ -4,4 +4,8 @@
 
 The extracted file is 479 bytes and has SHA-256 `ef4ff46dbc13bbc67215e7d8876b8492a26c627a58ffede44a0f0aa202fdc1be`. It has four lines numbered 20, 150, 200, and 250. It is used only to test saved-program decoding; its machine-code calls are outside the current runtime.
 
+`tetriz-master-basic4.bbc` is copied byte-for-byte from `T.MTETRIZ` on side 1 of the BBC-134 public-domain DFS disk (`Bbc134.dsd`). The [8-Bit Software BBC catalogue](https://8bs.com/catalogue/bbc.htm) identifies Tetris as Master-only; the program identifies itself as MTETRIZ 1.5, names Robin Pike and Steve Newton, and says “No Rights Reserved.” Its accompanying disk documentation describes it as the Master version. This is authentic BBC Master / BASIC IV-class saved-program evidence, but it does not identify the exact BASIC IV ROM revision.
+
+The saved file is 8,095 bytes with SHA-256 `f7def3541fe4aee51ec2d67d780cdf54a216b54495ea2b15a4a0544bad91ce70`. It contains 362 lines and two resolved line references. It is used only for decoding; its graphics, sound, machine-code, SRAM, and game behavior are not supported by the runtime.
+
 The ClockSP5 and echo fixtures exercise the ARM-style layout and have project-maintained readable sources. ClockSP5's tokenized file is produced by `tools/tokenize_clocksp5.py`; it is not an independently saved binary from an ARM BASIC V installation. See [the compatibility matrix](../../docs/tokenized-basic-compatibility.md) for evidence and remaining coverage gaps.

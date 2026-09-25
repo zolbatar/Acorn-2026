@@ -6,6 +6,7 @@ struct Fixture {
     layout: TokenizedBasicRecordLayout,
     lines: usize,
     references: usize,
+    first_line_bytes: Option<&'static [u8]>,
 }
 
 #[test]
@@ -17,6 +18,15 @@ fn decodes_tokenized_compatibility_fixture_corpus() {
             layout: TokenizedBasicRecordLayout::SharedBoundaryCarriageReturn,
             lines: 4,
             references: 0,
+            first_line_bytes: None,
+        },
+        Fixture {
+            name: "TETRIZ 1.5 BBC Master BASIC IV-class program",
+            bytes: include_bytes!("../examples/tokenized-compat/tetriz-master-basic4.bbc"),
+            layout: TokenizedBasicRecordLayout::SharedBoundaryCarriageReturn,
+            lines: 362,
+            references: 2,
+            first_line_bytes: Some(b"\xF4 >MTETRIZ15"),
         },
         Fixture {
             name: "ClockSP5 ARM BASIC V compatibility program",
@@ -24,6 +34,7 @@ fn decodes_tokenized_compatibility_fixture_corpus() {
             layout: TokenizedBasicRecordLayout::SeparateLineCarriageReturn,
             lines: 143,
             references: 37,
+            first_line_bytes: None,
         },
         Fixture {
             name: "minimal tokenized echo program",
@@ -31,6 +42,7 @@ fn decodes_tokenized_compatibility_fixture_corpus() {
             layout: TokenizedBasicRecordLayout::SeparateLineCarriageReturn,
             lines: 3,
             references: 0,
+            first_line_bytes: None,
         },
     ];
 
@@ -57,5 +69,13 @@ fn decodes_tokenized_compatibility_fixture_corpus() {
             "{}",
             fixture.name
         );
+        if let Some(expected) = fixture.first_line_bytes {
+            assert_eq!(
+                program.lines.first().map(|line| line.bytes.as_slice()),
+                Some(expected),
+                "{} token bytes were preserved",
+                fixture.name
+            );
+        }
     }
 }
