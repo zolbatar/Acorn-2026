@@ -19,7 +19,10 @@ const FIRST_HEAP_ADDRESS: u32 = GUEST_MEMORY_BASE + 0x8000;
 // The source-derived full Mandelbrot fixture can execute several billion
 // statements with its original dimensions and iteration cap.
 const MAX_EXECUTION_STEPS: u64 = 100_000_000_000;
+#[cfg(feature = "experimental-jit")]
+pub(super) const MAX_NATIVE_PROCEDURE_CALLS: u64 = 1_000_000;
 const PRINT_ZONE_WIDTH: usize = 14;
+const DEFAULT_PRINT_FORMAT: u32 = 0x0000_090A;
 
 #[derive(Clone, Debug, PartialEq)]
 enum Value {
@@ -84,12 +87,256 @@ pub(super) struct Interpreter {
     started: Instant,
     steps: u64,
     print_column: usize,
+    print_format: u32,
     next_heap_address: u32,
     pending_key: Option<u8>,
+    random_state: u32,
+    last_random_fraction: f64,
     #[cfg(feature = "experimental-jit")]
     jit: Option<JitProgram>,
     #[cfg(feature = "experimental-jit")]
     jit_fallback: Option<String>,
+}
+
+/// Synchronous callback state shared with a compiled numeric procedure.
+/// The JIT receives only this opaque pointer and calls the checked helpers
+/// below; it never receives a host pointer into guest memory.
+#[cfg(feature = "experimental-jit")]
+pub(super) struct NativeProcedureContext {
+    task: *mut Task,
+    dispatcher: *mut SwiDispatcher,
+    variables: *mut HashMap<String, Value>,
+    variable_names: *const String,
+    variable_count: usize,
+    steps: *mut u64,
+    pending_key: *mut Option<u8>,
+    line: u16,
+    calls: u64,
+    error: Option<RuntimeError>,
+}
+
+#[cfg(feature = "experimental-jit")]
+impl NativeProcedureContext {
+    fn new(
+        variables: &mut HashMap<String, Value>,
+        task: &mut Task,
+        dispatcher: &mut SwiDispatcher,
+        variable_names: &[String],
+        steps: &mut u64,
+        pending_key: &mut Option<u8>,
+        line: u16,
+    ) -> Self {
+        Self {
+            task,
+            dispatcher,
+            variables,
+            variable_names: variable_names.as_ptr(),
+            variable_count: variable_names.len(),
+            steps,
+            pending_key,
+            line,
+            calls: 0,
+            error: None,
+        }
+    }
+
+    pub(super) fn call_count(&self) -> u64 {
+        self.calls
+    }
+
+    pub(super) fn take_error(&mut self) -> Option<RuntimeError> {
+        self.error.take()
+    }
+}
+
+#[cfg(feature = "experimental-jit")]
+pub(super) extern "C" fn native_procedure_enter(context: *mut std::ffi::c_void) -> i32 {
+    if context.is_null() {
+        return 0;
+    }
+    // SAFETY: the opaque pointer is created by `NativeProcedureContext::new`
+    // and remains alive throughout the synchronous native procedure call.
+    let context = unsafe { &mut *context.cast::<NativeProcedureContext>() };
+    if context.error.is_some() {
+        return 0;
+    }
+    context.calls = context.calls.saturating_add(1);
+    if context.calls > MAX_NATIVE_PROCEDURE_CALLS {
+        context.error = Some(program_error(
+            context.line,
+            "native procedure call budget exceeded",
+        ));
+        0
+    } else {
+        1
+    }
+}
+
+#[cfg(feature = "experimental-jit")]
+pub(super) extern "C" fn native_procedure_tick(context: *mut std::ffi::c_void, line: i32) -> i32 {
+    if context.is_null() {
+        return 0;
+    }
+    // SAFETY: the opaque pointer is created by `NativeProcedureContext::new`
+    // and remains alive throughout the synchronous native procedure call.
+    let context = unsafe { &mut *context.cast::<NativeProcedureContext>() };
+    if context.error.is_some() {
+        return 0;
+    }
+    context.line = line.clamp(0, i32::from(u16::MAX)) as u16;
+
+    // SAFETY: the interpreter lends this counter to the context exclusively
+    // until the compiled procedure returns.
+    let steps = unsafe { &mut *context.steps };
+    *steps = steps.saturating_add(1);
+    if *steps > MAX_EXECUTION_STEPS {
+        context.error = Some(program_error(context.line, "execution step limit reached"));
+        return 0;
+    }
+    if *steps & 0x3FF == 0 {
+        // SAFETY: both pointers remain exclusively borrowed for this call.
+        let dispatcher = unsafe { &mut *context.dispatcher };
+        if let Some(key) = dispatcher.poll_key() {
+            unsafe { *context.pending_key = Some(key) };
+        }
+    }
+    1
+}
+
+#[cfg(feature = "experimental-jit")]
+pub(super) extern "C" fn native_procedure_context_ok(context: *mut std::ffi::c_void) -> i32 {
+    if context.is_null() {
+        return 0;
+    }
+    // SAFETY: the opaque pointer is created by `NativeProcedureContext::new`
+    // and remains alive throughout the synchronous native procedure call.
+    i32::from(unsafe { (*context.cast::<NativeProcedureContext>()).error.is_none() })
+}
+
+#[cfg(feature = "experimental-jit")]
+pub(super) extern "C" fn native_procedure_get_variable(
+    context: *mut std::ffi::c_void,
+    index: i32,
+) -> f64 {
+    if context.is_null() {
+        return 0.0;
+    }
+    // SAFETY: the opaque pointer is created by `NativeProcedureContext::new`
+    // and remains alive throughout the synchronous native procedure call.
+    let context = unsafe { &mut *context.cast::<NativeProcedureContext>() };
+    if context.error.is_some() || index < 0 || index as usize >= context.variable_count {
+        if context.error.is_none() {
+            context.error = Some(program_error(
+                context.line,
+                "compiled procedure referenced an invalid variable slot",
+            ));
+        }
+        return 0.0;
+    }
+
+    // SAFETY: the names slice and variable map are exclusively borrowed for
+    // the duration of this synchronous native procedure call.
+    let name = unsafe { &*context.variable_names.add(index as usize) };
+    let variables = unsafe { &*context.variables };
+    match variables
+        .get(name)
+        .cloned()
+        .unwrap_or_else(|| default_value(name))
+        .number(context.line)
+    {
+        Ok(value) => value,
+        Err(error) => {
+            context.error = Some(error);
+            0.0
+        }
+    }
+}
+
+#[cfg(feature = "experimental-jit")]
+pub(super) extern "C" fn native_procedure_set_variable(
+    context: *mut std::ffi::c_void,
+    index: i32,
+    value: f64,
+) -> i32 {
+    if context.is_null() {
+        return 0;
+    }
+    // SAFETY: the opaque pointer is created by `NativeProcedureContext::new`
+    // and remains alive throughout the synchronous native procedure call.
+    let context = unsafe { &mut *context.cast::<NativeProcedureContext>() };
+    if context.error.is_some() || index < 0 || index as usize >= context.variable_count {
+        if context.error.is_none() {
+            context.error = Some(program_error(
+                context.line,
+                "compiled procedure referenced an invalid variable slot",
+            ));
+        }
+        return 0;
+    }
+
+    // SAFETY: the names slice and variable map are exclusively borrowed for
+    // the duration of this synchronous native procedure call.
+    let name = unsafe { &*context.variable_names.add(index as usize) };
+    let value = if name.ends_with('%') {
+        f64::from(value.trunc() as i32)
+    } else {
+        value
+    };
+    unsafe {
+        (&mut *context.variables).insert(name.clone(), Value::Number(value));
+    }
+    1
+}
+
+#[cfg(feature = "experimental-jit")]
+pub(super) extern "C" fn native_procedure_graphics(
+    context: *mut std::ffi::c_void,
+    operation: i32,
+    first: f64,
+    second: f64,
+) -> i32 {
+    if context.is_null() {
+        return 0;
+    }
+    // SAFETY: the opaque pointer is created by `NativeProcedureContext::new`
+    // and remains alive throughout the synchronous native procedure call.
+    let context = unsafe { &mut *context.cast::<NativeProcedureContext>() };
+    if context.error.is_some() {
+        return 0;
+    }
+
+    let result = (|| {
+        // SAFETY: these references are exclusively borrowed for the duration
+        // of this synchronous native procedure call.
+        let task = unsafe { &mut *context.task };
+        let dispatcher = unsafe { &mut *context.dispatcher };
+        match operation {
+            0 => dispatcher
+                .write_via_os_write_c(task, &[18, first.trunc() as u8, second.trunc() as u8]),
+            1 | 2 => dispatcher.plot(
+                task,
+                if operation == 1 { 4 } else { 5 },
+                graphics_coordinate(first, context.line)?,
+                graphics_coordinate(second, context.line)?,
+            ),
+            _ => Err(program_error(
+                context.line,
+                "compiled procedure requested an invalid graphics operation",
+            )),
+        }
+    })();
+    match result {
+        Ok(()) => 1,
+        Err(error) => {
+            context.error = Some(error);
+            0
+        }
+    }
+}
+
+#[cfg(feature = "experimental-jit")]
+pub(super) extern "C" fn native_procedure_integer(value: f64) -> f64 {
+    f64::from(value.trunc() as i32)
 }
 
 impl Interpreter {
@@ -125,8 +372,11 @@ impl Interpreter {
             started: Instant::now(),
             steps: 0,
             print_column: 0,
+            print_format: DEFAULT_PRINT_FORMAT,
             next_heap_address: FIRST_HEAP_ADDRESS,
             pending_key: None,
+            random_state: 0xA341_316C,
+            last_random_fraction: 0.0,
             #[cfg(feature = "experimental-jit")]
             jit: None,
             #[cfg(feature = "experimental-jit")]
@@ -297,6 +547,108 @@ impl Interpreter {
                 continue;
             }
 
+            #[cfg(feature = "experimental-jit")]
+            if let Statement::ProcedureCall(name, arguments) =
+                self.program.instructions[address].statement.clone()
+            {
+                if let Some(variable_names) = self
+                    .jit
+                    .as_ref()
+                    .and_then(|jit| jit.native_procedure_variables(&name))
+                {
+                    let line = self.program.instructions[address].line_number;
+                    let values = self.evaluate_arguments(&arguments, line, task)?;
+                    let expected_arguments = self
+                        .program
+                        .procedures
+                        .get(&name)
+                        .map(|definition| definition.parameters.len());
+                    let numeric_values = if expected_arguments == Some(values.len()) {
+                        Some(
+                            values
+                                .iter()
+                                .map(|value| value.number(line))
+                                .collect::<Result<Vec<_>, _>>()?,
+                        )
+                    } else {
+                        None
+                    };
+                    let can_run_natively = numeric_values.as_ref().is_some_and(|inputs| {
+                        self.jit
+                            .as_ref()
+                            .is_some_and(|jit| jit.native_procedure_is_safe(&name, inputs))
+                    });
+                    if can_run_natively {
+                        let numeric_values = numeric_values.as_ref().expect("checked above");
+                        let mut context = NativeProcedureContext::new(
+                            &mut self.variables,
+                            task,
+                            dispatcher,
+                            &variable_names,
+                            &mut self.steps,
+                            &mut self.pending_key,
+                            line,
+                        );
+                        let status = match self.jit.as_mut() {
+                            Some(jit) => {
+                                jit.run_native_procedure(&name, &mut context, numeric_values)?
+                            }
+                            None => false,
+                        };
+                        if status {
+                            address += 1;
+                            continue;
+                        }
+                    }
+
+                    match self.execute_procedure_call_values(&name, values, address, line)? {
+                        Flow::Next => address += 1,
+                        Flow::Jump(destination) => address = destination,
+                        Flow::Stop => break,
+                    }
+                    continue;
+                }
+            }
+
+            #[cfg(feature = "experimental-jit")]
+            if let Some(variables) = self
+                .jit
+                .as_ref()
+                .and_then(|jit| jit.numeric_statement_variables(address))
+            {
+                let line = self.program.instructions[address].line_number;
+                let inputs = variables
+                    .iter()
+                    .map(|name| self.get_variable(name).number(line))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let outputs = self
+                    .jit
+                    .as_mut()
+                    .and_then(|jit| jit.run_numeric_statement(address, &inputs));
+                if let Some(outputs) = outputs {
+                    let instruction = self.program.instructions[address].clone();
+                    let statement = super::jit::numeric_statement_with_results(
+                        &instruction.statement,
+                        &outputs,
+                    )
+                    .ok_or_else(|| {
+                        program_error(line, "compiled numeric statement no longer matches")
+                    })?;
+                    match self.execute_statement(
+                        &statement,
+                        address,
+                        instruction.line_number,
+                        task,
+                        dispatcher,
+                    )? {
+                        Flow::Next => address += 1,
+                        Flow::Jump(destination) => address = destination,
+                        Flow::Stop => break,
+                    }
+                    continue;
+                }
+            }
+
             let instruction = self.program.instructions[address].clone();
             match self.execute_statement(
                 &instruction.statement,
@@ -334,6 +686,36 @@ impl Interpreter {
             }
             Statement::Print(items) => {
                 self.print(items, line, task, dispatcher)?;
+                Ok(Flow::Next)
+            }
+            Statement::ClearScreen => {
+                dispatcher.write_via_os_write_c(task, &[12])?;
+                Ok(Flow::Next)
+            }
+            Statement::ClearGraphics => {
+                dispatcher.write_via_os_write_c(task, &[16])?;
+                Ok(Flow::Next)
+            }
+            Statement::Colour(colours) => {
+                if colours.is_empty() || colours.len() > 2 {
+                    return Err(program_error(line, "COLOUR expects one or two values"));
+                }
+                let foreground = self.evaluate(&colours[0], line, task)?.number(line)?;
+                dispatcher.write_via_os_write_c(task, &[17, foreground.trunc() as u8])?;
+                if let Some(background) = colours.get(1) {
+                    let background = self.evaluate(background, line, task)?.number(line)?;
+                    dispatcher
+                        .write_via_os_write_c(task, &[17, (background.trunc() as u8) | 0x80])?;
+                }
+                Ok(Flow::Next)
+            }
+            Statement::PrintFormat(expression) => {
+                let format = self.evaluate(expression, line, task)?.number(line)?.trunc() as i64;
+                self.print_format = if format == 0 {
+                    DEFAULT_PRINT_FORMAT
+                } else {
+                    format as u32
+                };
                 Ok(Flow::Next)
             }
             Statement::Mode(expression) => {
@@ -524,6 +906,7 @@ impl Interpreter {
                             return Ok(Flow::Next);
                         }
                     }
+                    return self.execute_procedure_call_values(name, values, address, line);
                 }
 
                 let Some(definition) = self.program.procedures.get(name).cloned() else {
@@ -533,19 +916,7 @@ impl Interpreter {
                     ));
                 };
                 let values = self.evaluate_arguments(arguments, line, task)?;
-                if values.len() != definition.parameters.len() {
-                    return Err(program_error(
-                        line,
-                        format!("PROC {name} argument count mismatch"),
-                    ));
-                }
-                let saved_variables = self.bind_parameters(&definition.parameters, values, line)?;
-                self.returns.push(ReturnFrame {
-                    kind: ReturnKind::Procedure,
-                    address: address + 1,
-                    saved_variables,
-                });
-                Ok(Flow::Jump(definition.entry))
+                self.enter_procedure(name, definition, values, address, line)
             }
             Statement::DefineFunction(_, _) => Ok(Flow::Next),
             Statement::FunctionReturn(_) => Err(program_error(
@@ -600,6 +971,46 @@ impl Interpreter {
             .get(&target)
             .copied()
             .ok_or_else(|| program_error(line, format!("line {target} does not exist")))
+    }
+
+    #[cfg(feature = "experimental-jit")]
+    fn execute_procedure_call_values(
+        &mut self,
+        name: &str,
+        values: Vec<Value>,
+        address: usize,
+        line: u16,
+    ) -> Result<Flow, RuntimeError> {
+        let Some(definition) = self.program.procedures.get(name).cloned() else {
+            return Err(program_error(
+                line,
+                format!("unknown procedure PROC {name}"),
+            ));
+        };
+        self.enter_procedure(name, definition, values, address, line)
+    }
+
+    fn enter_procedure(
+        &mut self,
+        name: &str,
+        definition: super::parser::Definition,
+        values: Vec<Value>,
+        address: usize,
+        line: u16,
+    ) -> Result<Flow, RuntimeError> {
+        if values.len() != definition.parameters.len() {
+            return Err(program_error(
+                line,
+                format!("PROC {name} argument count mismatch"),
+            ));
+        }
+        let saved_variables = self.bind_parameters(&definition.parameters, values, line)?;
+        self.returns.push(ReturnFrame {
+            kind: ReturnKind::Procedure,
+            address: address + 1,
+            saved_variables,
+        });
+        Ok(Flow::Jump(definition.entry))
     }
 
     fn return_from(&mut self, expected: ReturnKind, line: u16) -> Result<Flow, RuntimeError> {
@@ -892,6 +1303,15 @@ impl Interpreter {
         }
     }
 
+    fn next_random_u32(&mut self) -> u32 {
+        let mut value = self.random_state;
+        value ^= value.wrapping_shl(13);
+        value ^= value.wrapping_shr(17);
+        value ^= value.wrapping_shl(5);
+        self.random_state = value;
+        value
+    }
+
     fn evaluate_binary(
         &self,
         left: Value,
@@ -1018,6 +1438,7 @@ impl Interpreter {
             }
             0x94 => Ok(Value::Number(one_number()?.abs())),
             0x9B => Ok(Value::Number(one_number()?.cos())),
+            0xB5 => Ok(Value::Number(one_number()?.sin())),
             0xA8 => Ok(Value::Number(one_number()?.floor())),
             0xA9 => {
                 if values.len() != 1 {
@@ -1035,6 +1456,37 @@ impl Interpreter {
                 Ok(Value::Number(
                     self.pending_key.take().map_or(no_key, f64::from),
                 ))
+            }
+            0xB3 => {
+                if values.len() > 1 {
+                    return Err(program_error(line, "RND expects zero or one argument"));
+                }
+                let value = if values.is_empty() {
+                    f64::from(self.next_random_u32() as i32)
+                } else {
+                    let argument = values[0].number(line)?;
+                    let integer = argument.trunc() as i64;
+                    if argument < 0.0 {
+                        let seed = integer as i32;
+                        self.random_state = if seed == 0 { 0xA341_316C } else { seed as u32 };
+                        f64::from(seed)
+                    } else {
+                        match integer {
+                            0 => self.last_random_fraction,
+                            1 => {
+                                self.last_random_fraction =
+                                    f64::from(self.next_random_u32()) / 4_294_967_296.0;
+                                self.last_random_fraction
+                            }
+                            upper => {
+                                let upper = u32::try_from(upper)
+                                    .map_err(|_| program_error(line, "RND limit is too large"))?;
+                                f64::from(self.next_random_u32() % upper + 1)
+                            }
+                        }
+                    }
+                };
+                Ok(Value::Number(value))
             }
             0xA7 => {
                 if !(2..=3).contains(&values.len()) {
@@ -1335,7 +1787,13 @@ impl Interpreter {
             match item {
                 PrintItem::Value(expression) => {
                     let value = self.evaluate(expression, line, task)?;
-                    self.emit(&value_to_bytes(value), task, dispatcher)?;
+                    let bytes = match value {
+                        Value::String(value) => value,
+                        Value::Number(value) => {
+                            format_print_number(value, self.print_format).into_bytes()
+                        }
+                    };
+                    self.emit(&bytes, task, dispatcher)?;
                 }
                 PrintItem::Spaces(expression) => {
                     let count = self.evaluate(expression, line, task)?.number(line)?;
@@ -1558,13 +2016,6 @@ fn graphics_coordinate(number: f64, line: u16) -> Result<i32, RuntimeError> {
     Ok(coordinate as i32)
 }
 
-fn value_to_bytes(value: Value) -> Vec<u8> {
-    match value {
-        Value::String(value) => value,
-        Value::Number(value) => format_number(value).into_bytes(),
-    }
-}
-
 fn format_number(number: f64) -> String {
     if number == 0.0 {
         return "0".into();
@@ -1573,6 +2024,22 @@ fn format_number(number: f64) -> String {
         return format!("{number:.0}");
     }
     number.to_string()
+}
+
+fn format_print_number(number: f64, format: u32) -> String {
+    if !number.is_finite() {
+        return format_number(number);
+    }
+    let style = (format >> 16) & 0xFF;
+    let precision = ((format >> 8) & 0xFF).min(10) as usize;
+    match style {
+        2 => format!("{number:.precision$}"),
+        1 => {
+            let fractional_digits = precision.saturating_sub(1);
+            format!("{number:.fractional_digits$e}").replace('e', "E")
+        }
+        _ => format_number(number),
+    }
 }
 
 fn require_argument_count(
