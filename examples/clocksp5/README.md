@@ -7,9 +7,11 @@ ClockSP5.bbc is a generated ARM BBC BASIC V tokenised saved-program file for tes
 Run `cargo run`, then enter these commands at the MOS prompt:
 
 ```text
-BASICLOAD examples/clocksp5/ClockSP5.bbc
+BASICLOAD $.clocksp5.ClockSP5
 BASICRUN
 ```
+
+Both `.bbc` fixtures from this folder are staged under `demo-volume/clocksp5` with BASIC file type metadata and extensionless guest names (`ClockSP5` and `integer-repeat-jit`).
 
 The loader reports 143 lines and 37 line references. The compatibility runner executes the subset used by this program and prints three complete workload passes, with the benchmark sections and comparison in each, before returning to `*`. Its hosted profile uses monotonic centisecond `TIME` and the no-key `INKEY` result. ClockSP5's own guards then skip its native ARM call and hardware/OS setup; the final hardware reset command is accepted as a no-op.
 

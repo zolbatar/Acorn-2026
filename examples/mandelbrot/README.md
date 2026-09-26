@@ -13,9 +13,11 @@ python3 tools/tokenize_full_mandelbrot.py
 Run it in the windowed app from the repository root:
 
 ```text
-BASICLOAD examples/mandelbrot/mandelbrot.bbc
+BASICLOAD $.mandelbrot.mandelbrot
 BASICRUN
 ```
+
+All three `.bbc` fixtures from this folder are also staged under `demo-volume/mandelbrot`. HostFS metadata gives them the BASIC file type and exposes extensionless guest names.
 
 The listing asks for a 1680 × 1050 display and up to 8192 iterations per pixel, so its interpreted run can take a while. The window uses a shared RGBA raster surface and 60 Hz display updates; plot history does not grow with the number of pixels. Press a key after the image completes to return to the prompt.
 
@@ -35,7 +37,7 @@ The generator reuses the project's limited ARM BASIC V fixture encoder. These by
 Run it in the windowed app from the repository root:
 
 ```text
-BASICLOAD examples/mandelbrot/reduced.bbc
+BASICLOAD $.mandelbrot.reduced
 BASICRUN
 ```
 
