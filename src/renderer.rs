@@ -4,6 +4,7 @@ use crate::{
     font::bbc_micro_glyph,
     graphics::{GraphicsPrimitive, GraphicsSnapshot, GraphicsWindow, Point, graphics_colour},
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const SCREEN_WIDTH: u32 = 640;
 pub const SCREEN_HEIGHT: u32 = 256;
@@ -37,7 +38,14 @@ pub fn render(snapshot: &GraphicsSnapshot, frame: &mut [u8]) {
                     if let Some((from, to)) = clip_line(*from, *to, *clip, snapshot) {
                         let from = screen_point(from, snapshot);
                         let to = screen_point(to, snapshot);
-                        draw_line(frame, width, height, from, to, colour(*logical_colour));
+                        draw_line(
+                            frame,
+                            width,
+                            height,
+                            from,
+                            to,
+                            colour(*logical_colour, snapshot),
+                        );
                     }
                 }
                 GraphicsPrimitive::Point {
@@ -48,7 +56,14 @@ pub fn render(snapshot: &GraphicsSnapshot, frame: &mut [u8]) {
                 } => {
                     if inside(*at, *clip, snapshot) {
                         let (x, y) = screen_point(*at, snapshot);
-                        set_pixel(frame, width, height, x, y, colour(*logical_colour));
+                        set_pixel(
+                            frame,
+                            width,
+                            height,
+                            x,
+                            y,
+                            colour(*logical_colour, snapshot),
+                        );
                     }
                 }
             }
@@ -60,13 +75,17 @@ pub fn render(snapshot: &GraphicsSnapshot, frame: &mut [u8]) {
 }
 
 fn draw_text(snapshot: &GraphicsSnapshot, frame: &mut [u8], width: u32, height: u32) {
+    if is_teletext_mode(snapshot.mode.number) {
+        draw_teletext(snapshot, frame, width, height);
+        return;
+    }
     let columns = u32::from(snapshot.mode.text_columns);
     let rows = u32::from(snapshot.mode.text_rows);
     if columns == 0 || rows == 0 {
         return;
     }
 
-    let text_colour = colour(u32::from(snapshot.text_colour));
+    let text_colour = colour(u32::from(snapshot.text_colour), snapshot);
 
     for (index, character) in snapshot.text_cells.iter().copied().enumerate() {
         if character == b' ' {
@@ -107,6 +126,221 @@ fn draw_text(snapshot: &GraphicsSnapshot, frame: &mut [u8], width: u32, height: 
     }
 }
 
+#[derive(Clone, Copy)]
+struct TeletextAttributes {
+    foreground: u8,
+    background: u8,
+    graphics: bool,
+    separated: bool,
+    flashing: bool,
+    double_height: bool,
+    conceal: bool,
+    hold_graphics: bool,
+}
+
+impl Default for TeletextAttributes {
+    fn default() -> Self {
+        Self {
+            foreground: 7,
+            background: 0,
+            graphics: false,
+            separated: false,
+            flashing: false,
+            double_height: false,
+            conceal: false,
+            hold_graphics: false,
+        }
+    }
+}
+
+fn is_teletext_mode(number: u8) -> bool {
+    number == 7 || number == 135
+}
+
+fn draw_teletext(snapshot: &GraphicsSnapshot, frame: &mut [u8], width: u32, height: u32) {
+    let columns = u32::from(snapshot.mode.text_columns);
+    let rows = u32::from(snapshot.mode.text_rows);
+    if columns == 0 || rows == 0 {
+        return;
+    }
+    let flash_visible = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|time| (time.as_millis() / 500) % 2 == 0)
+        .unwrap_or(true);
+
+    for row in 0..rows {
+        let mut attributes = TeletextAttributes::default();
+        let mut held_graphic = None;
+        for column in 0..columns {
+            let index = (row * columns + column) as usize;
+            let character = snapshot.text_cells.get(index).copied().unwrap_or(b' ');
+            let control = (0x80..=0x9F).contains(&character);
+            let displayed_character = if control {
+                if attributes.hold_graphics && attributes.graphics {
+                    held_graphic
+                } else {
+                    None
+                }
+            } else if attributes.graphics && teletext_mosaic_pattern(character).is_some() {
+                held_graphic = Some(character);
+                Some(character)
+            } else {
+                Some(character)
+            };
+
+            draw_teletext_cell(
+                snapshot,
+                frame,
+                width,
+                height,
+                column,
+                row,
+                displayed_character,
+                attributes,
+                flash_visible,
+            );
+
+            if control {
+                apply_teletext_control(&mut attributes, character);
+            }
+        }
+    }
+}
+
+fn apply_teletext_control(attributes: &mut TeletextAttributes, control: u8) {
+    match control {
+        0x80 | 0x90 => {
+            attributes.foreground = 0;
+            attributes.graphics = false;
+            attributes.conceal = false;
+        }
+        0x81..=0x87 => {
+            attributes.foreground = control - 0x80;
+            attributes.graphics = false;
+            attributes.conceal = false;
+        }
+        0x88 => attributes.flashing = true,
+        0x89 => attributes.flashing = false,
+        0x8C => attributes.double_height = false,
+        0x8D => attributes.double_height = true,
+        0x91..=0x97 => {
+            attributes.foreground = control - 0x90;
+            attributes.graphics = true;
+            attributes.conceal = false;
+        }
+        0x98 => attributes.conceal = true,
+        0x99 => attributes.separated = false,
+        0x9A => attributes.separated = true,
+        0x9C => attributes.background = 0,
+        0x9D => attributes.background = attributes.foreground,
+        0x9E => attributes.hold_graphics = true,
+        0x9F => attributes.hold_graphics = false,
+        _ => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_teletext_cell(
+    snapshot: &GraphicsSnapshot,
+    frame: &mut [u8],
+    width: u32,
+    height: u32,
+    column: u32,
+    row: u32,
+    character: Option<u8>,
+    attributes: TeletextAttributes,
+    flash_visible: bool,
+) {
+    let columns = u32::from(snapshot.mode.text_columns);
+    let rows = u32::from(snapshot.mode.text_rows);
+    let left = column * width / columns;
+    let right = (column + 1) * width / columns;
+    let top = row * height / rows;
+    let bottom = (row + 1) * height / rows;
+    let cell_width = right - left;
+    let cell_height = bottom - top;
+    let background = graphics_colour(u32::from(attributes.background), snapshot.mode);
+    for y in top..bottom {
+        for x in left..right {
+            set_pixel(frame, width, height, x as i32, y as i32, background);
+        }
+    }
+
+    if attributes.conceal || (attributes.flashing && !flash_visible) {
+        return;
+    }
+    let Some(character) = character else {
+        return;
+    };
+    let foreground = graphics_colour(u32::from(attributes.foreground), snapshot.mode);
+
+    if attributes.graphics {
+        if let Some(pattern) = teletext_mosaic_pattern(character) {
+            for sixel_y in 0..3_u32 {
+                for sixel_x in 0..2_u32 {
+                    let bit = 4 - sixel_y * 2 + sixel_x;
+                    if pattern & (1 << bit) == 0 {
+                        continue;
+                    }
+                    let mut x0 = left + sixel_x * cell_width / 2;
+                    let mut x1 = left + (sixel_x + 1) * cell_width / 2;
+                    let mut y0 = top + sixel_y * cell_height / 3;
+                    let mut y1 = top + (sixel_y + 1) * cell_height / 3;
+                    if attributes.separated {
+                        x0 += 1;
+                        x1 = x1.saturating_sub(1);
+                        y0 += 1;
+                        y1 = y1.saturating_sub(1);
+                    }
+                    for y in y0..y1 {
+                        for x in x0..x1 {
+                            set_pixel(frame, width, height, x as i32, y as i32, foreground);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+    }
+
+    let character = character & 0x7F;
+    let Some(glyph) = bbc_micro_glyph(character) else {
+        return;
+    };
+    for y in 0..cell_height {
+        let glyph_y = if attributes.double_height {
+            let half = if row % 2 == 0 { 0 } else { 4 };
+            half + (y * 4 / cell_height) as usize
+        } else {
+            (y * 8 / cell_height) as usize
+        };
+        let bits = glyph[glyph_y.min(7)];
+        for x in 0..cell_width {
+            let glyph_x = (x * 8 / cell_width) as u8;
+            if bits & (0x80 >> glyph_x) != 0 {
+                set_pixel(
+                    frame,
+                    width,
+                    height,
+                    (left + x) as i32,
+                    (top + y) as i32,
+                    foreground,
+                );
+            }
+        }
+    }
+}
+
+fn teletext_mosaic_pattern(character: u8) -> Option<u8> {
+    match character {
+        0x20..=0x3F => Some(character - 0x20),
+        0x60..=0x7F => Some((character - 0x40) | 0x20),
+        0xA0..=0xBF => Some(character - 0xA0),
+        0xE0..=0xFF => Some((character - 0xE0) | 0x20),
+        _ => None,
+    }
+}
+
 fn draw_cursor(snapshot: &GraphicsSnapshot, frame: &mut [u8], width: u32, height: u32) {
     let columns = u32::from(snapshot.mode.text_columns);
     let rows = u32::from(snapshot.mode.text_rows);
@@ -130,13 +364,14 @@ fn draw_cursor(snapshot: &GraphicsSnapshot, frame: &mut [u8], width: u32, height
             height,
             cursor_x as i32,
             bottom as i32,
-            colour(u32::from(snapshot.text_colour)),
+            colour(u32::from(snapshot.text_colour), snapshot),
         );
     }
 }
 
 fn inside(point: Point, clip: GraphicsWindow, snapshot: &GraphicsSnapshot) -> bool {
-    point.x >= clip.left
+    snapshot.mode.graphics_enabled
+        && point.x >= clip.left
         && point.x <= clip.right
         && point.y >= clip.bottom
         && point.y <= clip.top
@@ -152,6 +387,9 @@ fn clip_line(
     clip: GraphicsWindow,
     snapshot: &GraphicsSnapshot,
 ) -> Option<(Point, Point)> {
+    if !snapshot.mode.graphics_enabled {
+        return None;
+    }
     let left = clip.left.max(0) as f64;
     let right = clip.right.min(snapshot.mode.logical_width - 1) as f64;
     let bottom = clip.bottom.max(0) as f64;
@@ -280,6 +518,6 @@ fn set_pixel(frame: &mut [u8], width: u32, height: u32, x: i32, y: i32, rgba: [u
     frame[offset..offset + BYTES_PER_PIXEL].copy_from_slice(&rgba);
 }
 
-fn colour(logical_colour: u32) -> [u8; 4] {
-    graphics_colour(logical_colour)
+fn colour(logical_colour: u32, snapshot: &GraphicsSnapshot) -> [u8; 4] {
+    graphics_colour(logical_colour, snapshot.mode)
 }

@@ -1,5 +1,5 @@
-10 REM Reduced Mandelbrot for the hosted mode-2 graphics path
-20 MODE 2
+10 REM Reduced Mandelbrot for the hosted mode-12 graphics path
+20 MODE 12
 30 xsize%=640:ysize%=256
 40 aspect=ysize%/xsize%
 50 xcentre=-0.75:ycentre=0:scale=3.5

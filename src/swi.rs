@@ -207,8 +207,14 @@ impl SwiDispatcher {
         match number {
             OS_WRITE_C => {
                 let character = context.registers[R0] as u8;
+                let previous_mode = self.graphics.snapshot().mode;
                 let output_byte = self.graphics.write_byte(character)?;
-                if !self.display_batch_active || output_byte.is_some() {
+                let mode_changed = self.graphics.snapshot().mode != previous_mode;
+                if mode_changed {
+                    self.publish_display_event(DisplayEvent::GraphicsSnapshot(
+                        self.graphics.snapshot().clone(),
+                    ));
+                } else if !self.display_batch_active || output_byte.is_some() {
                     self.publish_display_event(DisplayEvent::WriteByte(character));
                 }
                 if let Some(byte) = output_byte {

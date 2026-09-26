@@ -22,7 +22,7 @@ The listing asks for a 1680 × 1050 display and up to 8192 iterations per pixel,
 
 ## Reduced hosted example
 
-[`reduced.bas`](reduced.bas) remains a quick project-authored derivative for the MODE 2 graphics path. It visits 640 × 256 pixels, caps each point at 48 iterations, uses the eight logical colors, and avoids the original's extended mode and `ColourTrans` path.
+[`reduced.bas`](reduced.bas) remains a quick project-authored derivative for standard RISC OS MODE 12 (640 × 256, 16 colours). It visits 640 × 256 pixels, caps each point at 48 iterations, uses the first eight logical colours, and avoids the original's extended mode and `ColourTrans` path.
 
 The checked-in [`reduced.bbc`](reduced.bbc) is generated from that numbered source with:
 

@@ -4,6 +4,7 @@ use std::{
     error::Error,
     sync::{Arc, mpsc},
     thread,
+    time::{Duration, Instant},
 };
 
 use pixels::{Pixels, SurfaceTexture};
@@ -66,6 +67,7 @@ struct WindowApp {
     window: Option<Arc<Window>>,
     pixels: Option<Pixels<'static>>,
     frame_size: (u32, u32),
+    next_teletext_flash: Option<Instant>,
 }
 
 impl WindowApp {
@@ -77,6 +79,7 @@ impl WindowApp {
             window: None,
             pixels: None,
             frame_size: (renderer::SCREEN_WIDTH, renderer::SCREEN_HEIGHT),
+            next_teletext_flash: None,
         }
     }
 
@@ -164,6 +167,8 @@ impl WindowApp {
                 if let Err(error) = self.graphics.write_byte(byte) {
                     eprintln!("Acorn-2026 display state error: {error}");
                 }
+                let mode = self.graphics.snapshot().mode;
+                self.resize_buffer((mode.pixel_width, mode.pixel_height));
             }
             DisplayEvent::Plot { code, x, y } => {
                 if let Err(error) = self.graphics.plot(code, x, y) {
@@ -299,5 +304,30 @@ impl ApplicationHandler<WindowUserEvent> for WindowApp {
         match event {
             WindowUserEvent::Display(event) => self.apply_display_event(event, event_loop),
         }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let snapshot = self.graphics.snapshot();
+        let is_teletext = matches!(snapshot.mode.number, 7 | 135);
+        let has_flash = is_teletext && snapshot.text_cells.contains(&0x88);
+        if !has_flash {
+            self.next_teletext_flash = None;
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+
+        let now = Instant::now();
+        let deadline = self
+            .next_teletext_flash
+            .unwrap_or_else(|| now + Duration::from_millis(500));
+        if now >= deadline {
+            self.request_redraw();
+            self.next_teletext_flash = Some(now + Duration::from_millis(500));
+        } else {
+            self.next_teletext_flash = Some(deadline);
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            self.next_teletext_flash.expect("flash deadline is set"),
+        ));
     }
 }

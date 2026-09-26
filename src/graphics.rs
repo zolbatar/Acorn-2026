@@ -1,9 +1,6 @@
 use crate::error::RuntimeError;
 use std::sync::{Arc, Mutex};
 
-const DEFAULT_GRAPHICS_WIDTH: i32 = 1280;
-const DEFAULT_GRAPHICS_HEIGHT: i32 = 1024;
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Point {
     pub x: i32,
@@ -35,7 +32,9 @@ pub struct ScreenMode {
     pub pixel_height: u32,
     pub text_columns: u16,
     pub text_rows: u16,
-    pub colours: u8,
+    pub colours: u32,
+    pub bits_per_pixel: u8,
+    pub graphics_enabled: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -179,7 +178,7 @@ impl Default for GraphicsService {
                 graphics_origin: Point::default(),
                 graphics_cursor: Point::default(),
                 text_cursor: Point::default(),
-                text_colour: 7,
+                text_colour: default_foreground_colour(mode),
                 graphics_action: 0,
                 graphics_colour: 7,
                 text_cells: vec![
@@ -230,6 +229,9 @@ impl GraphicsService {
 
     /// Apply one OS_Plot operation using RISC OS logical coordinates.
     pub fn plot(&mut self, plot_code: u8, x: i32, y: i32) -> Result<(), RuntimeError> {
+        if !self.snapshot.mode.graphics_enabled {
+            return Ok(());
+        }
         let group = plot_code & 0xF8;
         let subcode = plot_code & 0x07;
         let relative = subcode < 4;
@@ -315,7 +317,9 @@ impl GraphicsService {
             pixel_height,
             text_columns: 80,
             text_rows: 25,
-            colours: 16,
+            colours: 16_777_216,
+            bits_per_pixel: 32,
+            graphics_enabled: true,
         };
         self.snapshot.mode = mode;
         self.snapshot.text_window = default_text_window(mode);
@@ -327,9 +331,9 @@ impl GraphicsService {
             vec![b' '; usize::from(mode.text_columns) * usize::from(mode.text_rows)];
         self.snapshot.primitives.clear();
         self.snapshot.raster_surface = Some(SharedRasterSurface::new(pixel_width, pixel_height));
-        self.snapshot.text_colour = 7;
+        self.snapshot.text_colour = default_foreground_colour(mode);
         self.snapshot.graphics_action = 0;
-        self.snapshot.graphics_colour = 7;
+        self.snapshot.graphics_colour = u32::from(default_foreground_colour(mode));
         Ok(())
     }
 
@@ -379,9 +383,10 @@ impl GraphicsService {
                 self.snapshot.graphics_colour = u32::from(parameters[1]);
             }
             20 => {
-                self.snapshot.text_colour = 7;
+                self.snapshot.text_colour = default_foreground_colour(self.snapshot.mode);
                 self.snapshot.graphics_action = 0;
-                self.snapshot.graphics_colour = 7;
+                self.snapshot.graphics_colour =
+                    u32::from(default_foreground_colour(self.snapshot.mode));
             }
             22 => self.set_mode(parameters[0])?,
             24 => self.set_graphics_window(parameters),
@@ -431,9 +436,9 @@ impl GraphicsService {
             vec![b' '; usize::from(mode.text_columns) * usize::from(mode.text_rows)];
         self.snapshot.primitives.clear();
         self.snapshot.raster_surface = None;
-        self.snapshot.text_colour = 7;
+        self.snapshot.text_colour = default_foreground_colour(mode);
         self.snapshot.graphics_action = 0;
-        self.snapshot.graphics_colour = 7;
+        self.snapshot.graphics_colour = u32::from(default_foreground_colour(mode));
         Ok(())
     }
 
@@ -566,26 +571,88 @@ fn vdu_parameter_count(command: u8) -> usize {
 }
 
 fn screen_mode(number: u8) -> Option<ScreenMode> {
-    let (logical_height, pixel_height, text_columns, text_rows, colours) = match number {
-        0 => (DEFAULT_GRAPHICS_HEIGHT, 256, 80, 32, 2),
-        1 => (DEFAULT_GRAPHICS_HEIGHT, 256, 40, 32, 4),
-        2 => (DEFAULT_GRAPHICS_HEIGHT, 256, 20, 32, 16),
-        3 => (1000, 250, 80, 25, 2),
-        4 => (DEFAULT_GRAPHICS_HEIGHT, 256, 40, 32, 2),
-        5 => (DEFAULT_GRAPHICS_HEIGHT, 256, 20, 32, 4),
-        6 => (1000, 250, 40, 25, 2),
-        7 => (1000, 250, 40, 25, 16),
-        _ => return None,
+    // RISC OS PRM, Volume 4, Table B. Mode 32 is unassigned. The modes in
+    // the range 128..=164 are the BBC BASIC shadow-memory aliases for 0..=36;
+    // shadow memory has no separate visual representation in this hosted
+    // profile, so those aliases share the base mode's display description.
+    let base_number = if (128..=164).contains(&number) {
+        number - 128
+    } else {
+        number
     };
-    Some(ScreenMode {
-        number,
-        logical_width: DEFAULT_GRAPHICS_WIDTH,
+    let (
+        logical_width,
         logical_height,
-        pixel_width: 640,
+        pixel_width,
         pixel_height,
         text_columns,
         text_rows,
         colours,
+        bits_per_pixel,
+        graphics_enabled,
+    ) = match base_number {
+        0 => (1280, 1024, 640, 256, 80, 32, 2, 1, true),
+        1 => (1280, 1024, 320, 256, 40, 32, 4, 2, true),
+        2 => (1280, 1024, 160, 256, 20, 32, 16, 4, true),
+        // Text-only modes use a host raster sized to the character grid; the
+        // guest has no graphics coordinate space in these modes.
+        3 => (0, 0, 640, 250, 80, 25, 2, 1, false),
+        4 => (1280, 1024, 320, 256, 40, 32, 2, 1, true),
+        5 => (1280, 1024, 160, 256, 20, 32, 4, 2, true),
+        6 => (0, 0, 640, 250, 40, 25, 2, 1, false),
+        // Mode 7 uses the SAA5050-style Teletext character display.
+        7 => (0, 0, 480, 500, 40, 25, 16, 0, false),
+        8 => (1280, 1024, 640, 256, 80, 32, 4, 2, true),
+        9 => (1280, 1024, 320, 256, 40, 32, 16, 4, true),
+        10 => (1280, 1024, 160, 256, 20, 32, 256, 8, true),
+        11 => (1280, 1000, 640, 250, 80, 25, 4, 2, true),
+        12 => (1280, 1024, 640, 256, 80, 32, 16, 4, true),
+        13 => (1280, 1024, 320, 256, 40, 32, 256, 8, true),
+        14 => (1280, 1000, 640, 250, 80, 25, 16, 4, true),
+        15 => (1280, 1024, 640, 256, 80, 32, 256, 8, true),
+        16 => (2112, 1024, 1056, 256, 132, 32, 16, 4, true),
+        17 => (2112, 1000, 1056, 250, 132, 25, 16, 4, true),
+        18 => (1280, 1024, 640, 512, 80, 64, 2, 1, true),
+        19 => (1280, 1024, 640, 512, 80, 64, 4, 2, true),
+        20 => (1280, 1024, 640, 512, 80, 64, 16, 4, true),
+        21 => (1280, 1024, 640, 512, 80, 64, 256, 8, true),
+        22 => (768, 576, 768, 288, 96, 36, 16, 4, true),
+        23 => (2304, 1792, 1152, 896, 144, 56, 2, 1, true),
+        24 => (2112, 1024, 1056, 256, 132, 32, 256, 8, true),
+        25 => (1280, 960, 640, 480, 80, 60, 2, 1, true),
+        26 => (1280, 960, 640, 480, 80, 60, 4, 2, true),
+        27 => (1280, 960, 640, 480, 80, 60, 16, 4, true),
+        28 => (1280, 960, 640, 480, 80, 60, 256, 8, true),
+        29 => (1600, 1200, 800, 600, 100, 75, 2, 1, true),
+        30 => (1600, 1200, 800, 600, 100, 75, 4, 2, true),
+        31 => (1600, 1200, 800, 600, 100, 75, 16, 4, true),
+        33 => (1536, 1152, 768, 288, 96, 36, 2, 1, true),
+        34 => (1536, 1152, 768, 288, 96, 36, 4, 2, true),
+        35 => (1536, 1152, 768, 288, 96, 36, 16, 4, true),
+        36 => (1536, 1152, 768, 288, 96, 36, 256, 8, true),
+        37 => (1792, 1408, 896, 352, 112, 44, 2, 1, true),
+        38 => (1792, 1408, 896, 352, 112, 44, 4, 2, true),
+        39 => (1792, 1408, 896, 352, 112, 44, 16, 4, true),
+        40 => (1792, 1408, 896, 352, 112, 44, 256, 8, true),
+        41 => (1280, 1408, 640, 352, 80, 44, 2, 1, true),
+        42 => (1280, 1408, 640, 352, 80, 44, 4, 2, true),
+        43 => (1280, 1408, 640, 352, 80, 44, 16, 4, true),
+        44 => (1280, 800, 640, 200, 80, 25, 2, 1, true),
+        45 => (1280, 800, 640, 200, 80, 25, 4, 2, true),
+        46 => (1280, 800, 640, 200, 80, 25, 16, 4, true),
+        _ => return None,
+    };
+    Some(ScreenMode {
+        number,
+        logical_width,
+        logical_height,
+        pixel_width,
+        pixel_height,
+        text_columns,
+        text_rows,
+        colours,
+        bits_per_pixel,
+        graphics_enabled,
     })
 }
 
@@ -603,7 +670,7 @@ fn rasterize_primitive(
         } => {
             if point_inside(*at, *clip, snapshot) {
                 let (x, y) = screen_point(*at, snapshot);
-                surface.set_pixel(x, y, graphics_colour(*logical_colour));
+                surface.set_pixel(x, y, graphics_colour(*logical_colour, snapshot.mode));
             }
         }
         GraphicsPrimitive::Line {
@@ -625,7 +692,7 @@ fn rasterize_primitive(
             let dy = -((y1 as i64 - y0 as i64).abs() as i32);
             let sy = if y0 < y1 { 1 } else { -1 };
             let mut error = dx + dy;
-            let color = graphics_colour(*logical_colour);
+            let color = graphics_colour(*logical_colour, snapshot.mode);
             loop {
                 surface.set_pixel(x0 as u32, y0 as u32, color);
                 if x0 == x1 && y0 == y1 {
@@ -646,7 +713,8 @@ fn rasterize_primitive(
 }
 
 fn point_inside(point: Point, clip: GraphicsWindow, snapshot: &GraphicsSnapshot) -> bool {
-    point.x >= clip.left
+    snapshot.mode.graphics_enabled
+        && point.x >= clip.left
         && point.x <= clip.right
         && point.y >= clip.bottom
         && point.y <= clip.top
@@ -671,6 +739,9 @@ fn clip_line(
     clip: GraphicsWindow,
     snapshot: &GraphicsSnapshot,
 ) -> Option<(Point, Point)> {
+    if !snapshot.mode.graphics_enabled {
+        return None;
+    }
     let (left, right) = (
         clip.left.max(0) as f64,
         clip.right.min(snapshot.mode.logical_width - 1) as f64,
@@ -748,7 +819,7 @@ fn line_out_code(x: f64, y: f64, left: f64, right: f64, bottom: f64, top: f64) -
     code
 }
 
-pub(crate) fn graphics_colour(value: u32) -> [u8; 4] {
+pub(crate) fn graphics_colour(value: u32, mode: ScreenMode) -> [u8; 4] {
     if value <= 0xFF {
         const PALETTE: [[u8; 4]; 8] = [
             [0x00, 0x00, 0x00, 0xFF],
@@ -760,7 +831,35 @@ pub(crate) fn graphics_colour(value: u32) -> [u8; 4] {
             [0x00, 0xFF, 0xFF, 0xFF],
             [0xFF, 0xFF, 0xFF, 0xFF],
         ];
-        PALETTE[(value as usize) & 7]
+        match mode.bits_per_pixel {
+            8 => {
+                // The BASIC GCOL byte stores two bits per RGB component and
+                // two tint bits. Without an explicit TINT command, the
+                // foreground uses the default full tint and the background
+                // uses no tint.
+                let colour = value as u8;
+                let tint = if colour & 0x80 == 0 { 3 } else { 0 };
+                let channel =
+                    |shift: u32| ((((u32::from(colour) >> shift) & 3) * 4 + tint) * 17) as u8;
+                [channel(0), channel(2), channel(4), 0xFF]
+            }
+            1 | 2 | 4 => {
+                let logical = (value % mode.colours.max(1)) as usize;
+                let physical = match mode.bits_per_pixel {
+                    1 => {
+                        if logical == 0 {
+                            0
+                        } else {
+                            7
+                        }
+                    }
+                    2 => [0, 1, 3, 7][logical.min(3)],
+                    _ => logical.min(15) as u8,
+                };
+                PALETTE[usize::from(physical & 7)]
+            }
+            _ => PALETTE[(value as usize) & 7],
+        }
     } else {
         [
             ((value >> 8) & 0xFF) as u8,
@@ -781,10 +880,22 @@ fn default_text_window(mode: ScreenMode) -> TextWindow {
 }
 
 fn default_graphics_window(mode: ScreenMode) -> GraphicsWindow {
+    if !mode.graphics_enabled {
+        return GraphicsWindow {
+            left: 0,
+            bottom: 0,
+            right: 0,
+            top: 0,
+        };
+    }
     GraphicsWindow {
         left: 0,
         bottom: 0,
         right: mode.logical_width - 1,
         top: mode.logical_height - 1,
     }
+}
+
+fn default_foreground_colour(mode: ScreenMode) -> u8 {
+    if mode.bits_per_pixel == 8 { 63 } else { 7 }
 }
