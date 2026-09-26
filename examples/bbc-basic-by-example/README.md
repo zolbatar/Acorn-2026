@@ -4,6 +4,8 @@ This directory contains 32 `.BAS` programs copied from [learnagon/bbc-basic-by-e
 
 Each source file has a matching `.bbc` tokenised file. The `.bbc` files were made with [Steve Fryatt's Tokenize](https://github.com/steve-fryatt/tokenize) at commit `d5ea2f424bb7bcc9645416986b51f2ffb9b0e220`. The conversion script keeps the token and line-reference bytes, while changing the tokenizer's shared-CR framing to the separate-CR framing used by this repository's generated ARM-profile fixtures. These are converter-generated ARM-profile files; they are not saves produced by a named BBC BASIC V ROM. Tokenize does not check whether every statement is supported by this runtime.
 
+The tokenised `.bbc` files are copied into `demo-volume/agon`; the paired `.bas` sources are not included in the demo volume. HostFS metadata gives each `.bbc` file the BASIC file type and exposes its guest name without the host `.bbc` suffix, so load it with a path such as `BASICLOAD $.agon.TREE`.
+
 Every source begins with `REM @BASIC64 MODE=CLASSIC TARGET=AGON`. This records the intended classic BASIC compatibility mode and Agon target so the examples are not mistaken for native BASIC64 programs. It remains a BASIC comment; the current runtime does not read it to select a profile. The paired `.bbc` file stores it as tokenised line 0.
 
 Regenerate the `.bbc` files from the included sources with Tokenize available on `PATH`:
@@ -21,7 +23,7 @@ BBC_BASIC_TOKENIZER=/path/to/tokenize python3 tools/tokenize_external_basic_exam
 Run a file through the experimental hybrid JIT from the MOS prompt:
 
 ```text
-BASICLOAD examples/bbc-basic-by-example/operators-and-special-symbols/EXPONENTIATION-OPERATOR.bbc
+BASICLOAD $.agon.operators-and-special-symbols.EXPONENTIATION-OPERATOR
 BASICJIT
 ```
 
@@ -32,7 +34,7 @@ These programs target Agon Light BASIC. The set widens the source syntax and num
 The unmodified tree listing can also be run through the hosted compatibility profile:
 
 ```text
-BASICLOAD examples/bbc-basic-by-example/TREE.bbc
+BASICLOAD $.agon.TREE
 BASICJIT
 ```
 
