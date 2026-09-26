@@ -1,5 +1,6 @@
-use std::{error::Error, fmt};
+use std::{collections::BTreeMap, error::Error, fmt};
 
+use crate::filesystem::OpenFile;
 use crate::tokenized_basic::TokenizedBasicProgram;
 
 pub const GUEST_MEMORY_BASE: u32 = 0x1000;
@@ -99,6 +100,43 @@ pub struct Task {
     pub id: u64,
     pub memory: GuestMemory,
     pub loaded_tokenized_program: Option<TokenizedBasicProgram>,
+    pub file_system: FileSystemContext,
+}
+
+#[derive(Debug)]
+pub struct FileSystemContext {
+    pub current_file_system: String,
+    pub temporary_file_system: String,
+    pub current_directory: Vec<String>,
+    pub user_root: Vec<String>,
+    pub library_directory: Vec<String>,
+    pub previous_directory: Vec<String>,
+    pub open_files: BTreeMap<u32, OpenFile>,
+    next_handle: u32,
+}
+
+impl Default for FileSystemContext {
+    fn default() -> Self {
+        Self {
+            current_file_system: "HostFS".to_string(),
+            temporary_file_system: "HostFS".to_string(),
+            current_directory: Vec::new(),
+            user_root: Vec::new(),
+            library_directory: Vec::new(),
+            previous_directory: Vec::new(),
+            open_files: BTreeMap::new(),
+            next_handle: 1,
+        }
+    }
+}
+
+impl FileSystemContext {
+    pub fn insert_file(&mut self, open_file: OpenFile) -> u32 {
+        let handle = self.next_handle.max(1);
+        self.next_handle = handle.wrapping_add(1).max(1);
+        self.open_files.insert(handle, open_file);
+        handle
+    }
 }
 
 impl Task {
@@ -107,6 +145,7 @@ impl Task {
             id,
             memory: GuestMemory::default(),
             loaded_tokenized_program: None,
+            file_system: FileSystemContext::default(),
         }
     }
 }
