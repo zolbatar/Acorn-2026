@@ -407,9 +407,12 @@ impl Interpreter {
             .or(report.fallback_reason)
             .or_else(|| {
                 if report.compiled_units.is_empty() {
-                    Some("no verified native regions matched; the entire program was interpreted".into())
+                    Some(
+                        "no BASIC regions were optimized; the entire program was interpreted"
+                            .into(),
+                    )
                 } else {
-                    Some("BASIC control flow, graphics, SWIs, and unmatched statements used the interpreter".into())
+                    Some("BASIC control flow and unmatched statements used the interpreter".into())
                 }
             });
         report

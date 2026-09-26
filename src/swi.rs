@@ -1457,9 +1457,6 @@ impl SwiDispatcher {
                 }
             }
         } else if cli_command_matches(verb, "BASICJIT") {
-            eprintln!(
-                "BASICJIT: compiling verified native regions; unmatched BASIC stays interpreted."
-            );
             self.begin_display_batch();
             let result = if arguments.is_empty() {
                 let Some(program) = task.loaded_tokenized_program.take() else {
@@ -1480,27 +1477,11 @@ impl SwiDispatcher {
             self.finish_display_batch();
             match result {
                 Ok(report) => {
-                    let units = if report.compiled_units.is_empty() {
-                        "none".to_string()
-                    } else {
-                        report.compiled_units.join(", ")
-                    };
                     let fallback = report
                         .fallback_reason
                         .unwrap_or_else(|| "remaining statements used the interpreter".into());
-                    let native_call_count = if report.compiled_calls == 1 {
-                        "1 native call".to_string()
-                    } else {
-                        format!("{} native calls", report.compiled_calls)
-                    };
-                    let native_work = if report.rendered_pixels == 0 {
-                        native_call_count
-                    } else {
-                        format!("{native_call_count} for {} pixels", report.rendered_pixels)
-                    };
                     let summary = format!(
-                        "BASICJIT: compiled {units}; {native_work} in {} (compile {}); {fallback}.",
-                        format_elapsed(report.compiled_time),
+                        "BASICJIT: {fallback} (compile {}).",
                         format_elapsed(report.compile_time),
                     );
                     eprintln!("{summary}");

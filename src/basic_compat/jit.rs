@@ -597,9 +597,8 @@ impl JitProgram {
             "Mandelbrot full frame loop at BASIC line {}",
             region.line
         ));
-        self.report.fallback_reason = Some(
-            "mode setup and the final key wait used the interpreter; ColourTrans and OS_Plot used checked runtime services".into(),
-        );
+        self.report.fallback_reason =
+            Some("mode setup and the final key wait used the interpreter".into());
         Ok(Some(MandelbrotFrameOutput {
             after: region.after,
             width: inputs.width,
@@ -741,9 +740,8 @@ impl JitProgram {
                 procedure.region.name
             )));
         }
-        self.report.fallback_reason = Some(
-            "top-level BASIC statements and unmatched code used the interpreter; native procedure state and graphics effects used checked runtime callbacks".into(),
-        );
+        self.report.fallback_reason =
+            Some("top-level BASIC statements and unmatched code used the interpreter".into());
         Ok(true)
     }
 
@@ -761,10 +759,10 @@ pub(super) fn run_parsed_program_jit(
     match compile_for_jit(&parsed) {
         Ok(Some(jit)) => interpreter.install_jit(jit),
         Ok(None) => interpreter.set_jit_fallback(
-            "no verified native regions matched; the entire program will be interpreted",
+            "no BASIC regions were optimized; the entire program was interpreted",
         ),
         Err(reason) => interpreter.set_jit_fallback(&format!(
-            "native compilation failed ({reason}); the entire program will be interpreted"
+            "native compilation failed ({reason}); the entire program was interpreted"
         )),
     }
 
