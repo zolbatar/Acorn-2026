@@ -9,6 +9,7 @@ use std::{fs, path::Path};
 use crate::{
     basic_compat::{self, JitExecutionReport},
     error::RuntimeError,
+    filesystem::{FILETYPE_BASIC, FileMetadata},
     memory::Task,
     swi::SwiDispatcher,
     tokenized_basic::TokenizedBasicProgram,
@@ -59,6 +60,39 @@ pub fn run_file(
     }
 }
 
+/// Runs a file resolved by the task's selected filing system. RISC OS file
+/// type metadata selects tokenized BASIC; other types are treated as text
+/// source when their contents are valid UTF-8.
+pub fn run_guest_file(
+    path: &str,
+    task: &mut Task,
+    dispatcher: &mut SwiDispatcher,
+) -> Result<(), RuntimeError> {
+    let (bytes, metadata) = dispatcher.read_guest_file(task, path)?;
+    run_guest_bytes(&bytes, &metadata, task, dispatcher)
+}
+
+pub fn run_guest_bytes(
+    bytes: &[u8],
+    metadata: &FileMetadata,
+    task: &mut Task,
+    dispatcher: &mut SwiDispatcher,
+) -> Result<(), RuntimeError> {
+    if metadata.file_type & 0xFFF == FILETYPE_BASIC {
+        let program = TokenizedBasicProgram::decode(bytes)
+            .map_err(|error| RuntimeError::Program(error.to_string()))?;
+        basic_compat::run_program(&program, task, dispatcher)
+    } else {
+        let source = std::str::from_utf8(bytes).map_err(|error| {
+            RuntimeError::Program(format!(
+                "file type &{:03X} is not tokenized BASIC and the file is not UTF-8 text: {error}",
+                metadata.file_type & 0xFFF
+            ))
+        })?;
+        run_source(source, task, dispatcher)
+    }
+}
+
 pub fn run_file_jit(
     path: &str,
     task: &mut Task,
@@ -73,6 +107,27 @@ pub fn run_file_jit(
             let program = TokenizedBasicProgram::load_file(path)?;
             basic_compat::run_program_jit(&program, task, dispatcher)
         }
+    }
+}
+
+pub fn run_guest_file_jit(
+    path: &str,
+    task: &mut Task,
+    dispatcher: &mut SwiDispatcher,
+) -> Result<JitExecutionReport, RuntimeError> {
+    let (bytes, metadata) = dispatcher.read_guest_file(task, path)?;
+    if metadata.file_type & 0xFFF == FILETYPE_BASIC {
+        let program = TokenizedBasicProgram::decode(&bytes)
+            .map_err(|error| RuntimeError::Program(error.to_string()))?;
+        basic_compat::run_program_jit(&program, task, dispatcher)
+    } else {
+        let source = std::str::from_utf8(&bytes).map_err(|error| {
+            RuntimeError::Program(format!(
+                "file type &{:03X} is not tokenized BASIC and the file is not UTF-8 text: {error}",
+                metadata.file_type & 0xFFF
+            ))
+        })?;
+        run_source_jit(source, task, dispatcher)
     }
 }
 

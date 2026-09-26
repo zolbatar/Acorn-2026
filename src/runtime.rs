@@ -84,8 +84,13 @@ impl Runtime {
 
         let mut command = SwiContext::default();
         command.registers[0] = LINE_BUFFER;
-        self.dispatcher
+        match self
+            .dispatcher
             .dispatch(OS_CLI, &mut self.task, &mut command)
+        {
+            Ok(()) => Ok(()),
+            Err(error) => self.report_error(&error),
+        }
     }
 
     pub fn report_error(&mut self, error: &RuntimeError) -> Result<(), RuntimeError> {

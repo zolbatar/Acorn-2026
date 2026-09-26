@@ -136,7 +136,7 @@ extern "C" fn render_mandelbrot_pixel(
             conversion.registers[0] = hue.wrapping_mul(0x1_0000) as u32;
             conversion.registers[1] = 0xFF00;
             conversion.registers[2] = 0xFF;
-            dispatcher.dispatch_named_swi("COLOURTRANS_CONVERTHSVTORGB", &mut conversion)?;
+            dispatcher.dispatch_named_swi("COLOURTRANS_CONVERTHSVTORGB", task, &mut conversion)?;
             context.rgb = [
                 conversion.registers[0] as i32,
                 conversion.registers[1] as i32,
@@ -147,7 +147,7 @@ extern "C" fn render_mandelbrot_pixel(
         }
         gcol.registers[3] = 0x100;
         gcol.registers[4] = 0;
-        dispatcher.dispatch_named_swi("COLOURTRANS_SETGCOL", &mut gcol)?;
+        dispatcher.dispatch_named_swi("COLOURTRANS_SETGCOL", task, &mut gcol)?;
         let plot_x = x.checked_mul(2).ok_or_else(|| {
             RuntimeError::Program(format!(
                 "BASIC line {}: graphics coordinate overflowed",

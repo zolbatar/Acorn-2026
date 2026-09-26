@@ -67,6 +67,7 @@ pub struct OpenFile {
     pub can_read: bool,
     pub can_write: bool,
     pub guest_path: String,
+    pub eof_error_next: bool,
 }
 
 #[derive(Debug)]
@@ -102,6 +103,28 @@ impl HostFileSystem {
         &self.volume_name
     }
 
+    pub fn set_volume_name(&mut self, name: &str) -> Result<(), RuntimeError> {
+        if !valid_volume_name(name.trim()) {
+            return Err(fs_error("invalid volume name"));
+        }
+        let descriptor = format!("{VOLUME_MAGIC}\nvolume-name={}\n", name.trim());
+        let descriptor_path = self.root.join(VOLUME_DESCRIPTOR);
+        let temporary_path = self
+            .root
+            .join(format!("{VOLUME_DESCRIPTOR}.tmp-{}", std::process::id()));
+        fs::write(&temporary_path, descriptor)?;
+        if let Err(error) = fs::rename(&temporary_path, &descriptor_path) {
+            let _ = fs::remove_file(temporary_path);
+            return Err(RuntimeError::Io(error));
+        }
+        self.volume_name = name.trim().to_string();
+        Ok(())
+    }
+
+    pub fn volume_root(&self) -> &Path {
+        &self.root
+    }
+
     fn canonical_root(&self) -> Result<PathBuf, RuntimeError> {
         fs::canonicalize(&self.root).map_err(|error| {
             RuntimeError::Program(format!(
@@ -125,6 +148,9 @@ impl HostFileSystem {
         path: &str,
     ) -> Result<ResolvedPath, RuntimeError> {
         let (file_system, volume, path) = split_device_prefix(path);
+        if file_system.is_none() && !self.check_file_system_name(&context.temporary_file_system) {
+            return Err(fs_error("no filing system is currently selected"));
+        }
         if let Some(file_system) = file_system
             && !self.check_file_system_name(file_system)
         {
@@ -154,6 +180,7 @@ impl HostFileSystem {
                 "@" => components = context.current_directory.clone(),
                 "&" => components = context.user_root.clone(),
                 "%" => components = context.library_directory.clone(),
+                "\\" => components = context.previous_directory.clone(),
                 "^" => {
                     components.pop();
                 }
@@ -169,10 +196,23 @@ impl HostFileSystem {
         let root = self.canonical_root()?;
         let mut host_path = root.clone();
         let mut canonical_components = Vec::new();
-        for component in &components {
+        for (index, component) in components.iter().enumerate() {
             let found = self.find_child(&host_path, component)?;
             let Some(found) = found else {
-                host_path.push(component);
+                let candidate = host_path.join(component);
+                match fs::symlink_metadata(&candidate) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(fs_error("HostFS does not follow symbolic links"));
+                    }
+                    Ok(metadata) => {
+                        if !metadata.is_dir() && index + 1 < components.len() {
+                            return Err(fs_error(format!("'{}' is not a directory", component)));
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(RuntimeError::Io(error)),
+                }
+                host_path = candidate;
                 canonical_components.push(component.clone());
                 continue;
             };
@@ -190,15 +230,28 @@ impl HostFileSystem {
             return Err(fs_error("path resolves outside the mounted HostFS volume"));
         }
 
+        let is_directory = host_path.is_dir();
         let metadata = if host_path.is_file() {
             self.metadata_for_host_file(&host_path)?
         } else {
             None
         };
-        let is_directory = host_path.is_dir();
+        if let Some(metadata) = &metadata {
+            if !valid_guest_leaf(&metadata.guest_name) {
+                return Err(fs_error(format!(
+                    "invalid guest filename '{}' in {}",
+                    metadata.guest_name,
+                    metadata_path(&host_path).display()
+                )));
+            }
+            if let Some(leaf) = canonical_components.last_mut() {
+                *leaf = metadata.guest_name.clone();
+            }
+        }
+        let guest_path = canonical_components.join(".");
         Ok(ResolvedPath {
             host_path,
-            guest_path: canonical_components.join("."),
+            guest_path,
             metadata,
             is_directory,
         })
@@ -279,6 +332,15 @@ impl HostFileSystem {
                 continue;
             }
             if file_name.ends_with(METADATA_SUFFIX) {
+                let file_type = entry.file_type()?;
+                if file_type.is_symlink() {
+                    return Err(fs_error(
+                        "HostFS metadata sidecars cannot be symbolic links",
+                    ));
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
                 let payload_name = file_name
                     .strip_suffix(METADATA_SUFFIX)
                     .unwrap_or_default()
@@ -309,10 +371,11 @@ impl HostFileSystem {
             if !file_type.is_file() {
                 continue;
             }
-            let sidecar = sidecars.get(&file_name).cloned().or_else(|| {
-                let sidecar = metadata_path(&entry.path());
-                sidecar.is_file().then_some(sidecar)
-            });
+            let sidecar = if let Some(sidecar) = sidecars.get(&file_name) {
+                Some(sidecar.clone())
+            } else {
+                regular_file_if_present(&metadata_path(&entry.path()))?
+            };
             let metadata = match sidecar {
                 Some(sidecar) => read_metadata(&sidecar)?,
                 None => {
@@ -440,15 +503,67 @@ impl HostFileSystem {
         read: bool,
         write: bool,
         create: bool,
+        truncate: bool,
     ) -> Result<(File, ResolvedPath), RuntimeError> {
         let resolved = self.canonical_guest_path(context, path)?;
         if resolved.is_directory {
             return Err(fs_error(format!("'{}' is a directory", path)));
         }
+        if !resolved.host_path.exists() && create {
+            let parent = resolved
+                .host_path
+                .parent()
+                .ok_or_else(|| fs_error("invalid file path"))?;
+            let root = self.canonical_root()?;
+            let canonical_parent = parent.canonicalize()?;
+            if !canonical_parent.starts_with(&root) {
+                return Err(fs_error("path resolves outside the mounted HostFS volume"));
+            }
+            let guest_name = resolved
+                .guest_path
+                .rsplit('.')
+                .next()
+                .unwrap_or(&resolved.guest_path)
+                .to_string();
+            let metadata = FileMetadata::plain_file(guest_name);
+            let mut options = OpenOptions::new();
+            options.read(read).write(write).create_new(true);
+            let file = options.open(&resolved.host_path)?;
+            write_metadata(&metadata_path(&resolved.host_path), &metadata)?;
+            return Ok((
+                file,
+                ResolvedPath {
+                    host_path: resolved.host_path,
+                    guest_path: resolved.guest_path,
+                    metadata: Some(metadata),
+                    is_directory: false,
+                },
+            ));
+        }
         let mut options = OpenOptions::new();
-        options.read(read).write(write).create(create);
+        options
+            .read(read)
+            .write(write)
+            .truncate(truncate)
+            .create(false);
         let file = options.open(&resolved.host_path)?;
         Ok((file, resolved))
+    }
+
+    pub fn write_file(
+        &self,
+        context: &FileSystemContext,
+        path: &str,
+        bytes: &[u8],
+        metadata: FileMetadata,
+    ) -> Result<(), RuntimeError> {
+        let resolved = match self.canonical_guest_path(context, path) {
+            Ok(resolved) if !resolved.is_directory => resolved,
+            Ok(_) => return Err(fs_error(format!("'{}' is a directory", path))),
+            Err(_) => self.create_file(context, path, metadata.clone())?,
+        };
+        fs::write(&resolved.host_path, bytes)?;
+        write_metadata(&metadata_path(&resolved.host_path), &metadata)
     }
 
     pub fn delete_file(&self, context: &FileSystemContext, path: &str) -> Result<(), RuntimeError> {
@@ -545,7 +660,7 @@ impl HostFileSystem {
         path: &Path,
     ) -> Result<Option<FileMetadata>, RuntimeError> {
         let sidecar = metadata_path(path);
-        if sidecar.is_file() {
+        if let Some(sidecar) = regular_file_if_present(&sidecar)? {
             return read_metadata(&sidecar).map(Some);
         }
         let name = path
@@ -618,7 +733,7 @@ impl HostFileSystem {
             }
             if entry.file_type()?.is_file() {
                 let sidecar = metadata_path(&entry.path());
-                if sidecar.is_file() {
+                if regular_file_if_present(&sidecar)?.is_some() {
                     let metadata = read_metadata(&sidecar)?;
                     if metadata.guest_name.eq_ignore_ascii_case(guest_name) {
                         return Ok(Some(entry));
@@ -758,15 +873,29 @@ fn split_device_prefix(path: &str) -> (Option<&str>, Option<&str>, &str) {
 }
 
 fn read_volume_name(root: &Path) -> Option<String> {
-    let descriptor = fs::read_to_string(root.join(VOLUME_DESCRIPTOR)).ok()?;
+    let descriptor_path = root.join(VOLUME_DESCRIPTOR);
+    let descriptor_metadata = fs::symlink_metadata(&descriptor_path).ok()?;
+    if descriptor_metadata.file_type().is_symlink() || !descriptor_metadata.is_file() {
+        return None;
+    }
+    let descriptor = fs::read_to_string(descriptor_path).ok()?;
     let mut lines = descriptor.lines();
     if lines.next()? != VOLUME_MAGIC {
         return None;
     }
     lines.find_map(|line| {
         let (key, value) = line.split_once('=')?;
-        (key.trim() == "volume-name" && !value.trim().is_empty()).then(|| value.trim().to_string())
+        (key.trim() == "volume-name" && valid_volume_name(value.trim()))
+            .then(|| value.trim().to_string())
     })
+}
+
+fn valid_volume_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= u8::MAX as usize
+        && !name
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '=' | ':' | '.'))
 }
 
 fn parent_guest_path(full_path: &str) -> &str {
@@ -854,4 +983,16 @@ fn percent_decode(value: &str) -> Result<String, RuntimeError> {
 
 fn fs_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::Program(message.into())
+}
+
+fn regular_file_if_present(path: &Path) -> Result<Option<PathBuf>, RuntimeError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(fs_error(
+            "HostFS metadata sidecars cannot be symbolic links",
+        )),
+        Ok(metadata) if metadata.is_file() => Ok(Some(path.to_path_buf())),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(RuntimeError::Io(error)),
+    }
 }

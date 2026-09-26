@@ -67,6 +67,11 @@ impl GuestMemory {
         Ok(())
     }
 
+    pub fn read_bytes(&self, address: u32, length: usize) -> Result<Vec<u8>, MemoryError> {
+        let index = self.index(address, length)?;
+        Ok(self.bytes[index..index + length].to_vec())
+    }
+
     pub fn read_c_string(&self, address: u32, max_bytes: usize) -> Result<Vec<u8>, MemoryError> {
         let mut result = Vec::new();
         for offset in 0..max_bytes {
@@ -125,17 +130,25 @@ impl Default for FileSystemContext {
             library_directory: Vec::new(),
             previous_directory: Vec::new(),
             open_files: BTreeMap::new(),
-            next_handle: 1,
+            // FileSwitch file handles are conventionally returned in the
+            // upper half of the byte range.
+            next_handle: 0x80,
         }
     }
 }
 
 impl FileSystemContext {
-    pub fn insert_file(&mut self, open_file: OpenFile) -> u32 {
-        let handle = self.next_handle.max(1);
-        self.next_handle = handle.wrapping_add(1).max(1);
+    pub fn insert_file(&mut self, open_file: OpenFile) -> Option<u32> {
+        if self.open_files.len() >= 0x80 {
+            return None;
+        }
+        let mut handle = self.next_handle.clamp(0x80, 0xFF);
+        while self.open_files.contains_key(&handle) {
+            handle = if handle == 0xFF { 0x80 } else { handle + 1 };
+        }
+        self.next_handle = if handle == 0xFF { 0x80 } else { handle + 1 };
         self.open_files.insert(handle, open_file);
-        handle
+        Some(handle)
     }
 }
 

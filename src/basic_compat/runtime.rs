@@ -3,7 +3,7 @@ use std::{collections::HashMap, time::Instant};
 use crate::{
     error::RuntimeError,
     memory::{GUEST_MEMORY_BASE, GUEST_MEMORY_SIZE, Task},
-    swi::{OS_NEW_LINE, OS_READ_LINE, SwiContext, SwiDispatcher},
+    swi::{OS_CLI, OS_NEW_LINE, OS_READ_LINE, SwiContext, SwiDispatcher},
 };
 
 #[cfg(feature = "experimental-jit")]
@@ -940,7 +940,7 @@ impl Interpreter {
                                 as u32;
                     }
                 }
-                dispatcher.dispatch_named_swi(&swi_name, &mut context)?;
+                dispatcher.dispatch_named_swi(&swi_name, task, &mut context)?;
                 for (register, target) in results.iter().enumerate() {
                     self.set_variable(
                         target,
@@ -955,7 +955,15 @@ impl Interpreter {
                 "machine-code CALL requires a matching processor compatibility service not available in the hosted profile",
             )),
             Statement::StarCommand(command) => {
-                self.execute_star_command(command, line)?;
+                let command = String::from_utf8_lossy(command);
+                let command_address = GUEST_MEMORY_BASE + 0x6000;
+                task.memory
+                    .write_bytes(command_address, command.as_bytes())?;
+                task.memory
+                    .write_byte(command_address + command.len() as u32, 0)?;
+                let mut context = SwiContext::default();
+                context.registers[0] = command_address;
+                dispatcher.dispatch(OS_CLI, task, &mut context)?;
                 Ok(Flow::Next)
             }
         }
@@ -1852,24 +1860,6 @@ impl Interpreter {
         dispatcher.dispatch(OS_NEW_LINE, task, &mut SwiContext::default())?;
         self.print_column = 0;
         Ok(())
-    }
-
-    fn execute_star_command(&self, command: &[u8], line: u16) -> Result<(), RuntimeError> {
-        let command = String::from_utf8_lossy(command);
-        let normalized: String = command
-            .chars()
-            .filter(|character| !character.is_ascii_whitespace())
-            .flat_map(char::to_uppercase)
-            .collect();
-        if normalized == "FX151,78,243" {
-            // ClockSP5 resets machine-specific display/timing state here.
-            // The hosted profile has no such hardware state to restore.
-            return Ok(());
-        }
-        Err(program_error(
-            line,
-            format!("MOS command *{command} is not available in the hosted profile"),
-        ))
     }
 }
 
