@@ -33,9 +33,14 @@ const TOKEN_LOG: u8 = 0xAB;
 const TOKEN_NOT: u8 = 0xAC;
 const TOKEN_SQR: u8 = 0xB6;
 const TOKEN_TAN: u8 = 0xB7;
+const TOKEN_SIN: u8 = 0xB5;
+const TOKEN_RND: u8 = 0xB3;
 const TOKEN_TO: u8 = 0xB8;
 const TOKEN_VAL: u8 = 0xBC;
 const TOKEN_CHR: u8 = 0xBD;
+const TOKEN_CLS: u8 = 0xDB;
+const TOKEN_CLG: u8 = 0xDA;
+const TOKEN_COLOUR: u8 = 0xFB;
 const TOKEN_LEFT: u8 = 0xC0;
 const TOKEN_MID: u8 = 0xC1;
 const TOKEN_RIGHT: u8 = 0xC2;
@@ -68,6 +73,7 @@ const TOKEN_RESTORE: u8 = 0xF7;
 const TOKEN_RETURN: u8 = 0xF8;
 const TOKEN_UNTIL: u8 = 0xFD;
 const TOKEN_VDU: u8 = 0xEF;
+const TOKEN_LET: u8 = 0xE9;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Expr {
@@ -161,6 +167,10 @@ pub(crate) enum Statement {
     Assign(LValue, Expr),
     Input(LValue),
     Print(Vec<PrintItem>),
+    ClearScreen,
+    ClearGraphics,
+    Colour(Vec<Expr>),
+    PrintFormat(Expr),
     Mode(Expr),
     Vdu(Vec<VduArgument>),
     Line(Expr, Expr, Expr, Expr),
@@ -480,7 +490,13 @@ impl<'a> Lexer<'a> {
         {
             return self.hex_literal();
         }
-        if byte.is_ascii_digit() {
+        if byte.is_ascii_digit()
+            || (byte == b'.'
+                && self
+                    .bytes
+                    .get(self.offset + 1)
+                    .is_some_and(u8::is_ascii_digit))
+        {
             return self.number_literal();
         }
         if byte.is_ascii_alphabetic() {
@@ -589,7 +605,16 @@ impl Parser {
         match token {
             Token::Keyword(TOKEN_IF) => self.parse_if(),
             Token::Keyword(TOKEN_PRINT) => self.parse_print(),
+            Token::Keyword(TOKEN_CLS) => Ok(Statement::ClearScreen),
+            Token::Keyword(TOKEN_CLG) => Ok(Statement::ClearGraphics),
+            Token::Keyword(TOKEN_COLOUR) => self.parse_colour(),
+            Token::Keyword(TOKEN_LET) => self.parse_statement(),
             Token::Keyword(TOKEN_MODE) => Ok(Statement::Mode(self.parse_expression(0)?)),
+            Token::Symbol(b'@') => {
+                self.expect_symbol(b'%')?;
+                self.expect_symbol(b'=')?;
+                Ok(Statement::PrintFormat(self.parse_expression(0)?))
+            }
             Token::Keyword(TOKEN_VDU) => self.parse_vdu(),
             Token::Keyword(TOKEN_LINE) => self.parse_line_statement(),
             Token::Keyword(TOKEN_MOVE) => self.parse_move_statement(false),
@@ -803,6 +828,14 @@ impl Parser {
         Ok(Statement::Gcol(action, colour))
     }
 
+    fn parse_colour(&mut self) -> Result<Statement, RuntimeError> {
+        let mut colours = vec![self.parse_expression(0)?];
+        while self.consume_symbol(b',') {
+            colours.push(self.parse_expression(0)?);
+        }
+        Ok(Statement::Colour(colours))
+    }
+
     fn parse_dim(&mut self) -> Result<Statement, RuntimeError> {
         let mut declarations = Vec::new();
         loop {
@@ -871,7 +904,7 @@ impl Parser {
             let parameters = self.parse_parameter_list()?;
             Ok(Statement::DefineProcedure(name, parameters))
         } else if self.consume_keyword(TOKEN_FN) {
-            let name = self.expect_identifier("function name")?;
+            let name = self.expect_named_routine("function name")?;
             let parameters = self.parse_parameter_list()?;
             Ok(Statement::DefineFunction(name, parameters))
         } else {
@@ -1062,17 +1095,20 @@ impl Parser {
             Token::Keyword(TOKEN_TIME) => Ok(Expr::Variable("TIME".into())),
             Token::Keyword(TOKEN_LOMEM) => Ok(Expr::Variable("LOMEM".into())),
             Token::Keyword(TOKEN_HIMEM) => Ok(Expr::Variable("HIMEM".into())),
-            Token::Keyword(TOKEN_INKEY) => {
+            Token::Keyword(TOKEN_INKEY | TOKEN_RND) => {
+                let Token::Keyword(token) = token else {
+                    unreachable!()
+                };
                 let arguments = if self.consume_symbol(b'(') {
                     self.parse_call_arguments_after_open()?
                 } else {
                     Vec::new()
                 };
-                Ok(Expr::Builtin(TOKEN_INKEY, arguments))
+                Ok(Expr::Builtin(token, arguments))
             }
             Token::Keyword(
                 TOKEN_ABS | TOKEN_COS | TOKEN_INT | TOKEN_LEN | TOKEN_LN | TOKEN_LOG | TOKEN_SQR
-                | TOKEN_TAN | TOKEN_STR | TOKEN_ASC | TOKEN_VAL | TOKEN_CHR,
+                | TOKEN_TAN | TOKEN_SIN | TOKEN_STR | TOKEN_ASC | TOKEN_VAL | TOKEN_CHR,
             ) => {
                 let Token::Keyword(token) = token else {
                     unreachable!()
@@ -1091,7 +1127,7 @@ impl Parser {
                 Ok(Expr::Builtin(token, self.parse_call_arguments()?))
             }
             Token::Keyword(TOKEN_FN) => {
-                let name = self.expect_identifier("function name")?;
+                let name = self.expect_named_routine("function name")?;
                 let arguments = if self.consume_symbol(b'(') {
                     self.parse_expression_list_until(b')')?
                 } else {
@@ -1200,9 +1236,21 @@ impl Parser {
     }
 
     fn expect_routine_name(&mut self, description: &str) -> Result<String, RuntimeError> {
+        if matches!(self.peek(), Token::Keyword(TOKEN_MODE)) {
+            self.next();
+            return Ok("MODE".into());
+        }
+        self.expect_named_routine(description)
+    }
+
+    fn expect_named_routine(&mut self, description: &str) -> Result<String, RuntimeError> {
+        let leading_underscore = self.consume_symbol(b'_');
         match self.next().clone() {
-            Token::Identifier(name) => Ok(name),
-            Token::Keyword(TOKEN_MODE) => Ok("MODE".into()),
+            Token::Identifier(name) => Ok(if leading_underscore {
+                format!("_{name}")
+            } else {
+                name
+            }),
             other => self.error(format!("expected {description}, found {other:?}")),
         }
     }
