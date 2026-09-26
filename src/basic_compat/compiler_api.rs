@@ -99,7 +99,10 @@ impl Lowerer {
             .iter()
             .any(|instruction| !matches!(instruction.statement, Statement::NoOp))
         {
-            return Err(unsupported(0, "executable statements after END are unsupported"));
+            return Err(unsupported(
+                0,
+                "executable statements after END are unsupported",
+            ));
         }
         let (result_line, result_local) = self
             .result

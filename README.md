@@ -105,3 +105,47 @@ BASICRUN
 ```
 
 It runs three workload passes, printing the benchmark sections and comparison each time, then returns to `*`. In this hosted profile, `TIME` is monotonic centiseconds and `INKEY` reads queued host keys; with no key pending, bare `INKEY` returns -256 and `INKEY(0)` returns -1. ClockSP5 follows its guarded path when no key is pending, skipping native ARM and hardware setup. Its final hardware reset command is accepted as a no-op. The displayed MHz figures compare this hosted BASIC interpreter's performance against the program's BBC B reference data; they do not measure the host processor's physical clock speed.
+
+## Try the experimental hybrid JIT
+
+From the repository root, start the optimized UI with Cranelift support:
+
+```sh
+cargo run-jit
+```
+
+Then load either demo and enter `BASICJIT`:
+
+```text
+BASICLOAD examples/mandelbrot/reduced.bbc
+BASICJIT
+```
+
+To try the source-derived full-size listing instead:
+
+```text
+BASICLOAD examples/mandelbrot/mandelbrot.bbc
+BASICJIT
+```
+
+It can take substantially longer because it plots 1680 × 1050 points with a
+higher iteration cap.
+
+```text
+BASICLOAD examples/clocksp5/ClockSP5.bbc
+BASICJIT
+```
+
+`BASICJIT` compiles the full listing's verified Mandelbrot raster loop and
+iteration math into one Cranelift frame kernel. Per-pixel ColourTrans and
+`OS_Plot` effects go through checked runtime services. Mode setup and the final
+key wait remain interpreted. The reduced fixture uses its verified iteration
+kernel, and ClockSP5 uses its verified nested integer `REPEAT` region.
+`BASICRUN` remains the interpreter reference. The summary reports compiled
+calls, rendered pixels where applicable, and elapsed native-region time; this
+is a kernel measurement, not a whole-program speedup. Use the windowed UI to
+see Mandelbrot. In stdio mode, the same MOS command works with
+`cargo run-jit -- --stdio`. In
+windowed mode, `BASICJIT` progress, timing, and runtime errors go to the host
+application's stderr console, keeping the graphics display clear. BASIC
+program output continues to use the emulated display.

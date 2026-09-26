@@ -6,8 +6,23 @@ rust-version = "1.85"
 description = "Hosted Acorn-2026 MOS and BASIC64 prototype"
 license = "MIT"
 
+[features]
+default = []
+experimental-jit = [
+    "dep:cranelift-codegen",
+    "dep:cranelift-frontend",
+    "dep:cranelift-jit",
+    "dep:cranelift-module",
+    "dep:cranelift-native",
+]
+
 [dependencies]
 arboard = { version = "3.6", default-features = false }
+cranelift-codegen = { version = "=0.135.2", optional = true }
+cranelift-frontend = { version = "=0.135.2", optional = true }
+cranelift-jit = { version = "=0.135.2", optional = true }
+cranelift-module = { version = "=0.135.2", optional = true }
+cranelift-native = { version = "=0.135.2", optional = true }
 pest = "2.8"
 pest_derive = "2.8"
 pixels = "0.15.0"

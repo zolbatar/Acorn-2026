@@ -6,6 +6,8 @@ use crate::{
     swi::{OS_NEW_LINE, OS_READ_LINE, SwiContext, SwiDispatcher},
 };
 
+#[cfg(feature = "experimental-jit")]
+use super::jit::JitProgram;
 use super::parser::{
     BinaryOp, DimDeclaration, Expr, LValue, MemoryWidth, ParsedProgram, PrintItem, Statement,
     UnaryOp, VduFormat,
@@ -84,6 +86,10 @@ pub(super) struct Interpreter {
     print_column: usize,
     next_heap_address: u32,
     pending_key: Option<u8>,
+    #[cfg(feature = "experimental-jit")]
+    jit: Option<JitProgram>,
+    #[cfg(feature = "experimental-jit")]
+    jit_fallback: Option<String>,
 }
 
 impl Interpreter {
@@ -121,7 +127,42 @@ impl Interpreter {
             print_column: 0,
             next_heap_address: FIRST_HEAP_ADDRESS,
             pending_key: None,
+            #[cfg(feature = "experimental-jit")]
+            jit: None,
+            #[cfg(feature = "experimental-jit")]
+            jit_fallback: None,
         }
+    }
+
+    #[cfg(feature = "experimental-jit")]
+    pub(super) fn install_jit(&mut self, jit: JitProgram) {
+        self.jit = Some(jit);
+    }
+
+    #[cfg(feature = "experimental-jit")]
+    pub(super) fn set_jit_fallback(&mut self, reason: &str) {
+        self.jit_fallback = Some(reason.to_string());
+    }
+
+    #[cfg(feature = "experimental-jit")]
+    pub(super) fn jit_report(&self) -> super::JitExecutionReport {
+        let mut report = self
+            .jit
+            .as_ref()
+            .map(JitProgram::report)
+            .unwrap_or_default();
+        report.fallback_reason = self
+            .jit_fallback
+            .clone()
+            .or(report.fallback_reason)
+            .or_else(|| {
+                if report.compiled_units.is_empty() {
+                    Some("no verified native regions matched; the entire program was interpreted".into())
+                } else {
+                    Some("BASIC control flow, graphics, SWIs, and unmatched statements used the interpreter".into())
+                }
+            });
+        report
     }
 
     pub(super) fn run(
@@ -140,6 +181,120 @@ impl Interpreter {
             if self.steps > MAX_EXECUTION_STEPS {
                 let line = self.program.instructions[address].line_number;
                 return Err(program_error(line, "execution step limit reached"));
+            }
+
+            #[cfg(feature = "experimental-jit")]
+            if self
+                .jit
+                .as_ref()
+                .and_then(JitProgram::mandelbrot_frame_start)
+                == Some(address)
+            {
+                let line = self.program.instructions[address].line_number;
+                let inputs = super::jit::MandelbrotFrameInputs {
+                    width: self.integer_variable("XSIZE%", line)?,
+                    height: self.integer_variable("YSIZE%", line)?,
+                    x_width: self.get_variable("XWIDTH").number(line)?,
+                    x_min: self.get_variable("XMIN").number(line)?,
+                    y_width: self.get_variable("YWIDTH").number(line)?,
+                    y_min: self.get_variable("YMIN").number(line)?,
+                    iteration_limit: self.integer_variable("MAX%", line)?,
+                };
+                let initial_rgb = ["R%", "G%", "B%"]
+                    .map(|name| self.integer_variable(name, line))
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()?
+                    .try_into()
+                    .expect("three initial RGB components");
+                let frame = if let Some(jit) = self.jit.as_mut() {
+                    jit.run_mandelbrot_frame(
+                        inputs,
+                        task,
+                        dispatcher,
+                        &mut self.pending_key,
+                        initial_rgb,
+                    )?
+                } else {
+                    None
+                };
+                if let Some(frame) = frame {
+                    self.set_variable("X%", Value::Number(f64::from(frame.width)), line)?;
+                    self.set_variable("Y%", Value::Number(f64::from(frame.height)), line)?;
+                    self.set_variable("A", Value::Number(frame.last_pixel.real_c), line)?;
+                    self.set_variable("B", Value::Number(frame.last_pixel.imag_c), line)?;
+                    self.set_variable(
+                        "IT%",
+                        Value::Number(f64::from(frame.last_pixel.iterations)),
+                        line,
+                    )?;
+                    self.set_variable("E", Value::Number(frame.last_pixel.real_z), line)?;
+                    self.set_variable("F", Value::Number(frame.last_pixel.imag_z), line)?;
+                    self.set_variable("U", Value::Number(frame.last_pixel.u), line)?;
+                    self.set_variable("V", Value::Number(frame.last_pixel.v), line)?;
+                    self.set_variable("H%", Value::Number(f64::from(frame.last_pixel.hue)), line)?;
+                    for (name, value) in ["R%", "G%", "B%"].into_iter().zip(frame.rgb) {
+                        self.set_variable(name, Value::Number(f64::from(value)), line)?;
+                    }
+                    address = frame.after;
+                    continue;
+                }
+            }
+
+            #[cfg(feature = "experimental-jit")]
+            if self
+                .jit
+                .as_ref()
+                .and_then(JitProgram::mandelbrot_inline_start)
+                == Some(address)
+            {
+                let line = self.program.instructions[address].line_number;
+                let real_c = self.get_variable("A").number(line)?;
+                let imag_c = self.get_variable("B").number(line)?;
+                let iteration_limit = self.integer_variable("MAX%", line)?;
+                let Some((after, iterations, [real_z, imag_z, u, v])) = self
+                    .jit
+                    .as_mut()
+                    .and_then(|jit| jit.run_mandelbrot_inline(real_c, imag_c, iteration_limit))
+                else {
+                    address += 1;
+                    continue;
+                };
+                self.set_variable("IT%", Value::Number(f64::from(iterations)), line)?;
+                self.set_variable("E", Value::Number(real_z), line)?;
+                self.set_variable("F", Value::Number(imag_z), line)?;
+                self.set_variable("U", Value::Number(u), line)?;
+                self.set_variable("V", Value::Number(v), line)?;
+                address = after;
+                continue;
+            }
+
+            #[cfg(feature = "experimental-jit")]
+            if self
+                .jit
+                .as_ref()
+                .and_then(JitProgram::clocksp5_region_start)
+                == Some(address)
+            {
+                let line = self.program.instructions[address].line_number;
+                let values = ["B%", "L%", "I%", "D%", "E%"]
+                    .map(|name| self.integer_variable(name, line))
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()?;
+                let values: [i32; 5] = values.try_into().expect("five integer inputs");
+                let Some((after, final_l, final_c)) = self
+                    .jit
+                    .as_mut()
+                    .and_then(|jit| jit.run_clocksp5_integer_region(values))
+                else {
+                    // A vanished entry is impossible while the owned JIT
+                    // module is alive; keep the interpreter as a safe fallback.
+                    address += 1;
+                    continue;
+                };
+                self.set_variable("L%", Value::Number(f64::from(final_l)), line)?;
+                self.set_variable("C%", Value::Number(f64::from(final_c)), line)?;
+                address = after;
+                continue;
             }
 
             let instruction = self.program.instructions[address].clone();
@@ -349,6 +504,28 @@ impl Interpreter {
                 }
             }
             Statement::ProcedureCall(name, arguments) => {
+                #[cfg(feature = "experimental-jit")]
+                if name.eq_ignore_ascii_case("IT") {
+                    let values = self.evaluate_arguments(arguments, line, task)?;
+                    if values.len() == 3 {
+                        let real_c = values[0].number(line)?;
+                        let imag_c = values[1].number(line)?;
+                        let iteration_limit = values[2].number(line)?.trunc() as i32;
+                        if let Some((iterations, [real_z, imag_z, u, v])) = self
+                            .jit
+                            .as_mut()
+                            .and_then(|jit| jit.run_mandelbrot(real_c, imag_c, iteration_limit))
+                        {
+                            self.set_variable("IT%", Value::Number(f64::from(iterations)), line)?;
+                            self.set_variable("E", Value::Number(real_z), line)?;
+                            self.set_variable("F", Value::Number(imag_z), line)?;
+                            self.set_variable("U", Value::Number(u), line)?;
+                            self.set_variable("V", Value::Number(v), line)?;
+                            return Ok(Flow::Next);
+                        }
+                    }
+                }
+
                 let Some(definition) = self.program.procedures.get(name).cloned() else {
                     return Err(program_error(
                         line,
@@ -941,6 +1118,11 @@ impl Interpreter {
             .get(name)
             .cloned()
             .unwrap_or_else(|| default_value(name))
+    }
+
+    #[cfg(feature = "experimental-jit")]
+    fn integer_variable(&self, name: &str, line: u16) -> Result<i32, RuntimeError> {
+        Ok(self.get_variable(name).number(line)?.trunc() as i32)
     }
 
     fn set_variable(&mut self, name: &str, value: Value, line: u16) -> Result<(), RuntimeError> {

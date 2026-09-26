@@ -42,7 +42,7 @@ const MAX_CLI_BYTES: usize = 256;
 const MAX_STRING_BYTES: usize = 4096;
 const OUTPUT_BUFFER: u32 = GUEST_MEMORY_BASE + 0x1000;
 const HELP_TEXT: &[u8] =
-    b"Acorn-2026 MOS commands:\n\r  HELP       Show this help.\n\r  RUN        Run a .bas64 source file.\n\r  BASICLOAD  Load a tokenised BASIC file.\n\r  BASICRUN   Run the loaded compatibility subset.\n\r  QUIT       Exit the runtime.";
+    b"Acorn-2026 MOS commands:\n\r  HELP       Show this help.\n\r  RUN        Run a .bas64 source file.\n\r  BASICLOAD  Load a tokenised BASIC file.\n\r  BASICRUN   Run the loaded compatibility program.\n\r  BASICJIT   Run with experimental native hot regions.\n\r  QUIT       Exit the runtime.";
 
 fn hsv_to_rgb(hue: f64, saturation: f64, value: f64) -> (u8, u8, u8) {
     let hue = hue.rem_euclid(360.0) / 60.0;
@@ -581,6 +581,59 @@ impl SwiDispatcher {
                     self.write_new_line(task)
                 }
             }
+        } else if verb.eq_ignore_ascii_case("BASICJIT") {
+            if !arguments.is_empty() {
+                self.write_inline(task, b"Syntax: BASICJIT")?;
+                return self.write_new_line(task);
+            }
+
+            let Some(program) = task.loaded_tokenized_program.take() else {
+                self.write_inline(
+                    task,
+                    b"No tokenised BASIC program is loaded; use BASICLOAD first.",
+                )?;
+                return self.write_new_line(task);
+            };
+            eprintln!(
+                "BASICJIT: compiling verified native regions; unmatched BASIC stays interpreted."
+            );
+            self.begin_display_batch();
+            let result = crate::basic_compat::run_program_jit(&program, task, self);
+            self.finish_display_batch();
+            task.loaded_tokenized_program = Some(program);
+            match result {
+                Ok(report) => {
+                    let units = if report.compiled_units.is_empty() {
+                        "none".to_string()
+                    } else {
+                        report.compiled_units.join(", ")
+                    };
+                    let fallback = report
+                        .fallback_reason
+                        .unwrap_or_else(|| "remaining statements used the interpreter".into());
+                    let native_call_count = if report.compiled_calls == 1 {
+                        "1 native call".to_string()
+                    } else {
+                        format!("{} native calls", report.compiled_calls)
+                    };
+                    let native_work = if report.rendered_pixels == 0 {
+                        native_call_count
+                    } else {
+                        format!("{native_call_count} for {} pixels", report.rendered_pixels)
+                    };
+                    let summary = format!(
+                        "BASICJIT: compiled {units}; {native_work} in {} (compile {}); {fallback}.",
+                        format_elapsed(report.compiled_time),
+                        format_elapsed(report.compile_time),
+                    );
+                    eprintln!("{summary}");
+                    Ok(())
+                }
+                Err(error) => {
+                    eprintln!("BASICJIT error: {error}");
+                    Ok(())
+                }
+            }
         } else {
             self.write_inline(task, b"Bad command")?;
             self.write_new_line(task)
@@ -589,5 +642,13 @@ impl SwiDispatcher {
 
     fn write_new_line(&mut self, task: &mut Task) -> Result<(), RuntimeError> {
         self.dispatch(OS_NEW_LINE, task, &mut SwiContext::default())
+    }
+}
+
+fn format_elapsed(duration: Duration) -> String {
+    if duration.as_secs_f64() < 1.0 {
+        format!("{:.2} ms", duration.as_secs_f64() * 1_000.0)
+    } else {
+        format!("{:.2} s", duration.as_secs_f64())
     }
 }

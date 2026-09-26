@@ -1,0 +1,2 @@
+[alias]
+run-jit = "run --release --features experimental-jit"
