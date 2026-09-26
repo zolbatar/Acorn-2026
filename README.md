@@ -4,6 +4,8 @@
 
 Acorn-2026 is a design and implementation project for a modern, tinkerable computer environment inspired by Acorn and RISC OS. It preserves useful ideas and stable interfaces while replacing historical implementation limits. It is not a RISC OS simulator or a retro desktop remake.
 
+This project was also inspired by [pmirvine/risc-os](https://github.com/pmirvine/risc-os).
+
 ## Project status
 
 The hosted Rust MOS prompt is available in one graphics-capable window: `HELP` displays help and returns to `*`, and `QUIT` exits. The initial display renders MOS/BASIC text and plotted points/lines together using the supplied BBC Micro bitmap font. The tokenised [`text-and-pixels` demo](examples/graphics) prints and plots on the same screen. The first BASIC64 source slice runs `INPUT` and `PRINT` string variables from plain UTF-8 `.bas64` files using a pest grammar. `BASICLOAD` accepts two observed tokenized saved-program record layouts and preserves their token bytes. `BASICRUN` supports the string echo fixture, a narrow shared-boundary legacy core, ClockSP5 program version 5.08, and the source-derived full Mandelbrot listing through its selected 32-bit extended mode and `ColourTrans` path. These fixtures exercise specific compatibility slices; they do not establish broad BASIC V/VI compatibility. See the [tokenized BASIC compatibility matrix](docs/tokenized-basic-compatibility.md) for evidence and gaps.
