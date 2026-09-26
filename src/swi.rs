@@ -55,7 +55,7 @@ const MAX_CLI_BYTES: usize = 256;
 const MAX_STRING_BYTES: usize = 4096;
 const OUTPUT_BUFFER: u32 = GUEST_MEMORY_BASE + 0x1000;
 const CLI_STRING_BUFFER: u32 = GUEST_MEMORY_BASE + 0x3000;
-const HELP_TEXT: &[u8] = b"Acorn-2026 MOS commands:\n\r  *CAT [dir]             Catalogue a directory.\n\r  *DIR [dir]             Select the current directory.\n\r  *CDIR <dir>            Create a directory.\n\r  *DELETE <file>         Delete a file.\n\r  *RENAME <old> <new>    Rename a file or directory.\n\r  *FILETYPE <file> <id>  Set a RISC OS file type.\n\r  *TYPE <file>           Display a text file.\n\r  *DISC [name]           Read or set the volume name.\n\r  *HOSTFS                Select the HostFS filing system.\n\r  RUN <file>             Run a BASIC source or tokenised file.\n\r  BASICLOAD <file>       Load a tokenised BASIC program.\n\r  BASICRUN               Run the loaded program.\n\r  BASICJIT [file]        Run with experimental native hot regions.\n\r  HELP                   Show this help.\n\r  QUIT                   Exit the runtime.";
+const HELP_TEXT: &[u8] = b"Acorn-2026 MOS commands:\n\r  Commands can be abbreviated with a final dot (for example, *CA.); *. is a shortcut for *CAT.\n\r  *CAT [dir]             Catalogue a directory.\n\r  *DIR [dir]             Select the current directory.\n\r  *CDIR <dir>            Create a directory.\n\r  *DELETE <file>         Delete a file.\n\r  *RENAME <old> <new>    Rename a file or directory.\n\r  *FILETYPE <file> <id>  Set a RISC OS file type.\n\r  *TYPE <file>           Display a text file.\n\r  *DISC [name]           Read or set the volume name.\n\r  *HOSTFS                Select the HostFS filing system.\n\r  RUN <file>             Run a BASIC source or tokenised file.\n\r  BASICLOAD <file>       Load a tokenised BASIC program.\n\r  BASICRUN               Run the loaded program.\n\r  BASICJIT [file]        Run with experimental native hot regions.\n\r  HELP                   Show this help.\n\r  QUIT                   Exit the runtime.";
 
 fn hsv_to_rgb(hue: f64, saturation: f64, value: f64) -> (u8, u8, u8) {
     let hue = hue.rem_euclid(360.0) / 60.0;
@@ -1353,7 +1353,7 @@ impl SwiDispatcher {
             .read_c_string(context.registers[R0], MAX_CLI_BYTES)?;
         let command = String::from_utf8_lossy(&bytes);
         let command = command.trim();
-        let command = command.strip_prefix('*').unwrap_or(command).trim_start();
+        let command = command.trim_start_matches('*').trim_start();
         if command.is_empty() {
             return Ok(());
         }
@@ -1362,13 +1362,13 @@ impl SwiDispatcher {
         let verb = words.next().unwrap_or_default();
         let arguments = words.next().unwrap_or_default().trim();
 
-        if verb.eq_ignore_ascii_case("HELP") && arguments.is_empty() {
+        if cli_command_matches(verb, "HELP") && arguments.is_empty() {
             self.write_inline(task, HELP_TEXT)?;
             self.write_new_line(task)
-        } else if verb.eq_ignore_ascii_case("QUIT") && arguments.is_empty() {
+        } else if cli_command_matches(verb, "QUIT") && arguments.is_empty() {
             self.quit_requested = true;
             Ok(())
-        } else if verb.eq_ignore_ascii_case("RUN") {
+        } else if cli_command_matches(verb, "RUN") {
             if arguments.is_empty() {
                 self.write_inline(task, b"Syntax: RUN <file.bas64|bas|txt|asc|bbc>")?;
                 return self.write_new_line(task);
@@ -1388,7 +1388,7 @@ impl SwiDispatcher {
                     self.write_new_line(task)
                 }
             }
-        } else if verb.eq_ignore_ascii_case("BASICLOAD") {
+        } else if cli_command_matches(verb, "BASICLOAD") {
             if arguments.is_empty() {
                 self.write_inline(task, b"Syntax: BASICLOAD <file>")?;
                 return self.write_new_line(task);
@@ -1431,7 +1431,7 @@ impl SwiDispatcher {
                     self.write_new_line(task)
                 }
             }
-        } else if verb.eq_ignore_ascii_case("BASICRUN") {
+        } else if cli_command_matches(verb, "BASICRUN") {
             if !arguments.is_empty() {
                 self.write_inline(task, b"Syntax: BASICRUN")?;
                 return self.write_new_line(task);
@@ -1456,7 +1456,7 @@ impl SwiDispatcher {
                     self.write_new_line(task)
                 }
             }
-        } else if verb.eq_ignore_ascii_case("BASICJIT") {
+        } else if cli_command_matches(verb, "BASICJIT") {
             eprintln!(
                 "BASICJIT: compiling verified native regions; unmatched BASIC stays interpreted."
             );
@@ -1511,7 +1511,7 @@ impl SwiDispatcher {
                     Ok(())
                 }
             }
-        } else if verb.eq_ignore_ascii_case("CAT") {
+        } else if verb == "." || cli_command_matches(verb, "CAT") {
             let path = unquote_single_argument(arguments);
             let mut call = SwiContext::default();
             call.registers[R0] = 5;
@@ -1520,7 +1520,7 @@ impl SwiDispatcher {
                 write_guest_string(task, CLI_STRING_BUFFER, path)?;
             }
             self.dispatch(OS_FSCONTROL, task, &mut call)
-        } else if verb.eq_ignore_ascii_case("DIR") {
+        } else if cli_command_matches(verb, "DIR") {
             let path = unquote_single_argument(arguments);
             if path.is_empty() {
                 let selected = canonical_guest_name(
@@ -1536,7 +1536,7 @@ impl SwiDispatcher {
                 call.registers[R1] = CLI_STRING_BUFFER;
                 self.dispatch(OS_FSCONTROL, task, &mut call)
             }
-        } else if verb.eq_ignore_ascii_case("CDIR") {
+        } else if cli_command_matches(verb, "CDIR") {
             let path = unquote_single_argument(arguments);
             if path.is_empty() {
                 self.write_inline(task, b"Syntax: *CDIR <directory>")?;
@@ -1547,7 +1547,7 @@ impl SwiDispatcher {
             call.registers[R0] = 8;
             call.registers[R1] = CLI_STRING_BUFFER;
             self.dispatch(OS_FILE, task, &mut call)
-        } else if verb.eq_ignore_ascii_case("DELETE") {
+        } else if cli_command_matches(verb, "DELETE") {
             let path = unquote_single_argument(arguments);
             if path.is_empty() {
                 self.write_inline(task, b"Syntax: *DELETE <file>")?;
@@ -1558,7 +1558,7 @@ impl SwiDispatcher {
             call.registers[R0] = 6;
             call.registers[R1] = CLI_STRING_BUFFER;
             self.dispatch(OS_FILE, task, &mut call)
-        } else if verb.eq_ignore_ascii_case("RENAME") {
+        } else if cli_command_matches(verb, "RENAME") {
             let Some((from, to)) = split_two_cli_arguments(arguments) else {
                 self.write_inline(task, b"Syntax: *RENAME <old> <new>")?;
                 return self.write_new_line(task);
@@ -1570,7 +1570,7 @@ impl SwiDispatcher {
             call.registers[R1] = CLI_STRING_BUFFER;
             call.registers[R2] = CLI_STRING_BUFFER + 0x1000;
             self.dispatch(OS_FSCONTROL, task, &mut call)
-        } else if verb.eq_ignore_ascii_case("FILETYPE") {
+        } else if cli_command_matches(verb, "FILETYPE") {
             let Some((path, type_name)) = split_two_cli_arguments(arguments) else {
                 self.write_inline(task, b"Syntax: *FILETYPE <file> <type>")?;
                 return self.write_new_line(task);
@@ -1586,7 +1586,7 @@ impl SwiDispatcher {
             set_type.registers[R1] = CLI_STRING_BUFFER;
             set_type.registers[R2] = convert.registers[R2];
             self.dispatch(OS_FILE, task, &mut set_type)
-        } else if verb.eq_ignore_ascii_case("TYPE") {
+        } else if cli_command_matches(verb, "TYPE") {
             let path = unquote_single_argument(arguments);
             if path.is_empty() {
                 self.write_inline(task, b"Syntax: *TYPE <file>")?;
@@ -1622,7 +1622,7 @@ impl SwiDispatcher {
             close.registers[R1] = handle;
             self.dispatch(OS_FIND, task, &mut close)?;
             read_result
-        } else if verb.eq_ignore_ascii_case("DISC") {
+        } else if cli_command_matches(verb, "DISC") {
             if arguments.is_empty() {
                 let mut call = SwiContext::default();
                 call.registers[R0] = 5;
@@ -1641,13 +1641,13 @@ impl SwiDispatcher {
                 call.registers[R2] = CLI_STRING_BUFFER + 0x1000;
                 self.dispatch(OS_FSCONTROL, task, &mut call)
             }
-        } else if verb.eq_ignore_ascii_case("HOSTFS") {
+        } else if cli_command_matches(verb, "HOSTFS") {
             write_guest_string(task, CLI_STRING_BUFFER, "HostFS")?;
             let mut call = SwiContext::default();
             call.registers[R0] = 14;
             call.registers[R1] = CLI_STRING_BUFFER;
             self.dispatch(OS_FSCONTROL, task, &mut call)
-        } else if verb.eq_ignore_ascii_case("FX")
+        } else if cli_command_matches(verb, "FX")
             && arguments
                 .chars()
                 .filter(|character| !character.is_ascii_whitespace())
@@ -1666,6 +1666,17 @@ impl SwiDispatcher {
     fn write_new_line(&mut self, task: &mut Task) -> Result<(), RuntimeError> {
         self.dispatch(OS_NEW_LINE, task, &mut SwiContext::default())
     }
+}
+
+fn cli_command_matches(command_token: &str, command_name: &str) -> bool {
+    let Some(prefix) = command_token.strip_suffix('.') else {
+        return command_token.eq_ignore_ascii_case(command_name);
+    };
+
+    !prefix.is_empty()
+        && command_name
+            .get(..prefix.len())
+            .is_some_and(|leading| leading.eq_ignore_ascii_case(prefix))
 }
 
 fn read_guest_string(task: &Task, address: u32) -> Result<String, RuntimeError> {
