@@ -1,6 +1,6 @@
 use crate::{
     error::RuntimeError,
-    graphics::{GraphicsService, GraphicsSnapshot},
+    graphics::{GraphicsProfile, GraphicsService, GraphicsSnapshot},
     host::HostConsole,
     memory::{GUEST_MEMORY_BASE, Task},
 };
@@ -42,7 +42,7 @@ const MAX_CLI_BYTES: usize = 256;
 const MAX_STRING_BYTES: usize = 4096;
 const OUTPUT_BUFFER: u32 = GUEST_MEMORY_BASE + 0x1000;
 const HELP_TEXT: &[u8] =
-    b"Acorn-2026 MOS commands:\n\r  HELP       Show this help.\n\r  RUN        Run a .bas64 source file.\n\r  BASICLOAD  Load a tokenised BASIC file.\n\r  BASICRUN   Run the loaded compatibility program.\n\r  BASICJIT   Run with experimental native hot regions.\n\r  QUIT       Exit the runtime.";
+    b"Acorn-2026 MOS commands:\n\r  HELP       Show this help.\n\r  RUN        Run BASIC source or a tokenised .bbc file.\n\r  BASICLOAD  Load a tokenised BASIC file.\n\r  BASICRUN   Run the loaded compatibility program.\n\r  BASICJIT   Run with experimental native hot regions.\n\r  QUIT       Exit the runtime.";
 
 fn hsv_to_rgb(hue: f64, saturation: f64, value: f64) -> (u8, u8, u8) {
     let hue = hue.rem_euclid(360.0) / 60.0;
@@ -110,6 +110,19 @@ impl SwiDispatcher {
 
     pub fn graphics(&self) -> &GraphicsService {
         &self.graphics
+    }
+
+    pub(crate) fn set_graphics_profile(
+        &mut self,
+        profile: GraphicsProfile,
+    ) -> Result<(), RuntimeError> {
+        let previous = self.graphics.snapshot().clone();
+        self.graphics.set_profile(profile)?;
+        let snapshot = self.graphics.snapshot().clone();
+        if snapshot != previous {
+            self.publish_display_event(DisplayEvent::GraphicsSnapshot(snapshot));
+        }
+        Ok(())
     }
 
     pub(crate) fn poll_key(&mut self) -> Option<u8> {
@@ -518,7 +531,7 @@ impl SwiDispatcher {
             Ok(())
         } else if verb.eq_ignore_ascii_case("RUN") {
             if arguments.is_empty() {
-                self.write_inline(task, b"Syntax: RUN <file.bas64>")?;
+                self.write_inline(task, b"Syntax: RUN <file.bas64|bas|txt|asc|bbc>")?;
                 return self.write_new_line(task);
             }
 
@@ -526,10 +539,15 @@ impl SwiDispatcher {
                 .strip_prefix('"')
                 .and_then(|path| path.strip_suffix('"'))
                 .unwrap_or(arguments);
+            self.begin_display_batch();
             match crate::basic64::run_file(path, task, self) {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    self.finish_display_batch();
+                    Ok(())
+                }
                 Err(error) => {
-                    let message = format!("BASIC64 error: {error}");
+                    self.finish_display_batch();
+                    let message = format!("BASIC error: {error}");
                     self.write_inline(task, message.as_bytes())?;
                     self.write_new_line(task)
                 }
@@ -588,25 +606,30 @@ impl SwiDispatcher {
                 }
             }
         } else if verb.eq_ignore_ascii_case("BASICJIT") {
-            if !arguments.is_empty() {
-                self.write_inline(task, b"Syntax: BASICJIT")?;
-                return self.write_new_line(task);
-            }
-
-            let Some(program) = task.loaded_tokenized_program.take() else {
-                self.write_inline(
-                    task,
-                    b"No tokenised BASIC program is loaded; use BASICLOAD first.",
-                )?;
-                return self.write_new_line(task);
-            };
             eprintln!(
                 "BASICJIT: compiling verified native regions; unmatched BASIC stays interpreted."
             );
             self.begin_display_batch();
-            let result = crate::basic_compat::run_program_jit(&program, task, self);
+            let result = if arguments.is_empty() {
+                let Some(program) = task.loaded_tokenized_program.take() else {
+                    self.finish_display_batch();
+                    self.write_inline(
+                        task,
+                        b"No tokenised BASIC program is loaded; use BASICLOAD or pass a file.",
+                    )?;
+                    return self.write_new_line(task);
+                };
+                let result = crate::basic_compat::run_program_jit(&program, task, self);
+                task.loaded_tokenized_program = Some(program);
+                result
+            } else {
+                let path = arguments
+                    .strip_prefix('"')
+                    .and_then(|path| path.strip_suffix('"'))
+                    .unwrap_or(arguments);
+                crate::basic64::run_file_jit(path, task, self)
+            };
             self.finish_display_batch();
-            task.loaded_tokenized_program = Some(program);
             match result {
                 Ok(report) => {
                     let units = if report.compiled_units.is_empty() {

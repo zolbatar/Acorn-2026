@@ -8,7 +8,7 @@ This project was also inspired by [pmirvine/risc-os](https://github.com/pmirvine
 
 ## Project status
 
-The hosted Rust MOS prompt is available in one graphics-capable window: `HELP` displays help and returns to `*`, and `QUIT` exits. The initial display renders MOS/BASIC text and plotted points/lines together using the supplied BBC Micro bitmap font. The tokenised [`text-and-pixels` demo](examples/graphics) prints and plots on the same screen. The first BASIC64 source slice runs `INPUT` and `PRINT` string variables from plain UTF-8 `.bas64` files using a pest grammar. `BASICLOAD` accepts two observed tokenized saved-program record layouts and preserves their token bytes. `BASICRUN` supports the string echo fixture, a narrow shared-boundary legacy core, ClockSP5 program version 5.08, and the source-derived full Mandelbrot listing through its selected 32-bit extended mode and `ColourTrans` path. These fixtures exercise specific compatibility slices; they do not establish broad BASIC V/VI compatibility. See the [tokenized BASIC compatibility matrix](docs/tokenized-basic-compatibility.md) for evidence and gaps.
+The hosted Rust MOS prompt is available in one graphics-capable window: `HELP` displays help and returns to `*`, and `QUIT` exits. The initial display renders MOS/BASIC text and plotted points/lines together using the supplied BBC Micro bitmap font. The tokenised [`text-and-pixels` demo](examples/graphics) prints and plots on the same screen. UTF-8 `.bas64` and `.bas` source and decoded `.bbc` programs now use one parser output and compatibility execution engine; the optional Cranelift JIT consumes the same representation. `REM @BASIC64 MODE=HYBRID TARGET=AGON` selects the Agon graphics mode table at runtime. `BASICLOAD` accepts two observed tokenized saved-program record layouts and preserves their token bytes. `BASICRUN` supports the string echo fixture, a narrow shared-boundary legacy core, ClockSP5 program version 5.08, and the source-derived full Mandelbrot listing through its selected 32-bit extended mode and `ColourTrans` path. These fixtures exercise specific compatibility slices; they do not establish broad BBC BASIC V/VI compatibility or full Agon VDP emulation. See the [tokenized BASIC compatibility matrix](docs/tokenized-basic-compatibility.md) for evidence and gaps.
 
 ## Start here
 
@@ -21,7 +21,7 @@ The hosted Rust MOS prompt is available in one graphics-capable window: `HELP` d
 ## Current direction
 
 - A hosted Rust runtime provides low-level, kernel-like services; this does not begin as a bare-metal kernel.
-- BASIC64 runs in Rust, with an interpreter first and a JIT considered later.
+- UTF-8 BASIC source and supported tokenized programs share the Rust compatibility interpreter; an opt-in Cranelift JIT consumes the same parsed program representation.
 - BBC BASIC V/VI source semantics are a compatibility target where feasible.
 - SWI names and documented calling behavior are treated as stable public contracts.
 - Services are global while task address spaces are logical and isolated.
@@ -79,7 +79,14 @@ To run the string echo example, enter:
 RUN examples/echo.bas64
 ```
 
-The program asks for a line with `? ` and prints the entered string. Native BASIC64 source is currently plain UTF-8 identified by the `.bas64` extension.
+The program asks for a line with `? ` and prints the entered string. UTF-8 source uses `.bas64`, `.bas`, `.txt`, or `.asc`; all four extensions enter the same execution engine. Tokenized saved programs use `.bbc`.
+
+To run source directly through the JIT, start with `cargo run-jit` and pass a
+source or tokenized file to `BASICJIT`, for example:
+
+```text
+BASICJIT examples/mandelbrot/reduced.bas
+```
 
 To run the small tokenised BASIC echo fixture, enter:
 

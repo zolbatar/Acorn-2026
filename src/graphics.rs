@@ -2,6 +2,13 @@ use crate::error::RuntimeError;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GraphicsProfile {
+    #[default]
+    Hosted,
+    Agon,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Point {
     pub x: i32,
     pub y: i32,
@@ -26,6 +33,7 @@ pub struct TextWindow {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScreenMode {
     pub number: u8,
+    pub profile: GraphicsProfile,
     pub logical_width: i32,
     pub logical_height: i32,
     pub pixel_width: u32,
@@ -163,6 +171,7 @@ struct PendingVdu {
 pub struct GraphicsService {
     snapshot: GraphicsSnapshot,
     pending_vdu: Option<PendingVdu>,
+    profile: GraphicsProfile,
 }
 
 impl Default for GraphicsService {
@@ -189,6 +198,7 @@ impl Default for GraphicsService {
                 raster_surface: None,
             },
             pending_vdu: None,
+            profile: GraphicsProfile::Hosted,
         }
     }
 }
@@ -311,6 +321,7 @@ impl GraphicsService {
             .ok_or_else(|| RuntimeError::Program("extended mode height is too large".into()))?;
         let mode = ScreenMode {
             number: u8::MAX,
+            profile: self.profile,
             logical_width,
             logical_height,
             pixel_width,
@@ -347,6 +358,18 @@ impl GraphicsService {
 
     pub fn snapshot(&self) -> &GraphicsSnapshot {
         &self.snapshot
+    }
+
+    pub fn set_profile(&mut self, profile: GraphicsProfile) -> Result<(), RuntimeError> {
+        if self.profile == profile {
+            return Ok(());
+        }
+        self.profile = profile;
+        self.pending_vdu = None;
+        // A different target can assign a different meaning to the current
+        // mode number (or not support it at all). Start that target from its
+        // own default mode instead of carrying screen state across runtimes.
+        self.set_mode(0)
     }
 
     /// Replace the visible scene with a snapshot produced by the runtime.
@@ -421,9 +444,10 @@ impl GraphicsService {
     }
 
     fn set_mode(&mut self, number: u8) -> Result<(), RuntimeError> {
-        let mode = screen_mode(number).ok_or_else(|| {
+        let mode = screen_mode_for_profile(number, self.profile).ok_or_else(|| {
             RuntimeError::Program(format!(
-                "screen mode {number} is not supported by the hosted graphics profile"
+                "screen mode {number} is not supported by the {:?} graphics profile",
+                self.profile
             ))
         })?;
         self.snapshot.mode = mode;
@@ -644,6 +668,7 @@ fn screen_mode(number: u8) -> Option<ScreenMode> {
     };
     Some(ScreenMode {
         number,
+        profile: GraphicsProfile::Hosted,
         logical_width,
         logical_height,
         pixel_width,
@@ -653,6 +678,117 @@ fn screen_mode(number: u8) -> Option<ScreenMode> {
         colours,
         bits_per_pixel,
         graphics_enabled,
+    })
+}
+
+fn screen_mode_for_profile(number: u8, profile: GraphicsProfile) -> Option<ScreenMode> {
+    match profile {
+        GraphicsProfile::Hosted => screen_mode(number),
+        GraphicsProfile::Agon => agon_screen_mode(number),
+    }
+}
+
+fn agon_screen_mode(number: u8) -> Option<ScreenMode> {
+    // Agon VDP 1.04+ screen modes. The hosted adapter uses the Agon's
+    // 1280x1024 logical coordinate space. Double-buffered aliases currently
+    // share their base mode's hosted surface without a VDP swap cycle.
+    let base_number = match number {
+        129 => 1,
+        130 => 2,
+        132 => 4,
+        133 => 5,
+        134 => 6,
+        136 => 8,
+        137 => 9,
+        138 => 10,
+        139 => 11,
+        140 => 12,
+        141 => 13,
+        142 => 14,
+        143 => 15,
+        145 => 17,
+        146 => 18,
+        149 => 21,
+        150 => 22,
+        151 => 23,
+        153 => 25,
+        154 => 26,
+        156 => 28,
+        157 => 29,
+        158 => 30,
+        128..=255 => return None,
+        _ => number,
+    };
+    if base_number == 7 {
+        return Some(ScreenMode {
+            number,
+            profile: GraphicsProfile::Agon,
+            logical_width: 0,
+            logical_height: 0,
+            pixel_width: 640,
+            pixel_height: 480,
+            text_columns: 40,
+            text_rows: 25,
+            colours: 16,
+            bits_per_pixel: 0,
+            graphics_enabled: false,
+        });
+    }
+    let (pixel_width, pixel_height, colours) = match base_number {
+        0 => (640, 480, 16),
+        1 => (640, 480, 4),
+        2 => (640, 480, 2),
+        3 => (640, 240, 64),
+        4 => (640, 240, 16),
+        5 => (640, 240, 4),
+        6 => (640, 240, 2),
+        7 => (640, 480, 16),
+        8 => (320, 240, 64),
+        9 => (320, 240, 16),
+        10 => (320, 240, 4),
+        11 => (320, 240, 2),
+        12 => (320, 200, 64),
+        13 => (320, 200, 16),
+        14 => (320, 200, 4),
+        15 => (320, 200, 2),
+        16 => (800, 600, 4),
+        17 => (800, 600, 2),
+        18 => (1024, 768, 2),
+        19 => (1024, 768, 4),
+        20 => (512, 384, 64),
+        21 => (512, 384, 16),
+        22 => (512, 384, 4),
+        23 => (512, 384, 2),
+        24 => (640, 512, 16),
+        25 => (640, 512, 4),
+        26 => (640, 512, 2),
+        27 => (640, 256, 64),
+        28 => (640, 256, 16),
+        29 => (640, 256, 4),
+        30 => (640, 256, 2),
+        _ => return None,
+    };
+    let text_columns = u16::try_from((pixel_width / 8).max(1)).ok()?;
+    let text_rows = u16::try_from((pixel_height / 8).max(1)).ok()?;
+    let bits_per_pixel = match colours {
+        2 => 1,
+        4 => 2,
+        16 => 4,
+        64 => 6,
+        _ => unreachable!("Agon screen modes use documented indexed colour counts"),
+    };
+    Some(ScreenMode {
+        number,
+        profile: GraphicsProfile::Agon,
+        logical_width: 1280,
+        logical_height: 1024,
+        pixel_width,
+        pixel_height,
+        text_columns,
+        text_rows,
+        colours,
+        bits_per_pixel,
+        graphics_enabled: true,
     })
 }
 
@@ -831,6 +967,11 @@ pub(crate) fn graphics_colour(value: u32, mode: ScreenMode) -> [u8; 4] {
             [0x00, 0xFF, 0xFF, 0xFF],
             [0xFF, 0xFF, 0xFF, 0xFF],
         ];
+        if mode.profile == GraphicsProfile::Agon && mode.colours == 64 {
+            let colour = value % 64;
+            let channel = |shift: u32| (((colour >> shift) & 3) * 85) as u8;
+            return [channel(4), channel(2), channel(0), 0xFF];
+        }
         match mode.bits_per_pixel {
             8 => {
                 // The BASIC GCOL byte stores two bits per RGB component and
@@ -897,5 +1038,9 @@ fn default_graphics_window(mode: ScreenMode) -> GraphicsWindow {
 }
 
 fn default_foreground_colour(mode: ScreenMode) -> u8 {
-    if mode.bits_per_pixel == 8 { 63 } else { 7 }
+    if mode.bits_per_pixel == 8 || (mode.profile == GraphicsProfile::Agon && mode.colours == 64) {
+        63
+    } else {
+        7
+    }
 }

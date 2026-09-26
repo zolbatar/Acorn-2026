@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     error::RuntimeError,
+    graphics::GraphicsProfile,
     tokenized_basic::{TokenizedBasicLine, TokenizedBasicProgram, decode_line_reference},
 };
 
@@ -225,6 +226,22 @@ pub(crate) struct ParsedProgram {
     pub line_entries: BTreeMap<u16, usize>,
     pub procedures: std::collections::HashMap<String, Definition>,
     pub functions: std::collections::HashMap<String, Definition>,
+    pub options: ProgramOptions,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum LanguageMode {
+    Classic,
+    Basic64,
+    #[default]
+    Hybrid,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ProgramOptions {
+    pub mode: LanguageMode,
+    pub target: GraphicsProfile,
+    pub profile: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -246,7 +263,30 @@ pub(crate) fn parse_program(
     program: &TokenizedBasicProgram,
     profile: TokenProfile,
 ) -> Result<ParsedProgram, RuntimeError> {
-    let mut parsed = ParsedProgram::default();
+    let mut options = ProgramOptions::default();
+    let mut directive_seen = false;
+    let mut executable_seen = false;
+    for line in &program.lines {
+        if let Some(comment) = tokenized_rem_comment(&line.bytes) {
+            if is_basic64_directive(comment) {
+                if executable_seen || directive_seen {
+                    return Err(syntax_error(
+                        line.number,
+                        "BASIC64 directive must appear once before executable source",
+                    ));
+                }
+                parse_basic64_directive(comment, line.number, &mut options)?;
+                directive_seen = true;
+            }
+        } else if !line.bytes.is_empty() {
+            executable_seen = true;
+        }
+    }
+
+    let mut parsed = ParsedProgram {
+        options,
+        ..ParsedProgram::default()
+    };
     for line in &program.lines {
         if profile == TokenProfile::SharedBoundaryCore {
             validate_shared_boundary_core(line)?;
@@ -254,40 +294,213 @@ pub(crate) fn parse_program(
         parsed
             .line_entries
             .insert(line.number, parsed.instructions.len());
-        let statements = parse_line(line)?;
+        let statements = parse_line(line, LexMode::Tokenized)?;
         for statement in statements {
             if profile == TokenProfile::SharedBoundaryCore {
                 validate_shared_boundary_statement(&statement, line.number)?;
             }
-            let index = parsed.instructions.len();
-            match &statement {
-                Statement::DefineProcedure(name, parameters) => {
-                    parsed.procedures.insert(
-                        name.clone(),
-                        Definition {
-                            entry: index + 1,
-                            parameters: parameters.clone(),
-                        },
-                    );
-                }
-                Statement::DefineFunction(name, parameters) => {
-                    parsed.functions.insert(
-                        name.clone(),
-                        Definition {
-                            entry: index + 1,
-                            parameters: parameters.clone(),
-                        },
-                    );
-                }
-                _ => {}
-            }
-            parsed.instructions.push(LocatedStatement {
-                line_number: line.number,
-                statement,
-            });
+            record_statement(&mut parsed, line.number, statement);
         }
     }
     Ok(parsed)
+}
+
+pub(crate) fn parse_source(source: &str) -> Result<ParsedProgram, RuntimeError> {
+    let mut parsed = ParsedProgram::default();
+    let mut directive_seen = false;
+    let mut executable_seen = false;
+    let mut next_line_number = 10_u16;
+
+    for raw_line in source.lines() {
+        let (line_number, text) = split_source_line_number(raw_line, next_line_number)?;
+        next_line_number = line_number.saturating_add(10);
+        let bytes = text.as_bytes();
+        if let Some(comment) = source_rem_comment(text) {
+            if is_basic64_directive(comment.as_bytes()) {
+                if executable_seen || directive_seen {
+                    return Err(syntax_error(
+                        line_number,
+                        "BASIC64 directive must appear once before executable source",
+                    ));
+                }
+                parse_basic64_directive(comment.as_bytes(), line_number, &mut parsed.options)?;
+                directive_seen = true;
+            }
+        } else if !bytes.iter().all(u8::is_ascii_whitespace) {
+            executable_seen = true;
+        }
+
+        parsed
+            .line_entries
+            .entry(line_number)
+            .or_insert(parsed.instructions.len());
+        let line = TokenizedBasicLine {
+            number: line_number,
+            bytes: bytes.to_vec(),
+            line_references: Vec::new(),
+        };
+        for statement in parse_line(&line, LexMode::Source)? {
+            record_statement(&mut parsed, line_number, statement);
+        }
+    }
+
+    Ok(parsed)
+}
+
+fn record_statement(parsed: &mut ParsedProgram, line_number: u16, statement: Statement) {
+    let index = parsed.instructions.len();
+    match &statement {
+        Statement::DefineProcedure(name, parameters) => {
+            parsed.procedures.insert(
+                name.clone(),
+                Definition {
+                    entry: index + 1,
+                    parameters: parameters.clone(),
+                },
+            );
+        }
+        Statement::DefineFunction(name, parameters) => {
+            parsed.functions.insert(
+                name.clone(),
+                Definition {
+                    entry: index + 1,
+                    parameters: parameters.clone(),
+                },
+            );
+        }
+        _ => {}
+    }
+    parsed.instructions.push(LocatedStatement {
+        line_number,
+        statement,
+    });
+}
+
+fn split_source_line_number(line: &str, fallback: u16) -> Result<(u16, &str), RuntimeError> {
+    let leading_trimmed = line.trim_start_matches([' ', '\t']);
+    let digits = leading_trimmed
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count();
+    if digits == 0
+        || !leading_trimmed
+            .as_bytes()
+            .get(digits)
+            .is_none_or(u8::is_ascii_whitespace)
+    {
+        return Ok((fallback, leading_trimmed));
+    }
+    let number = leading_trimmed[..digits]
+        .parse::<u16>()
+        .map_err(|_| RuntimeError::Program("source line number is outside 0..65535".into()))?;
+    Ok((
+        number,
+        leading_trimmed[digits..].trim_start_matches([' ', '\t']),
+    ))
+}
+
+fn source_rem_comment(line: &str) -> Option<&str> {
+    let line = line.trim_start_matches([' ', '\t']);
+    let bytes = line.as_bytes();
+    if bytes.len() < 3 || !bytes[..3].eq_ignore_ascii_case(b"REM") {
+        return None;
+    }
+    if bytes.get(3).is_some_and(|byte| !byte.is_ascii_whitespace()) {
+        return None;
+    }
+    Some(&line[3..])
+}
+
+fn tokenized_rem_comment(line: &[u8]) -> Option<&[u8]> {
+    line.first()
+        .is_some_and(|byte| *byte == TOKEN_REM)
+        .then_some(&line[1..])
+}
+
+fn is_basic64_directive(comment: &[u8]) -> bool {
+    let comment = comment
+        .iter()
+        .copied()
+        .skip_while(u8::is_ascii_whitespace)
+        .collect::<Vec<_>>();
+    comment.len() >= 8
+        && comment[..8].eq_ignore_ascii_case(b"@BASIC64")
+        && comment.get(8).is_none_or(u8::is_ascii_whitespace)
+}
+
+fn parse_basic64_directive(
+    comment: &[u8],
+    line_number: u16,
+    options: &mut ProgramOptions,
+) -> Result<(), RuntimeError> {
+    let comment = std::str::from_utf8(comment)
+        .map_err(|_| syntax_error(line_number, "BASIC64 directive must be ASCII/UTF-8"))?;
+    let mut words = comment.split_ascii_whitespace();
+    let marker = words.next().unwrap_or_default();
+    if !marker.eq_ignore_ascii_case("@BASIC64") {
+        return Err(syntax_error(line_number, "invalid BASIC64 directive"));
+    }
+
+    let mut mode_seen = false;
+    let mut target_seen = false;
+    let mut profile_seen = false;
+    for word in words {
+        let (key, value) = word
+            .split_once('=')
+            .ok_or_else(|| syntax_error(line_number, "directive fields must use KEY=VALUE"))?;
+        if value.is_empty() {
+            return Err(syntax_error(
+                line_number,
+                "directive values cannot be empty",
+            ));
+        }
+        if key.eq_ignore_ascii_case("MODE") {
+            if mode_seen {
+                return Err(syntax_error(line_number, "duplicate MODE field"));
+            }
+            mode_seen = true;
+            options.mode = if value.eq_ignore_ascii_case("CLASSIC") {
+                LanguageMode::Classic
+            } else if value.eq_ignore_ascii_case("BASIC64") {
+                LanguageMode::Basic64
+            } else if value.eq_ignore_ascii_case("HYBRID") {
+                LanguageMode::Hybrid
+            } else {
+                return Err(syntax_error(line_number, "unknown BASIC language mode"));
+            };
+        } else if key.eq_ignore_ascii_case("TARGET") {
+            if target_seen {
+                return Err(syntax_error(line_number, "duplicate TARGET field"));
+            }
+            target_seen = true;
+            options.target =
+                if value.eq_ignore_ascii_case("HOSTED") || value.eq_ignore_ascii_case("RISCOS") {
+                    GraphicsProfile::Hosted
+                } else if value.eq_ignore_ascii_case("AGON") {
+                    GraphicsProfile::Agon
+                } else {
+                    return Err(syntax_error(line_number, "unknown BASIC runtime target"));
+                };
+        } else if key.eq_ignore_ascii_case("PROFILE") {
+            if profile_seen {
+                return Err(syntax_error(line_number, "duplicate PROFILE field"));
+            }
+            profile_seen = true;
+            options.profile = Some(value.to_owned());
+        } else {
+            return Err(syntax_error(
+                line_number,
+                &format!("unknown BASIC64 directive field {key}"),
+            ));
+        }
+    }
+    if profile_seen && options.mode != LanguageMode::Classic {
+        return Err(syntax_error(
+            line_number,
+            "PROFILE is only valid with MODE=CLASSIC",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_shared_boundary_statement(
@@ -389,12 +602,18 @@ fn validate_shared_boundary_core(line: &TokenizedBasicLine) -> Result<(), Runtim
     Ok(())
 }
 
-fn parse_line(line: &TokenizedBasicLine) -> Result<Vec<Statement>, RuntimeError> {
+#[derive(Clone, Copy)]
+enum LexMode {
+    Tokenized,
+    Source,
+}
+
+fn parse_line(line: &TokenizedBasicLine, mode: LexMode) -> Result<Vec<Statement>, RuntimeError> {
     if line.bytes.first() == Some(&b'*') {
         return Ok(vec![Statement::StarCommand(line.bytes[1..].to_vec())]);
     }
 
-    let mut parser = Parser::new(&line.bytes, line.number)?;
+    let mut parser = Parser::new(&line.bytes, line.number, mode)?;
     if parser.peek_keyword(TOKEN_REM) {
         return Ok(vec![Statement::NoOp]);
     }
@@ -429,14 +648,16 @@ struct Lexer<'a> {
     bytes: &'a [u8],
     offset: usize,
     line_number: u16,
+    mode: LexMode,
 }
 
 impl<'a> Lexer<'a> {
-    fn new(bytes: &'a [u8], line_number: u16) -> Self {
+    fn new(bytes: &'a [u8], line_number: u16, mode: LexMode) -> Self {
         Self {
             bytes,
             offset: 0,
             line_number,
+            mode,
         }
     }
 
@@ -575,28 +796,121 @@ impl<'a> Lexer<'a> {
         {
             self.offset += 1;
         }
-        if matches!(self.bytes.get(self.offset), Some(b'$' | b'%')) {
+        if self.bytes.get(self.offset) == Some(&b'$') {
             self.offset += 1;
+        } else if self.bytes.get(self.offset) == Some(&b'%') {
+            self.offset += 1;
+            if self.bytes.get(self.offset) == Some(&b'%') {
+                self.offset += 1;
+            }
         }
         let value = std::str::from_utf8(&self.bytes[start..self.offset])
             .map_err(|_| syntax_error(self.line_number, "invalid variable name"))?
             .to_ascii_uppercase();
+        if matches!(self.mode, LexMode::Source) {
+            if value == "SYS" {
+                return Ok(Token::Sys);
+            }
+            if let Some(keyword) = source_keyword(&value) {
+                if keyword == TOKEN_REM {
+                    self.offset = self.bytes.len();
+                }
+                return Ok(Token::Keyword(keyword));
+            }
+        }
         Ok(Token::Identifier(value))
     }
+}
+
+fn source_keyword(name: &str) -> Option<u8> {
+    Some(match name {
+        "AND" => TOKEN_AND,
+        "DIV" => TOKEN_DIV,
+        "MOD" => TOKEN_MOD,
+        "OR" => TOKEN_OR,
+        "LINE" => TOKEN_LINE,
+        "SPC" => TOKEN_SPC,
+        "TAB" => TOKEN_TAB,
+        "THEN" => TOKEN_THEN,
+        "ELSE" => TOKEN_ELSE,
+        "STEP" => TOKEN_STEP,
+        "PTR" => TOKEN_PTR,
+        "PAGE" => TOKEN_PAGE,
+        "TIME" => TOKEN_TIME,
+        "LOMEM" => TOKEN_LOMEM,
+        "HIMEM" => TOKEN_HIMEM,
+        "ABS" => TOKEN_ABS,
+        "ASC" => TOKEN_ASC,
+        "COS" => TOKEN_COS,
+        "FN" => TOKEN_FN,
+        "INKEY" => TOKEN_INKEY,
+        "INSTR" => TOKEN_INSTR,
+        "INT" => TOKEN_INT,
+        "LEN" => TOKEN_LEN,
+        "LN" => TOKEN_LN,
+        "LOG" => TOKEN_LOG,
+        "NOT" => TOKEN_NOT,
+        "SQR" => TOKEN_SQR,
+        "TAN" => TOKEN_TAN,
+        "SIN" => TOKEN_SIN,
+        "RND" => TOKEN_RND,
+        "TO" => TOKEN_TO,
+        "VAL" => TOKEN_VAL,
+        "CHR$" => TOKEN_CHR,
+        "CLS" => TOKEN_CLS,
+        "CLG" => TOKEN_CLG,
+        "COLOUR" | "COLOR" => TOKEN_COLOUR,
+        "LEFT$" => TOKEN_LEFT,
+        "MID$" => TOKEN_MID,
+        "RIGHT$" => TOKEN_RIGHT,
+        "STR$" => TOKEN_STR,
+        "STRING$" => TOKEN_STRING,
+        "CALL" => TOKEN_CALL,
+        "DRAW" => TOKEN_DRAW,
+        "DATA" => TOKEN_DATA,
+        "DEF" => TOKEN_DEF,
+        "END" => TOKEN_END,
+        "ENDPROC" => TOKEN_ENDPROC,
+        "ENDIF" => TOKEN_ENDIF,
+        "DIM" => TOKEN_DIM,
+        "FOR" => TOKEN_FOR,
+        "GOSUB" => TOKEN_GOSUB,
+        "GOTO" => TOKEN_GOTO,
+        "IF" => TOKEN_IF,
+        "INPUT" => TOKEN_INPUT,
+        "GCOL" => TOKEN_GCOL,
+        "MOVE" => TOKEN_MOVE,
+        "MODE" => TOKEN_MODE,
+        "NEXT" => TOKEN_NEXT,
+        "PRINT" => TOKEN_PRINT,
+        "PROC" => TOKEN_PROC,
+        "PLOT" => TOKEN_PLOT,
+        "READ" => TOKEN_READ,
+        "REM" => TOKEN_REM,
+        "REPEAT" => TOKEN_REPEAT,
+        "RESTORE" => TOKEN_RESTORE,
+        "RETURN" => TOKEN_RETURN,
+        "UNTIL" => TOKEN_UNTIL,
+        "VDU" => TOKEN_VDU,
+        "LET" => TOKEN_LET,
+        _ => return None,
+    })
 }
 
 struct Parser {
     tokens: Vec<Token>,
     cursor: usize,
     line_number: u16,
+    source_mode: bool,
 }
 
 impl Parser {
-    fn new(bytes: &[u8], line_number: u16) -> Result<Self, RuntimeError> {
+    fn new(bytes: &[u8], line_number: u16, mode: LexMode) -> Result<Self, RuntimeError> {
         Ok(Self {
-            tokens: Lexer::new(bytes, line_number).tokenize()?,
+            tokens: Lexer::new(bytes, line_number, mode).tokenize()?,
             cursor: 0,
             line_number,
+            source_mode: matches!(mode, LexMode::Source),
         })
     }
 
@@ -632,7 +946,9 @@ impl Parser {
             Token::Keyword(TOKEN_READ) => self.parse_read(),
             Token::Keyword(TOKEN_DATA) => self.parse_data(),
             Token::Keyword(TOKEN_RESTORE) => {
-                let target = if matches!(self.peek(), Token::LineReference(_)) {
+                let target = if matches!(self.peek(), Token::LineReference(_))
+                    || (self.source_mode && matches!(self.peek(), Token::Number(_)))
+                {
                     Some(self.expect_line_reference("RESTORE target")?)
                 } else {
                     None
@@ -731,6 +1047,20 @@ impl Parser {
         while !self.is_end() && !self.peek_keyword(TOKEN_ELSE) {
             if self.consume_symbol(b':') {
                 continue;
+            }
+            if self.source_mode {
+                if let Token::Number(target) = self.peek() {
+                    if target.is_finite()
+                        && *target >= 0.0
+                        && *target <= f64::from(u16::MAX)
+                        && target.fract() == 0.0
+                    {
+                        let target = *target as u16;
+                        self.next();
+                        body.push(Statement::Goto(target));
+                        continue;
+                    }
+                }
             }
             body.push(self.parse_statement()?);
             if !self.is_end() && !self.peek_symbol(b':') && !self.peek_keyword(TOKEN_ELSE) {
@@ -1220,10 +1550,18 @@ impl Parser {
     }
 
     fn expect_line_reference(&mut self, description: &str) -> Result<u16, RuntimeError> {
-        if let Token::LineReference(target) = self.next().clone() {
-            Ok(target)
-        } else {
-            self.error(format!("expected encoded {description}"))
+        match self.next().clone() {
+            Token::LineReference(target) => Ok(target),
+            Token::Number(target)
+                if self.source_mode
+                    && target.is_finite()
+                    && target >= 0.0
+                    && target <= f64::from(u16::MAX)
+                    && target.fract() == 0.0 =>
+            {
+                Ok(target as u16)
+            }
+            _ => self.error(format!("expected {description}")),
         }
     }
 

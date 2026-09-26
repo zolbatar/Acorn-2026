@@ -30,6 +30,24 @@ pub fn run_program(
     task: &mut Task,
     dispatcher: &mut SwiDispatcher,
 ) -> Result<(), RuntimeError> {
+    let parsed = parse_tokenized_program(program)?;
+    run_parsed_program(parsed, task, dispatcher)
+}
+
+/// Run plain-text BASIC source through the same parser output and interpreter
+/// used for decoded tokenized programs.
+pub fn run_source(
+    source: &str,
+    task: &mut Task,
+    dispatcher: &mut SwiDispatcher,
+) -> Result<(), RuntimeError> {
+    let parsed = parser::parse_source(source)?;
+    run_parsed_program(parsed, task, dispatcher)
+}
+
+fn parse_tokenized_program(
+    program: &TokenizedBasicProgram,
+) -> Result<parser::ParsedProgram, RuntimeError> {
     let profile = match program.record_layout {
         Some(TokenizedBasicRecordLayout::SharedBoundaryCarriageReturn) => {
             parser::TokenProfile::SharedBoundaryCore
@@ -38,8 +56,15 @@ pub fn run_program(
             parser::TokenProfile::ArmBasicV
         }
     };
+    parser::parse_program(program, profile)
+}
 
-    let parsed = parser::parse_program(program, profile)?;
+fn run_parsed_program(
+    parsed: parser::ParsedProgram,
+    task: &mut Task,
+    dispatcher: &mut SwiDispatcher,
+) -> Result<(), RuntimeError> {
+    dispatcher.set_graphics_profile(parsed.options.target)?;
     runtime::Interpreter::new(parsed).run(task, dispatcher)
 }
 
@@ -51,14 +76,33 @@ pub fn run_program_jit(
     task: &mut Task,
     dispatcher: &mut SwiDispatcher,
 ) -> Result<JitExecutionReport, RuntimeError> {
+    let parsed = parse_tokenized_program(program)?;
+    run_parsed_program_jit(parsed, task, dispatcher)
+}
+
+pub fn run_source_jit(
+    source: &str,
+    task: &mut Task,
+    dispatcher: &mut SwiDispatcher,
+) -> Result<JitExecutionReport, RuntimeError> {
+    let parsed = parser::parse_source(source)?;
+    run_parsed_program_jit(parsed, task, dispatcher)
+}
+
+fn run_parsed_program_jit(
+    parsed: parser::ParsedProgram,
+    task: &mut Task,
+    dispatcher: &mut SwiDispatcher,
+) -> Result<JitExecutionReport, RuntimeError> {
     #[cfg(feature = "experimental-jit")]
     {
-        return jit::run_program_jit(program, task, dispatcher);
+        dispatcher.set_graphics_profile(parsed.options.target)?;
+        return jit::run_parsed_program_jit(parsed, task, dispatcher);
     }
 
     #[cfg(not(feature = "experimental-jit"))]
     {
-        let _ = (program, task, dispatcher);
+        let _ = (parsed, task, dispatcher);
         Err(RuntimeError::Program(
             "BASICJIT is experimental; start Acorn-2026 with `cargo run-jit` first".into(),
         ))

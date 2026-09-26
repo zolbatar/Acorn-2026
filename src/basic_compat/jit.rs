@@ -26,14 +26,11 @@ use crate::{
     error::RuntimeError,
     memory::Task,
     swi::{SwiContext, SwiDispatcher},
-    tokenized_basic::{TokenizedBasicProgram, TokenizedBasicRecordLayout},
 };
 
 use super::{
     JitExecutionReport,
-    parser::{
-        self, BinaryOp, Definition, Expr, LValue, ParsedProgram, Statement, TokenProfile, UnaryOp,
-    },
+    parser::{self, BinaryOp, Definition, Expr, LValue, ParsedProgram, Statement, UnaryOp},
     runtime::{self, Interpreter, NativeProcedureContext},
 };
 
@@ -755,13 +752,11 @@ impl JitProgram {
     }
 }
 
-pub(super) fn run_program_jit(
-    program: &TokenizedBasicProgram,
+pub(super) fn run_parsed_program_jit(
+    parsed: ParsedProgram,
     task: &mut Task,
     dispatcher: &mut SwiDispatcher,
 ) -> Result<JitExecutionReport, RuntimeError> {
-    let parsed = parse_for_jit(program)?;
-
     let mut interpreter = Interpreter::new(parsed.clone());
     match compile_for_jit(&parsed) {
         Ok(Some(jit)) => interpreter.install_jit(jit),
@@ -1849,20 +1844,6 @@ fn variable_is(actual: &str, expected: &str) -> bool {
 
 fn binary(operator: BinaryOp, left: Expr, right: Expr) -> Expr {
     Expr::Binary(Box::new(left), operator, Box::new(right))
-}
-
-pub(super) fn parse_for_jit(
-    program: &TokenizedBasicProgram,
-) -> Result<ParsedProgram, RuntimeError> {
-    let profile = match program.record_layout {
-        Some(TokenizedBasicRecordLayout::SharedBoundaryCarriageReturn) => {
-            TokenProfile::SharedBoundaryCore
-        }
-        Some(TokenizedBasicRecordLayout::SeparateLineCarriageReturn) | None => {
-            TokenProfile::ArmBasicV
-        }
-    };
-    parser::parse_program(program, profile)
 }
 
 pub(super) fn compile_for_jit(program: &ParsedProgram) -> Result<Option<JitProgram>, String> {
