@@ -31,6 +31,21 @@ impl Runtime {
         }
     }
 
+    pub fn windowed_with_desktop(
+        input: Receiver<u8>,
+        display_events: Sender<DisplayEvent>,
+        wimp: Arc<WimpServer>,
+    ) -> Self {
+        Self {
+            task: Task::new(TASK_ID),
+            dispatcher: SwiDispatcher::windowed_with_desktop(
+                HostConsole::windowed(input),
+                display_events,
+                wimp,
+            ),
+        }
+    }
+
     /// Construct an independent BASIC task attached to the shared hosted Wimp.
     pub fn desktop_task(
         task_id: u64,
@@ -75,6 +90,9 @@ impl Runtime {
             }
 
             if self.dispatcher.quit_requested() {
+                return Ok(());
+            }
+            if self.dispatcher.desktop_requested() {
                 return Ok(());
             }
             self.write_prompt()?;
@@ -128,5 +146,66 @@ impl Runtime {
             &mut SwiContext::default(),
         )?;
         self.dispatcher.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::mpsc::{self, TryRecvError},
+        thread,
+        time::Duration,
+    };
+
+    use super::*;
+    use crate::{swi::DisplayEvent, wimp::WimpServer};
+
+    #[test]
+    fn desktop_command_suspends_prompt_input_until_wimp_session_closes() {
+        let (input_sender, input_receiver) = mpsc::channel();
+        for byte in b"*dEsK.\rHELP\r" {
+            input_sender.send(*byte).unwrap();
+        }
+        drop(input_sender);
+
+        let (display_sender, display_receiver) = mpsc::channel();
+        let (updates, _update_receiver) = mpsc::channel();
+        let wimp = WimpServer::new(updates);
+        let runtime_wimp = wimp.clone();
+        let (finished_sender, finished_receiver) = mpsc::channel();
+        let runtime_thread = thread::spawn(move || {
+            let mut runtime =
+                Runtime::windowed_with_desktop(input_receiver, display_sender, runtime_wimp);
+            let _ = finished_sender.send(runtime.run());
+        });
+
+        let mut initial_output = Vec::new();
+        loop {
+            match display_receiver.recv_timeout(Duration::from_secs(2)) {
+                Ok(DisplayEvent::WriteByte { byte, .. }) => initial_output.push(byte),
+                Ok(DisplayEvent::DesktopStarted) => break,
+                Ok(_) => {}
+                Err(error) => panic!("DESKTOP did not reach the display handoff: {error}"),
+            }
+        }
+        assert_eq!(initial_output.first(), Some(&b'*'));
+        assert!(wimp.desktop_windows().is_empty());
+        assert!(
+            display_receiver
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "queued HELP input must not be consumed and a hidden MOS prompt must not be emitted"
+        );
+        assert!(matches!(
+            finished_receiver.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+
+        wimp.stop();
+        finished_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("closing the Wimp session must release the suspended MOS task")
+            .expect("the MOS runtime should shut down cleanly");
+        runtime_thread.join().unwrap();
     }
 }

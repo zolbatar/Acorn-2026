@@ -40,9 +40,11 @@ Open the repository root (the folder containing `Cargo.toml`) in RustRover, then
 cargo run
 ```
 
-The app opens one window and displays the `*` prompt. Enter `HELP` to list the built-in commands. Enter `QUIT` to exit the runtime. Closing the window also exits.
+The app opens one window and displays the `*` prompt. Enter `HELP` to list the built-in commands. Enter `DESKTOP` to hand that window to the initially blank shared Wimp desktop; closing the window exits. `--desktop-demo` remains a separate launch path for the two sample windows. Enter `QUIT` to exit from the MOS prompt.
 
 Use **Command+V** on macOS to paste clipboard text into the window (Control+V on other hosts). Pasted line breaks act like pressing Enter, so multiple pasted command lines run in sequence. Printable ASCII is sent to the guest input path; tabs become spaces and unsupported characters are skipped.
+
+In the desktop, left-click is Select, middle-click is Menu, and right-click is Adjust. On a trackpad or two-button mouse, hold Option (Alt on other platforms) and left-click for Menu.
 
 To keep using the terminal frontend, run `cargo run -- --stdio`.
 

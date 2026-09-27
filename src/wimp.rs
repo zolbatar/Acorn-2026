@@ -779,6 +779,18 @@ impl WimpServer {
         self.changed.notify_all();
     }
 
+    /// Block the hosted command task until the host closes the Wimp session.
+    pub fn wait_until_stopped(&self) -> Result<(), RuntimeError> {
+        let mut state = self.lock_state()?;
+        while !state.stopped {
+            state = self
+                .changed
+                .wait(state)
+                .map_err(|_| program_error("Wimp session lock was poisoned"))?;
+        }
+        Ok(())
+    }
+
     /// The Wimp closes a task's windows if it exits without Wimp_CloseDown.
     pub fn task_exited(&self, guest_task_id: u64) {
         let Ok(mut state) = self.state.lock() else {

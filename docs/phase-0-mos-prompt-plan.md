@@ -2,11 +2,11 @@
 
 ## Purpose
 
-Define a small, reviewable contract for the first hosted prototype: a Rust runtime that reaches the MOS `*` prompt and accepts `HELP` and `QUIT`. The initial implementation used a terminal command line; the default frontend has since advanced to a single graphics-capable window, while `cargo run -- --stdio` retains the original terminal adapter. BASIC64 was deferred until after the prompt bring-up milestone. The long-term architecture in the design brief remains the project direction.
+Define a small, reviewable contract for the first hosted prototype: a Rust runtime that reaches the MOS `*` prompt and accepts `HELP` and `QUIT`. The initial implementation used a terminal command line; the default frontend has since advanced to a single graphics-capable window and gained `DESKTOP`, while `cargo run -- --stdio` retains the terminal adapter. BASIC64 was deferred until after the prompt bring-up milestone. The long-term architecture in the design brief remains the project direction.
 
 ## First milestone
 
-The hosted Rust executable starts one command task, shows `*`, reads a line through `OS_ReadLine`, and sends the command through `OS_CLI`. The built-in commands are `HELP` and `QUIT`. `HELP` prints the command list through the output SWIs; `QUIT` ends the runtime without printing another prompt. An unrecognized command reports `Bad command` and returns to the prompt. End-of-input also exits the hosted process. In windowed mode keyboard input is captured by the window and visible output is rendered from the same SWI-driven display state.
+The hosted Rust executable starts one command task, shows `*`, reads a line through `OS_ReadLine`, and sends the command through `OS_CLI`. The built-in commands include `HELP`, `QUIT`, and `DESKTOP`. `HELP` prints the command list through the output SWIs; `QUIT` ends the runtime without printing another prompt. In the windowed host, `DESKTOP` transfers the existing display to the shared Wimp service, initially with no windows, and suspends its caller until the host window closes. The runtime then exits without drawing another MOS prompt. `--desktop-demo` remains a separate way to start directly in the two-task Wimp demonstration. `DESKTOP` in `--stdio` reports that a windowed host is required and leaves the prompt available. An unrecognized command reports `Bad command` and returns to the prompt. End-of-input also exits the hosted process. In windowed mode keyboard input is captured by the window and visible output is rendered from the same SWI-driven display state.
 
 The user types `HELP` after the `*` prompt; the asterisk is the prompt marker and is not part of the command text.
 
@@ -18,11 +18,11 @@ The user types `HELP` after the `*` prompt; the asterisk is the prompt marker an
 | --- | --- |
 | Acceptance contract | Define the end-to-end demo: open/run the Cargo project, see `*`, type `HELP`, see help text and return to `*`, then type `QUIT` and confirm clean exit. Record unknown-command and end-of-input behavior. |
 | Host and project | Use a hosted terminal on macOS for the first target. Keep host I/O behind a Rust adapter and make the repository root a Cargo project that RustRover can open. |
-| Command contract | Implement `HELP` and `QUIT` as the first built-in MOS commands. Match them case-insensitively; `QUIT` requests a clean runtime exit and other input gets `Bad command`. |
+| Command contract | Implement `HELP`, `QUIT`, and the hosted `DESKTOP` handoff as built-in MOS commands. Match them case-insensitively; abbreviations use a final dot. `QUIT` requests a clean runtime exit, and `DESKTOP` reports an error when no graphical host is available. |
 | SWI catalog | Define the initial subset: `OS_WriteC`, `OS_WriteS`, `OS_Write0`, `OS_NewLine`, `OS_ReadC`, `OS_ReadLine`, and `OS_CLI`. Keep their numeric IDs and documented register/memory behavior. |
 | Caller and memory boundary | Carry a caller task and its logical address space into each SWI. Pointer arguments resolve through checked guest-memory access; no host pointers enter the guest interface. |
 | Compatibility boundary | Preserve documented behavior for the initial SWIs where feasible. Mark terminal-specific limitations and all unimplemented SWIs as outside this prototype slice. BASIC64 semantics and compatibility are deferred. |
-| Acceptance script | `cargo run`, enter `HELP`, confirm help output and the next `*` prompt, then enter `QUIT` and confirm the runtime exits without another prompt. Also record an unknown-command check. |
+| Acceptance script | `cargo run`, enter `HELP`, confirm help output and the next `*` prompt, then enter `QUIT` and confirm the runtime exits without another prompt. Also check an unknown command. For the desktop handoff, enter `DESKTOP` and confirm an empty Wimp surface takes over until the host window closes; confirm `--stdio` reports that a windowed host is required. |
 
 ## Initial SWI surface
 

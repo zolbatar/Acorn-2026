@@ -69,25 +69,21 @@ fn run_frontend(desktop_demo: bool) -> Result<(), Box<dyn Error>> {
     } else {
         None
     };
-    let wimp = if desktop_demo {
-        let (updates, update_receiver) = mpsc::channel();
-        let update_proxy = proxy.clone();
-        thread::Builder::new()
-            .name("acorn-wimp-desktop-updates".into())
-            .spawn(move || {
-                while update_receiver.recv().is_ok() {
-                    if update_proxy
-                        .send_event(WindowUserEvent::DesktopChanged)
-                        .is_err()
-                    {
-                        break;
-                    }
+    let (updates, update_receiver) = mpsc::channel();
+    let update_proxy = proxy.clone();
+    thread::Builder::new()
+        .name("acorn-wimp-desktop-updates".into())
+        .spawn(move || {
+            while update_receiver.recv().is_ok() {
+                if update_proxy
+                    .send_event(WindowUserEvent::DesktopChanged)
+                    .is_err()
+                {
+                    break;
                 }
-            })?;
-        Some(WimpServer::new(updates))
-    } else {
-        None
-    };
+            }
+        })?;
+    let wimp = WimpServer::new(updates);
 
     thread::Builder::new()
         .name("acorn-window-events".into())
@@ -101,7 +97,7 @@ fn run_frontend(desktop_demo: bool) -> Result<(), Box<dyn Error>> {
         })?;
 
     let mut guest_threads = Vec::new();
-    if let (Some(wimp), Some(programs)) = (wimp.clone(), programs) {
+    if let Some(programs) = programs {
         for (task_id, source, name) in programs {
             let task_wimp = wimp.clone();
             let task_display = display_sender.clone();
@@ -119,10 +115,12 @@ fn run_frontend(desktop_demo: bool) -> Result<(), Box<dyn Error>> {
         }
     } else {
         let exit_sender = display_sender.clone();
+        let runtime_wimp = wimp.clone();
         thread::Builder::new()
             .name("acorn-basic-runtime".into())
             .spawn(move || {
-                let mut runtime = Runtime::windowed(input_receiver, display_sender);
+                let mut runtime =
+                    Runtime::windowed_with_desktop(input_receiver, display_sender, runtime_wimp);
                 if let Err(error) = runtime.run() {
                     let _ = runtime.report_error(&error);
                 }
@@ -130,13 +128,13 @@ fn run_frontend(desktop_demo: bool) -> Result<(), Box<dyn Error>> {
             })?;
     }
 
-    let mut app = if let Some(wimp) = wimp {
+    let mut app = if desktop_demo {
         WindowApp::new_desktop(input_sender, wimp)
     } else {
-        WindowApp::new(input_sender)
+        WindowApp::new_windowed(input_sender, wimp)
     };
     let event_loop_result = event_loop.run_app(&mut app);
-    if let Some(wimp) = &app.desktop {
+    if let Some(wimp) = &app.wimp_service {
         wimp.stop();
     }
     for guest in guest_threads {
@@ -160,6 +158,7 @@ struct WindowApp {
     frame_size: (u32, u32),
     next_teletext_flash: Option<Instant>,
     desktop: Option<std::sync::Arc<WimpServer>>,
+    wimp_service: Option<std::sync::Arc<WimpServer>>,
     task_graphics: HashMap<u64, GraphicsService>,
     pointer: Option<(i32, i32)>,
     drag: Option<WindowDrag>,
@@ -176,6 +175,7 @@ impl WindowApp {
             frame_size: (renderer::SCREEN_WIDTH, renderer::SCREEN_HEIGHT),
             next_teletext_flash: None,
             desktop: None,
+            wimp_service: None,
             task_graphics: HashMap::new(),
             pointer: None,
             drag: None,
@@ -185,8 +185,33 @@ impl WindowApp {
     fn new_desktop(input: mpsc::Sender<u8>, wimp: std::sync::Arc<WimpServer>) -> Self {
         let mut app = Self::new(input);
         app.frame_size = (DESKTOP_PIXEL_WIDTH, DESKTOP_PIXEL_HEIGHT);
-        app.desktop = Some(wimp);
+        app.desktop = Some(wimp.clone());
+        app.wimp_service = Some(wimp);
         app
+    }
+
+    fn new_windowed(input: mpsc::Sender<u8>, wimp: std::sync::Arc<WimpServer>) -> Self {
+        let mut app = Self::new(input);
+        app.wimp_service = Some(wimp);
+        app
+    }
+
+    fn activate_desktop(&mut self) {
+        if self.desktop.is_some() {
+            return;
+        }
+        let Some(wimp) = self.wimp_service.clone() else {
+            eprintln!("Acorn-2026 received DESKTOP without a hosted Wimp service");
+            return;
+        };
+        // Resize while this is still the MOS display; resize_buffer intentionally
+        // ignores requests after desktop composition becomes active.
+        self.resize_buffer((DESKTOP_PIXEL_WIDTH, DESKTOP_PIXEL_HEIGHT));
+        self.task_graphics.clear();
+        self.pointer = None;
+        self.drag = None;
+        self.desktop = Some(wimp);
+        self.request_redraw();
     }
 
     fn handle_key(&self, event: KeyEvent) {
@@ -314,6 +339,7 @@ impl WindowApp {
                     self.resize_buffer(size);
                 }
             }
+            DisplayEvent::DesktopStarted => self.activate_desktop(),
             DisplayEvent::DesktopChanged => {}
             DisplayEvent::RuntimeExited => {
                 event_loop.exit();
@@ -380,12 +406,7 @@ impl WindowApp {
         let Some(wimp) = &self.desktop else {
             return;
         };
-        let buttons = match button {
-            MouseButton::Left => 4,
-            MouseButton::Middle => 2,
-            MouseButton::Right => 1,
-            _ => 0,
-        };
+        let buttons = mouse_button_mask(button, self.modifiers, true);
         if buttons == 0 {
             return;
         }
@@ -397,6 +418,16 @@ impl WindowApp {
             wimp.finish_drag(drag);
         }
         self.request_redraw();
+    }
+}
+
+fn mouse_button_mask(button: MouseButton, modifiers: ModifiersState, desktop_active: bool) -> u32 {
+    match button {
+        MouseButton::Left if desktop_active && modifiers.contains(ModifiersState::ALT) => 2,
+        MouseButton::Left => 4,
+        MouseButton::Middle => 2,
+        MouseButton::Right => 1,
+        _ => 0,
     }
 }
 
@@ -461,7 +492,7 @@ impl ApplicationHandler<WindowUserEvent> for WindowApp {
 
         match event {
             WindowEvent::CloseRequested => {
-                if let Some(wimp) = &self.desktop {
+                if let Some(wimp) = &self.wimp_service {
                     wimp.stop();
                 }
                 event_loop.exit();
@@ -517,6 +548,10 @@ impl ApplicationHandler<WindowUserEvent> for WindowApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.desktop.is_some() {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
         let snapshot = self.graphics.snapshot();
         let is_teletext = matches!(snapshot.mode.number, 7 | 135);
         let has_flash = is_teletext && snapshot.text_cells.contains(&0x88);
@@ -539,5 +574,64 @@ impl ApplicationHandler<WindowUserEvent> for WindowApp {
         event_loop.set_control_flow(ControlFlow::WaitUntil(
             self.next_teletext_flash.expect("flash deadline is set"),
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{memory::Task, swi::SwiContext, wimp::WIMP_INITIALISE};
+
+    #[test]
+    fn desktop_mouse_mapping_supports_option_menu_and_preserves_button_roles() {
+        let alt = ModifiersState::ALT;
+        let no_modifiers = ModifiersState::empty();
+
+        assert_eq!(mouse_button_mask(MouseButton::Left, no_modifiers, true), 4);
+        assert_eq!(mouse_button_mask(MouseButton::Left, alt, true), 2);
+        assert_eq!(mouse_button_mask(MouseButton::Left, alt, false), 4);
+        assert_eq!(
+            mouse_button_mask(MouseButton::Middle, no_modifiers, true),
+            2
+        );
+        assert_eq!(mouse_button_mask(MouseButton::Right, no_modifiers, true), 1);
+        assert_eq!(
+            mouse_button_mask(MouseButton::Other(8), no_modifiers, true),
+            0
+        );
+    }
+
+    #[test]
+    fn desktop_activation_switches_the_mos_frame_to_an_empty_shared_wimp() {
+        let (updates, _update_receiver) = mpsc::channel();
+        let wimp = WimpServer::new(updates);
+        let (input_sender, input_receiver) = mpsc::channel();
+        let mut app = WindowApp::new_windowed(input_sender, wimp.clone());
+
+        assert!(app.desktop.is_none());
+        app.activate_desktop();
+
+        assert_eq!(app.frame_size, (DESKTOP_PIXEL_WIDTH, DESKTOP_PIXEL_HEIGHT));
+        assert!(
+            app.desktop
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, &wimp)),
+            "the visible desktop must use the shared Wimp service"
+        );
+        assert!(wimp.desktop_windows().is_empty());
+
+        let mut task = Task::new(42);
+        task.memory.write_bytes(0x1000, b"desktop task\r").unwrap();
+        let mut initialise = SwiContext::default();
+        initialise.registers[0] = 310;
+        initialise.registers[1] = u32::from_le_bytes(*b"TASK");
+        initialise.registers[2] = 0x1000;
+        wimp.dispatch(WIMP_INITIALISE, &mut task, &mut initialise)
+            .unwrap();
+        assert_eq!(initialise.registers[0], 310);
+        assert!(wimp.desktop_windows().is_empty());
+
+        app.send_input(b'X');
+        assert!(input_receiver.try_recv().is_err());
     }
 }

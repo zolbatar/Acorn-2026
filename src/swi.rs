@@ -60,6 +60,7 @@ pub enum DisplayEvent {
         task_id: u64,
         snapshot: GraphicsSnapshot,
     },
+    DesktopStarted,
     DesktopChanged,
     RuntimeExited,
 }
@@ -80,7 +81,7 @@ const MAX_CLI_BYTES: usize = 256;
 const MAX_STRING_BYTES: usize = 4096;
 const OUTPUT_BUFFER: u32 = GUEST_MEMORY_BASE + 0x1000;
 const CLI_STRING_BUFFER: u32 = GUEST_MEMORY_BASE + 0x3000;
-const HELP_TEXT: &[u8] = b"Acorn-2026 MOS commands:\n\r  Commands can be abbreviated with a final dot (for example, *CA.); *. is a shortcut for *CAT.\n\r  *CAT [dir]             Catalogue a directory.\n\r  *DIR [dir]             Select the current directory.\n\r  *CDIR <dir>            Create a directory.\n\r  *DELETE <file>         Delete a file.\n\r  *RENAME <old> <new>    Rename a file or directory.\n\r  *FILETYPE <file> <id>  Set a RISC OS file type.\n\r  *TYPE <file>           Display a text file.\n\r  *DISC [name]           Read or set the volume name.\n\r  *HOSTFS                Select the HostFS filing system.\n\r  RUN <file>             Run a BASIC source or tokenised file.\n\r  BASICLOAD <file>       Load a tokenised BASIC program.\n\r  BASICRUN               Run the loaded program.\n\r  BASICJIT [file]        Run with experimental native hot regions.\n\r  HELP                   Show this help.\n\r  QUIT                   Exit the runtime.";
+const HELP_TEXT: &[u8] = b"Acorn-2026 MOS commands:\n\r  Commands can be abbreviated with a final dot (for example, *CA.); *. is a shortcut for *CAT.\n\r  *CAT [dir]             Catalogue a directory.\n\r  *DIR [dir]             Select the current directory.\n\r  *CDIR <dir>            Create a directory.\n\r  *DELETE <file>         Delete a file.\n\r  *RENAME <old> <new>    Rename a file or directory.\n\r  *FILETYPE <file> <id>  Set a RISC OS file type.\n\r  *TYPE <file>           Display a text file.\n\r  *DISC [name]           Read or set the volume name.\n\r  *HOSTFS                Select the HostFS filing system.\n\r  DESKTOP                Start the hosted Wimp desktop.\n\r  RUN <file>             Run a BASIC source or tokenised file.\n\r  BASICLOAD <file>       Load a tokenised BASIC program.\n\r  BASICRUN               Run the loaded program.\n\r  BASICJIT [file]        Run with experimental native hot regions.\n\r  HELP                   Show this help.\n\r  QUIT                   Exit the runtime.";
 
 fn hsv_to_rgb(hue: f64, saturation: f64, value: f64) -> (u8, u8, u8) {
     let hue = hue.rem_euclid(360.0) / 60.0;
@@ -113,9 +114,11 @@ pub struct SwiDispatcher {
     graphics: GraphicsService,
     file_system: HostFileSystem,
     quit_requested: bool,
+    desktop_requested: bool,
     display_events: Option<Sender<DisplayEvent>>,
     display_task_id: u64,
     wimp: Option<Arc<WimpServer>>,
+    desktop_service: Option<Arc<WimpServer>>,
     display_batch_active: bool,
     last_display_batch_publish: Option<Instant>,
     last_inkey_poll: Instant,
@@ -128,6 +131,16 @@ impl SwiDispatcher {
 
     pub fn windowed(console: HostConsole, display_events: Sender<DisplayEvent>) -> Self {
         Self::with_display_events(console, Some(display_events), 1, None)
+    }
+
+    pub(crate) fn windowed_with_desktop(
+        console: HostConsole,
+        display_events: Sender<DisplayEvent>,
+        wimp: Arc<WimpServer>,
+    ) -> Self {
+        let mut dispatcher = Self::with_display_events(console, Some(display_events), 1, None);
+        dispatcher.desktop_service = Some(wimp);
+        dispatcher
     }
 
     pub(crate) fn desktop_task(
@@ -150,9 +163,11 @@ impl SwiDispatcher {
             graphics: GraphicsService::default(),
             file_system: HostFileSystem::demo_default(),
             quit_requested: false,
+            desktop_requested: false,
             display_events,
             display_task_id,
             wimp,
+            desktop_service: None,
             display_batch_active: false,
             last_display_batch_publish: None,
             last_inkey_poll: Instant::now(),
@@ -161,6 +176,10 @@ impl SwiDispatcher {
 
     pub fn quit_requested(&self) -> bool {
         self.quit_requested
+    }
+
+    pub fn desktop_requested(&self) -> bool {
+        self.desktop_requested
     }
 
     pub fn graphics(&self) -> &GraphicsService {
@@ -1710,6 +1729,24 @@ impl SwiDispatcher {
             call.registers[R0] = 14;
             call.registers[R1] = CLI_STRING_BUFFER;
             self.dispatch(OS_FSCONTROL, task, &mut call)
+        } else if cli_command_matches(verb, "DESKTOP") {
+            if !arguments.is_empty() {
+                self.write_inline(task, b"Syntax: DESKTOP")?;
+                return self.write_new_line(task);
+            }
+            let Some(wimp) = self.desktop_service.take() else {
+                return Err(RuntimeError::Program(
+                    "DESKTOP requires the windowed host; restart without --stdio".into(),
+                ));
+            };
+
+            self.desktop_requested = true;
+            self.wimp = Some(Arc::clone(&wimp));
+            self.publish_display_event(DisplayEvent::DesktopStarted);
+            // Keep the MOS/BASIC caller suspended at the command boundary while
+            // the shared Wimp desktop owns the hosted display.
+            wimp.wait_until_stopped()?;
+            Ok(())
         } else if cli_command_matches(verb, "FX")
             && arguments
                 .chars()
@@ -1930,5 +1967,58 @@ fn format_elapsed(duration: Duration) -> String {
         format!("{:.2} ms", duration.as_secs_f64() * 1_000.0)
     } else {
         format!("{:.2} s", duration.as_secs_f64())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+
+    use super::*;
+
+    fn dispatch_cli_line(
+        dispatcher: &mut SwiDispatcher,
+        task: &mut Task,
+        line: &str,
+    ) -> Result<(), RuntimeError> {
+        task.memory
+            .write_bytes(CLI_STRING_BUFFER, line.as_bytes())?;
+        task.memory
+            .write_byte(CLI_STRING_BUFFER + line.len() as u32, 0)?;
+        let mut context = SwiContext::default();
+        context.registers[R0] = CLI_STRING_BUFFER;
+        dispatcher.dispatch(OS_CLI, task, &mut context)
+    }
+
+    #[test]
+    fn desktop_cli_requires_the_windowed_wimp_service_and_accepts_only_no_arguments() {
+        let (_input_sender, input_receiver) = mpsc::channel();
+        let (display_sender, _display_receiver) = mpsc::channel();
+        let mut dispatcher =
+            SwiDispatcher::windowed(HostConsole::windowed(input_receiver), display_sender);
+        let mut task = Task::new(1);
+
+        let error = dispatch_cli_line(&mut dispatcher, &mut task, "*dEsK.").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("DESKTOP requires the windowed host")
+        );
+        assert!(!dispatcher.desktop_requested());
+
+        assert!(dispatch_cli_line(&mut dispatcher, &mut task, "DESKTOP extra").is_ok());
+        assert!(!dispatcher.desktop_requested());
+    }
+
+    #[test]
+    fn desktop_abbreviation_does_not_steal_the_existing_dir_abbreviation() {
+        let (_input_sender, input_receiver) = mpsc::channel();
+        let (display_sender, _display_receiver) = mpsc::channel();
+        let mut dispatcher =
+            SwiDispatcher::windowed(HostConsole::windowed(input_receiver), display_sender);
+        let mut task = Task::new(1);
+
+        dispatch_cli_line(&mut dispatcher, &mut task, "*D.").unwrap();
+        assert!(!dispatcher.desktop_requested());
     }
 }

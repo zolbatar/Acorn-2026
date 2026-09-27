@@ -162,7 +162,11 @@ fn collect_demo_scene(
             Ok(DisplayEvent::GraphicsSnapshot { task_id, snapshot }) => {
                 graphics.insert(task_id, GraphicsService::from_snapshot(snapshot));
             }
-            Ok(DisplayEvent::DesktopChanged | DisplayEvent::RuntimeExited) => {}
+            Ok(
+                DisplayEvent::DesktopStarted
+                | DisplayEvent::DesktopChanged
+                | DisplayEvent::RuntimeExited,
+            ) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(Box::new(io::Error::new(
