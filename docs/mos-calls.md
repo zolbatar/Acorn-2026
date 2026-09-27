@@ -4,8 +4,9 @@ Parameterless BASIC `CALL` recognises the MOS entrypoints below and translates
 their arguments into existing caller-scoped SWI services. This is a service
 adapter, not execution of 6502 or ARM machine code. It is shared by source and
 tokenised BASIC; the current hybrid JIT reaches it through statement execution.
-The public `SwiDispatcher::dispatch_mos_call` boundary is also available for
-future native statement lowering.
+The strict whole-program JIT calls the same
+`SwiDispatcher::dispatch_mos_call` service through a checked runtime helper;
+it does not route `CALL` through interpreter statement execution.
 
 | Address | MOS service | Hosted operation |
 | --- | --- | --- |

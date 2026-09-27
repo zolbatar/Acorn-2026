@@ -86,6 +86,8 @@ pub(super) struct Interpreter {
     if_blocks: HashMap<usize, usize>,
     clock: MosClock,
     steps: u64,
+    interpreted_statement_count: u64,
+    interpreted_expression_count: u64,
     print_column: usize,
     print_format: u32,
     next_heap_address: u32,
@@ -371,6 +373,8 @@ impl Interpreter {
             if_blocks,
             clock: MosClock::default(),
             steps: 0,
+            interpreted_statement_count: 0,
+            interpreted_expression_count: 0,
             print_column: 0,
             print_format: DEFAULT_PRINT_FORMAT,
             next_heap_address: FIRST_HEAP_ADDRESS,
@@ -415,6 +419,8 @@ impl Interpreter {
                     Some("BASIC control flow and unmatched statements used the interpreter".into())
                 }
             });
+        report.interpreted_statement_count = self.interpreted_statement_count;
+        report.interpreted_expression_count = self.interpreted_expression_count;
         report
     }
 
@@ -677,6 +683,7 @@ impl Interpreter {
         task: &mut Task,
         dispatcher: &mut SwiDispatcher,
     ) -> Result<Flow, RuntimeError> {
+        self.interpreted_statement_count = self.interpreted_statement_count.saturating_add(1);
         match statement {
             Statement::Assign(target, expression) => {
                 let value = self.evaluate(expression, line, task)?;
@@ -1278,6 +1285,7 @@ impl Interpreter {
         line: u16,
         task: &Task,
     ) -> Result<Value, RuntimeError> {
+        self.interpreted_expression_count = self.interpreted_expression_count.saturating_add(1);
         match expression {
             Expr::Number(value) => Ok(Value::Number(*value)),
             Expr::String(value) => Ok(Value::String(value.clone())),

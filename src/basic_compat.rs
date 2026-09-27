@@ -3,17 +3,36 @@ pub mod compiler_api;
 
 #[cfg(feature = "experimental-jit")]
 mod jit;
+#[cfg(feature = "experimental-jit")]
+mod native_runtime;
 mod parser;
 mod runtime;
+#[cfg(feature = "experimental-jit")]
+mod strict_jit;
 
 #[derive(Clone, Debug, Default)]
 pub struct JitExecutionReport {
     pub compiled_units: Vec<String>,
     pub compiled_calls: u64,
     pub rendered_pixels: u64,
+    /// Executable BASIC statements entered through the reference interpreter.
+    pub interpreted_statement_count: u64,
+    /// Recursive expression nodes evaluated by the reference interpreter.
+    pub interpreted_expression_count: u64,
+    /// Checked runtime service/helper calls made by generated native code.
+    pub runtime_helper_calls: u64,
+    /// True only for a complete strict-native compilation and execution.
+    pub strict_native: bool,
     pub compiled_time: std::time::Duration,
     pub compile_time: std::time::Duration,
     pub fallback_reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StrictJitOptions {
+    /// Disable speed optimizations to retain loops and procedure calls used
+    /// solely for validation measurements.
+    pub benchmark_validation: bool,
 }
 
 use crate::{
@@ -87,6 +106,66 @@ pub fn run_source_jit(
 ) -> Result<JitExecutionReport, RuntimeError> {
     let parsed = parser::parse_source(source)?;
     run_parsed_program_jit(parsed, task, dispatcher)
+}
+
+/// Compile the complete parsed program before execution. Unsupported code is
+/// rejected with a BASIC source location; strict execution never falls back to
+/// the interpreter.
+pub fn run_program_jit_strict(
+    program: &TokenizedBasicProgram,
+    task: &mut Task,
+    dispatcher: &mut SwiDispatcher,
+) -> Result<JitExecutionReport, RuntimeError> {
+    run_program_jit_strict_with_options(program, task, dispatcher, StrictJitOptions::default())
+}
+
+pub fn run_program_jit_strict_with_options(
+    program: &TokenizedBasicProgram,
+    task: &mut Task,
+    dispatcher: &mut SwiDispatcher,
+    options: StrictJitOptions,
+) -> Result<JitExecutionReport, RuntimeError> {
+    let parsed = parse_tokenized_program(program)?;
+    run_parsed_program_jit_strict(parsed, task, dispatcher, options)
+}
+
+pub fn run_source_jit_strict(
+    source: &str,
+    task: &mut Task,
+    dispatcher: &mut SwiDispatcher,
+) -> Result<JitExecutionReport, RuntimeError> {
+    run_source_jit_strict_with_options(source, task, dispatcher, StrictJitOptions::default())
+}
+
+pub fn run_source_jit_strict_with_options(
+    source: &str,
+    task: &mut Task,
+    dispatcher: &mut SwiDispatcher,
+    options: StrictJitOptions,
+) -> Result<JitExecutionReport, RuntimeError> {
+    let parsed = parser::parse_source(source)?;
+    run_parsed_program_jit_strict(parsed, task, dispatcher, options)
+}
+
+fn run_parsed_program_jit_strict(
+    parsed: parser::ParsedProgram,
+    task: &mut Task,
+    dispatcher: &mut SwiDispatcher,
+    options: StrictJitOptions,
+) -> Result<JitExecutionReport, RuntimeError> {
+    #[cfg(feature = "experimental-jit")]
+    {
+        dispatcher.set_graphics_profile(parsed.options.target)?;
+        return strict_jit::run_parsed_program_with_options(parsed, task, dispatcher, options);
+    }
+
+    #[cfg(not(feature = "experimental-jit"))]
+    {
+        let _ = (parsed, task, dispatcher, options);
+        Err(RuntimeError::Program(
+            "strict BASICJIT is experimental; start Acorn-2026 with `cargo run-jit` first".into(),
+        ))
+    }
 }
 
 fn run_parsed_program_jit(

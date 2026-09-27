@@ -86,7 +86,7 @@ const MAX_CLI_BYTES: usize = 256;
 const MAX_STRING_BYTES: usize = 4096;
 const OUTPUT_BUFFER: u32 = GUEST_MEMORY_BASE + 0x1000;
 const CLI_STRING_BUFFER: u32 = GUEST_MEMORY_BASE + 0x3000;
-const HELP_TEXT: &[u8] = b"Acorn-2026 MOS commands:\n\r  Commands can be abbreviated with a final dot (for example, *CA.); *. is a shortcut for *CAT.\n\r  *CAT [dir]             Catalogue a directory.\n\r  *DIR [dir]             Select the current directory.\n\r  *CDIR <dir>            Create a directory.\n\r  *DELETE <file>         Delete a file.\n\r  *RENAME <old> <new>    Rename a file or directory.\n\r  *FILETYPE <file> <id>  Set a RISC OS file type.\n\r  *TYPE <file>           Display a text file.\n\r  *DISC [name]           Read or set the volume name.\n\r  *HOSTFS                Select the HostFS filing system.\n\r  DESKTOP                Start the hosted Wimp desktop.\n\r  RUN <file>             Run a BASIC source or tokenised file.\n\r  BASICLOAD <file>       Load a tokenised BASIC program.\n\r  BASICRUN               Run the loaded program.\n\r  BASICJIT [file]        Run with experimental native hot regions.\n\r  HELP                   Show this help.\n\r  QUIT                   Exit the runtime.";
+const HELP_TEXT: &[u8] = b"Acorn-2026 MOS commands:\n\r  Commands can be abbreviated with a final dot (for example, *CA.); *. is a shortcut for *CAT.\n\r  *CAT [dir]             Catalogue a directory.\n\r  *DIR [dir]             Select the current directory.\n\r  *CDIR <dir>            Create a directory.\n\r  *DELETE <file>         Delete a file.\n\r  *RENAME <old> <new>    Rename a file or directory.\n\r  *FILETYPE <file> <id>  Set a RISC OS file type.\n\r  *TYPE <file>           Display a text file.\n\r  *DISC [name]           Read or set the volume name.\n\r  *HOSTFS                Select the HostFS filing system.\n\r  DESKTOP                Start the hosted Wimp desktop.\n\r  RUN <file>             Run a BASIC source or tokenised file.\n\r  BASICLOAD <file>       Load a tokenised BASIC program.\n\r  BASICRUN               Run the loaded program.\n\r  BASICJIT [file]        Run with experimental native hot regions.\n\r  BASICJIT STRICT [file] Compile and run supported code without fallback.\n\r  HELP                   Show this help.\n\r  QUIT                   Exit the runtime.";
 
 fn hsv_to_rgb(hue: f64, saturation: f64, value: f64) -> (u8, u8, u8) {
     let hue = hue.rem_euclid(360.0) / 60.0;
@@ -1483,9 +1483,22 @@ impl SwiDispatcher {
             return Ok(());
         }
 
-        let mut words = command.splitn(2, char::is_whitespace);
-        let verb = words.next().unwrap_or_default();
-        let arguments = words.next().unwrap_or_default().trim();
+        let compact_fx = command
+            .get(..2)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("FX"))
+            && command
+                .as_bytes()
+                .get(2)
+                .is_some_and(|next| !next.is_ascii_whitespace());
+        let (verb, arguments) = if compact_fx {
+            (&command[..2], command[2..].trim())
+        } else {
+            let mut words = command.splitn(2, char::is_whitespace);
+            (
+                words.next().unwrap_or_default(),
+                words.next().unwrap_or_default().trim(),
+            )
+        };
 
         if cli_command_matches(verb, "HELP") && arguments.is_empty() {
             self.write_inline(task, HELP_TEXT)?;
@@ -1583,6 +1596,25 @@ impl SwiDispatcher {
             }
         } else if cli_command_matches(verb, "BASICJIT") {
             self.begin_display_batch();
+            let arguments = arguments.trim();
+            let (strict, arguments) = match arguments.split_once(char::is_whitespace) {
+                Some((first, rest)) if first.eq_ignore_ascii_case("STRICT") => (true, rest.trim()),
+                None if arguments.eq_ignore_ascii_case("STRICT") => (true, ""),
+                _ => (false, arguments),
+            };
+            let (benchmark_validation, arguments) = if strict {
+                match arguments.strip_prefix("--benchmark-validation") {
+                    Some(rest) if rest.is_empty() || rest.starts_with(char::is_whitespace) => {
+                        (true, rest.trim())
+                    }
+                    _ => (false, arguments),
+                }
+            } else {
+                (false, arguments)
+            };
+            let options = crate::basic_compat::StrictJitOptions {
+                benchmark_validation,
+            };
             let result = if arguments.is_empty() {
                 let Some(program) = task.loaded_tokenized_program.take() else {
                     self.finish_display_batch();
@@ -1592,23 +1624,48 @@ impl SwiDispatcher {
                     )?;
                     return self.write_new_line(task);
                 };
-                let result = crate::basic_compat::run_program_jit(&program, task, self);
+                let result = if strict {
+                    crate::basic_compat::run_program_jit_strict_with_options(
+                        &program, task, self, options,
+                    )
+                } else {
+                    crate::basic_compat::run_program_jit(&program, task, self)
+                };
                 task.loaded_tokenized_program = Some(program);
                 result
             } else {
                 let path = unquote_single_argument(arguments);
-                crate::basic64::run_guest_file_jit(path, task, self)
+                if strict {
+                    crate::basic64::run_guest_file_jit_strict(path, task, self, options)
+                } else {
+                    crate::basic64::run_guest_file_jit(path, task, self)
+                }
             };
             self.finish_display_batch();
             match result {
                 Ok(report) => {
-                    let fallback = report
-                        .fallback_reason
-                        .unwrap_or_else(|| "remaining statements used the interpreter".into());
-                    let summary = format!(
-                        "BASICJIT: {fallback} (compile {}).",
-                        format_elapsed(report.compile_time),
-                    );
+                    let summary = if report.strict_native {
+                        format!(
+                            "BASICJIT strict native: {} units, {} native calls, {} runtime helpers, {} interpreter statements, {} interpreter expressions (compile {}, run {}).",
+                            report.compiled_units.len(),
+                            report.compiled_calls,
+                            report.runtime_helper_calls,
+                            report.interpreted_statement_count,
+                            report.interpreted_expression_count,
+                            format_elapsed(report.compile_time),
+                            format_elapsed(report.compiled_time),
+                        )
+                    } else {
+                        let fallback = report
+                            .fallback_reason
+                            .unwrap_or_else(|| "remaining statements used the interpreter".into());
+                        format!(
+                            "BASICJIT: {fallback}; {} interpreted statements, {} expressions (compile {}).",
+                            report.interpreted_statement_count,
+                            report.interpreted_expression_count,
+                            format_elapsed(report.compile_time),
+                        )
+                    };
                     eprintln!("{summary}");
                     Ok(())
                 }
@@ -2044,5 +2101,61 @@ mod tests {
 
         dispatch_cli_line(&mut dispatcher, &mut task, "*D.").unwrap();
         assert!(!dispatcher.desktop_requested());
+    }
+
+    #[test]
+    fn clocksp5_compact_fx_reset_is_a_quiet_hosted_noop() {
+        let (_input_sender, input_receiver) = mpsc::channel();
+        let (display_sender, display_receiver) = mpsc::channel();
+        let mut dispatcher =
+            SwiDispatcher::windowed(HostConsole::windowed(input_receiver), display_sender);
+        let mut task = Task::new(1);
+
+        dispatch_cli_line(&mut dispatcher, &mut task, "*fx151,78,243").unwrap();
+        assert!(display_receiver.try_iter().next().is_none());
+    }
+
+    #[cfg(feature = "experimental-jit")]
+    #[test]
+    fn strict_basicjit_returns_to_cli_with_loaded_program_available() {
+        let (_input_sender, input_receiver) = mpsc::channel();
+        let (display_sender, display_receiver) = mpsc::channel();
+        let mut dispatcher =
+            SwiDispatcher::windowed(HostConsole::windowed(input_receiver), display_sender);
+        let mut task = Task::new(1);
+        task.loaded_tokenized_program = Some(crate::tokenized_basic::TokenizedBasicProgram {
+            lines: vec![
+                crate::tokenized_basic::TokenizedBasicLine {
+                    number: 10,
+                    bytes: vec![0xF1, b'"', b'S', b'T', b'R', b'I', b'C', b'T', b'"'],
+                    line_references: Vec::new(),
+                },
+                crate::tokenized_basic::TokenizedBasicLine {
+                    number: 20,
+                    bytes: vec![0xE0],
+                    line_references: Vec::new(),
+                },
+            ],
+            record_layout: None,
+        });
+
+        dispatch_cli_line(
+            &mut dispatcher,
+            &mut task,
+            "BASICJIT STRICT --benchmark-validation",
+        )
+        .unwrap();
+        assert!(task.loaded_tokenized_program.is_some());
+        let native_output = display_receiver
+            .try_iter()
+            .filter_map(|event| match event {
+                DisplayEvent::WriteByte { byte, .. } => Some(byte),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(native_output.windows(6).any(|bytes| bytes == b"STRICT"));
+        dispatch_cli_line(&mut dispatcher, &mut task, "HELP").unwrap();
+        dispatch_cli_line(&mut dispatcher, &mut task, "QUIT").unwrap();
+        assert!(dispatcher.quit_requested());
     }
 }

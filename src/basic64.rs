@@ -7,7 +7,7 @@
 use std::{fs, path::Path};
 
 use crate::{
-    basic_compat::{self, JitExecutionReport},
+    basic_compat::{self, JitExecutionReport, StrictJitOptions},
     error::RuntimeError,
     filesystem::{FILETYPE_BASIC, FileMetadata},
     memory::Task,
@@ -128,6 +128,28 @@ pub fn run_guest_file_jit(
             ))
         })?;
         run_source_jit(source, task, dispatcher)
+    }
+}
+
+pub fn run_guest_file_jit_strict(
+    path: &str,
+    task: &mut Task,
+    dispatcher: &mut SwiDispatcher,
+    options: StrictJitOptions,
+) -> Result<JitExecutionReport, RuntimeError> {
+    let (bytes, metadata) = dispatcher.read_guest_file(task, path)?;
+    if metadata.file_type & 0xFFF == FILETYPE_BASIC {
+        let program = TokenizedBasicProgram::decode(&bytes)
+            .map_err(|error| RuntimeError::Program(error.to_string()))?;
+        basic_compat::run_program_jit_strict_with_options(&program, task, dispatcher, options)
+    } else {
+        let source = std::str::from_utf8(&bytes).map_err(|error| {
+            RuntimeError::Program(format!(
+                "file type &{:03X} is not tokenized BASIC and the file is not UTF-8 text: {error}",
+                metadata.file_type & 0xFFF
+            ))
+        })?;
+        basic_compat::run_source_jit_strict_with_options(source, task, dispatcher, options)
     }
 }
 

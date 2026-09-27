@@ -141,6 +141,28 @@ BASICRUN
 
 It runs three workload passes, printing the benchmark sections and comparison each time, then returns to `*`. In this hosted profile, `TIME` is monotonic centiseconds and `INKEY` reads queued host keys; with no key pending, bare `INKEY` returns -256 and `INKEY(0)` returns -1. ClockSP5 follows its guarded path when no key is pending, skipping native ARM and hardware setup. Its final hardware reset command is accepted as a no-op. The displayed MHz figures compare this hosted BASIC interpreter's performance against the program's BBC B reference data; they do not measure the host processor's physical clock speed.
 
+## Run ClockSP5 through strict native code
+
+From the repository root, start the Cranelift-enabled runtime:
+
+```sh
+cargo run-jit
+```
+
+At the MOS prompt, run either checked-in form with benchmark validation:
+
+```text
+BASICJIT STRICT --benchmark-validation examples/clocksp5/ClockSP5.bas
+BASICJIT STRICT --benchmark-validation examples/clocksp5/ClockSP5.bbc
+```
+
+Strict mode compiles the whole program before execution and reports zero
+interpreter statement and expression counts. Benchmark-validation mode keeps
+ClockSP5's measured loops and empty procedure calls. The hosted MHz figures are
+the program's comparison against its BBC B reference data; they are not a
+physical host clock reading or a strict-JIT speedup claim. See the
+[`ClockSP5 run plan`](docs/clocksp5-run-plan.md) for coverage and limits.
+
 ## Try the experimental hybrid JIT
 
 From the repository root, start the optimized UI with Cranelift support:

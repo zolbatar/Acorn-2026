@@ -382,12 +382,7 @@ fn split_source_line_number(line: &str, fallback: u16) -> Result<(u16, &str), Ru
         .bytes()
         .take_while(u8::is_ascii_digit)
         .count();
-    if digits == 0
-        || !leading_trimmed
-            .as_bytes()
-            .get(digits)
-            .is_none_or(u8::is_ascii_whitespace)
-    {
+    if digits == 0 || leading_trimmed.as_bytes().get(digits) == Some(&b'.') {
         return Ok((fallback, leading_trimmed));
     }
     let number = leading_trimmed[..digits]
@@ -649,6 +644,7 @@ struct Lexer<'a> {
     offset: usize,
     line_number: u16,
     mode: LexMode,
+    previous: Option<Token>,
 }
 
 impl<'a> Lexer<'a> {
@@ -658,6 +654,7 @@ impl<'a> Lexer<'a> {
             offset: 0,
             line_number,
             mode,
+            previous: None,
         }
     }
 
@@ -669,6 +666,7 @@ impl<'a> Lexer<'a> {
                 tokens.push(token);
                 return Ok(tokens);
             }
+            self.previous = Some(token.clone());
             tokens.push(token);
         }
     }
@@ -811,7 +809,22 @@ impl<'a> Lexer<'a> {
             if value == "SYS" {
                 return Ok(Token::Sys);
             }
+            // BBC BASIC source routinely places keywords directly beside their
+            // following argument (`FORI%=...`, `PROCs`, `REPEATUNTIL...`). The
+            // tokenised form makes those boundaries explicit; recover them in
+            // source mode by consuming the longest reserved word prefix.
             if let Some(keyword) = source_keyword(&value) {
+                if keyword == TOKEN_REM {
+                    self.offset = self.bytes.len();
+                }
+                return Ok(Token::Keyword(keyword));
+            }
+            if let Some((spelling, keyword)) =
+                source_keyword_prefix(&value).filter(|(_, keyword)| {
+                    source_keyword_prefix_is_valid(*keyword, self.previous.as_ref())
+                })
+            {
+                self.offset = start + spelling.len();
                 if keyword == TOKEN_REM {
                     self.offset = self.bytes.len();
                 }
@@ -895,6 +908,190 @@ fn source_keyword(name: &str) -> Option<u8> {
         "LET" => TOKEN_LET,
         _ => return None,
     })
+}
+
+fn source_keyword_prefix(name: &str) -> Option<(&'static str, u8)> {
+    const KEYWORDS: &[&str] = &[
+        "ENDPROC", "STRING$", "RESTORE", "REPEAT", "RETURN", "INSTR", "RIGHT$", "COLOUR", "ENDIF",
+        "GOSUB", "INPUT", "LOMEM", "HIMEM", "CHR$", "COLOR", "LEFT$", "MID$", "PRINT", "READ",
+        "UNTIL", "GOTO", "MODE", "NEXT", "PROC", "PLOT", "CALL", "DRAW", "DATA", "DEF", "DIM",
+        "ELSE", "FOR", "GCOL", "IF", "LET", "LINE", "MOVE", "REM", "TAB", "THEN", "VDU", "ABS",
+        "AND", "ASC", "CLG", "CLS", "COS", "DIV", "END", "FN", "INT", "INKEY", "LEN", "LN", "LOG",
+        "MOD", "NOT", "OR", "PAGE", "PTR", "RND", "SIN", "SPC", "SQR", "STEP", "TAN", "TIME", "TO",
+        "VAL", "STR$",
+    ];
+    KEYWORDS
+        .iter()
+        .copied()
+        .filter(|keyword| name.starts_with(keyword))
+        .max_by_key(|keyword| keyword.len())
+        .and_then(|spelling| source_keyword(spelling).map(|token| (spelling, token)))
+}
+
+fn source_keyword_prefix_is_valid(keyword: u8, previous: Option<&Token>) -> bool {
+    let statement_boundary = previous.is_none_or(|previous| {
+        matches!(
+            previous,
+            Token::Symbol(b':')
+                | Token::Keyword(TOKEN_THEN | TOKEN_ELSE | TOKEN_REPEAT | TOKEN_DEF)
+        )
+    });
+    if is_statement_keyword(keyword) || is_binary_keyword(keyword) {
+        return statement_boundary || previous.is_some_and(token_ends_expression);
+    }
+
+    let starts_definition =
+        previous == Some(&Token::Keyword(TOKEN_DEF)) && matches!(keyword, TOKEN_PROC | TOKEN_FN);
+    let follows_print_separator = keyword == TOKEN_ELSE && previous == Some(&Token::Symbol(b';'));
+    let adjacent_print_control = matches!(keyword, TOKEN_SPC | TOKEN_TAB)
+        && (previous.is_some_and(token_ends_expression)
+            || matches!(previous, Some(Token::Symbol(b'\''))));
+    starts_definition
+        || follows_print_separator
+        || adjacent_print_control
+        || (is_expression_keyword(keyword) && previous.is_some_and(token_expects_expression))
+}
+
+fn is_binary_keyword(keyword: u8) -> bool {
+    matches!(
+        keyword,
+        TOKEN_AND | TOKEN_DIV | TOKEN_MOD | TOKEN_OR | TOKEN_STEP | TOKEN_TO
+    )
+}
+
+fn is_statement_keyword(keyword: u8) -> bool {
+    matches!(
+        keyword,
+        TOKEN_CALL
+            | TOKEN_CLS
+            | TOKEN_CLG
+            | TOKEN_COLOUR
+            | TOKEN_DATA
+            | TOKEN_DEF
+            | TOKEN_DIM
+            | TOKEN_DRAW
+            | TOKEN_END
+            | TOKEN_ENDIF
+            | TOKEN_ENDPROC
+            | TOKEN_FOR
+            | TOKEN_GCOL
+            | TOKEN_GOSUB
+            | TOKEN_GOTO
+            | TOKEN_IF
+            | TOKEN_INPUT
+            | TOKEN_LET
+            | TOKEN_LINE
+            | TOKEN_MODE
+            | TOKEN_MOVE
+            | TOKEN_NEXT
+            | TOKEN_PLOT
+            | TOKEN_PRINT
+            | TOKEN_PROC
+            | TOKEN_READ
+            | TOKEN_REM
+            | TOKEN_REPEAT
+            | TOKEN_RESTORE
+            | TOKEN_RETURN
+            | TOKEN_ELSE
+            | TOKEN_THEN
+            | TOKEN_UNTIL
+            | TOKEN_VDU
+    )
+}
+
+fn is_expression_keyword(keyword: u8) -> bool {
+    matches!(
+        keyword,
+        TOKEN_ABS
+            | TOKEN_AND
+            | TOKEN_ASC
+            | TOKEN_CHR
+            | TOKEN_COS
+            | TOKEN_DIV
+            | TOKEN_FN
+            | TOKEN_HIMEM
+            | TOKEN_INKEY
+            | TOKEN_INSTR
+            | TOKEN_INT
+            | TOKEN_LEN
+            | TOKEN_LEFT
+            | TOKEN_LN
+            | TOKEN_LOMEM
+            | TOKEN_LOG
+            | TOKEN_MID
+            | TOKEN_MOD
+            | TOKEN_NOT
+            | TOKEN_OR
+            | TOKEN_PAGE
+            | TOKEN_PTR
+            | TOKEN_RIGHT
+            | TOKEN_RND
+            | TOKEN_SIN
+            | TOKEN_SPC
+            | TOKEN_SQR
+            | TOKEN_STEP
+            | TOKEN_STR
+            | TOKEN_STRING
+            | TOKEN_TAB
+            | TOKEN_TAN
+            | TOKEN_THEN
+            | TOKEN_TIME
+            | TOKEN_TO
+            | TOKEN_VAL
+    )
+}
+
+fn token_ends_expression(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::Number(_)
+            | Token::String(_)
+            | Token::Identifier(_)
+            | Token::LineReference(_)
+            | Token::Symbol(b')')
+            | Token::Keyword(
+                TOKEN_INKEY | TOKEN_LOMEM | TOKEN_HIMEM | TOKEN_PAGE | TOKEN_PTR | TOKEN_TIME
+            )
+    )
+}
+
+fn token_expects_expression(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::Symbol(
+            b'=' | b'+' | b'-' | b'*' | b'/' | b'^' | b'<' | b'>' | b'(' | b',' | b'!' | b'?'
+        ) | Token::Keyword(
+            TOKEN_ABS
+                | TOKEN_AND
+                | TOKEN_ASC
+                | TOKEN_COS
+                | TOKEN_DIV
+                | TOKEN_FN
+                | TOKEN_IF
+                | TOKEN_INSTR
+                | TOKEN_INT
+                | TOKEN_LEN
+                | TOKEN_LEFT
+                | TOKEN_LN
+                | TOKEN_LOG
+                | TOKEN_MID
+                | TOKEN_MOD
+                | TOKEN_NOT
+                | TOKEN_OR
+                | TOKEN_PRINT
+                | TOKEN_RIGHT
+                | TOKEN_SIN
+                | TOKEN_SPC
+                | TOKEN_SQR
+                | TOKEN_STR
+                | TOKEN_STRING
+                | TOKEN_TAB
+                | TOKEN_TAN
+                | TOKEN_THEN
+                | TOKEN_TO
+                | TOKEN_UNTIL
+        )
+    )
 }
 
 struct Parser {
@@ -1494,16 +1691,13 @@ impl Parser {
     }
 
     fn parse_call_arguments(&mut self) -> Result<Vec<Expr>, RuntimeError> {
-        let mut arguments = Vec::new();
-        if self.consume_symbol(b')') {
-            return Ok(arguments);
+        // In ARM BASIC source, the opening parenthesis is ordinary text. In
+        // tokenized BASIC the string-function token carries that delimiter,
+        // while the closing parenthesis remains in the token stream.
+        if self.source_mode {
+            self.expect_symbol(b'(')?;
         }
-        arguments.push(self.parse_expression(0)?);
-        while self.consume_symbol(b',') {
-            arguments.push(self.parse_expression(0)?);
-        }
-        self.expect_symbol(b')')?;
-        Ok(arguments)
+        self.parse_call_arguments_after_open()
     }
 
     fn parse_call_arguments_after_open(&mut self) -> Result<Vec<Expr>, RuntimeError> {
@@ -1656,11 +1850,11 @@ impl Parser {
 
 fn pseudo_variable_for_assignment(token: u8) -> Option<&'static str> {
     match token {
-        0xCF => Some("PTR"),
-        0xD0 => Some("PAGE"),
+        0xCF | TOKEN_PTR => Some("PTR"),
+        0xD0 | TOKEN_PAGE => Some("PAGE"),
         TOKEN_TIME | 0xD1 => Some("TIME"),
-        0xD2 => Some("LOMEM"),
-        0xD3 => Some("HIMEM"),
+        0xD2 | TOKEN_LOMEM => Some("LOMEM"),
+        0xD3 | TOKEN_HIMEM => Some("HIMEM"),
         _ => None,
     }
 }
@@ -1671,8 +1865,36 @@ fn syntax_error(line_number: u16, message: &str) -> RuntimeError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Statement, TokenProfile, parse_program};
+    use super::{Statement, TokenProfile, parse_program, parse_source};
     use crate::tokenized_basic::TokenizedBasicProgram;
+
+    #[test]
+    fn parses_dense_clocksp5_source_without_splitting_keyword_prefixed_names() {
+        let clock = parse_source(include_str!("../../examples/clocksp5/ClockSP5.bas"))
+            .expect("dense ClockSP5 source should parse");
+        assert!(clock.procedures.contains_key("T"));
+        assert!(clock.procedures.contains_key("S"));
+        assert!(clock.functions.contains_key("B"));
+
+        let tokenized =
+            TokenizedBasicProgram::decode(include_bytes!("../../examples/clocksp5/ClockSP5.bbc"))
+                .expect("ClockSP5 tokenized fixture should decode");
+        let tokenized = parse_program(&tokenized, TokenProfile::ArmBasicV)
+            .expect("ClockSP5 tokenized fixture should parse");
+        assert_eq!(clock.instructions.len(), tokenized.instructions.len());
+        for (source, tokenized) in clock.instructions.iter().zip(&tokenized.instructions) {
+            assert_eq!(source.line_number, tokenized.line_number);
+            assert_eq!(
+                format!("{:?}", source.statement),
+                format!("{:?}", tokenized.statement),
+                "statement mismatch at BASIC line {}",
+                source.line_number
+            );
+        }
+
+        parse_source(include_str!("../../examples/wimp/two-windows/alpha.bas64"))
+            .expect("BASIC64 identifiers such as definition% should remain intact");
+    }
 
     #[test]
     fn parses_clocksp5_tokenized_program() {
