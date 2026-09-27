@@ -10,4 +10,5 @@ pub mod renderer;
 pub mod runtime;
 pub mod swi;
 pub mod tokenized_basic;
+pub mod wimp;
 pub mod window;

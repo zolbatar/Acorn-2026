@@ -11,6 +11,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+use std::sync::Arc;
+
+use crate::wimp::{
+    WIMP_CLOSE_DOWN, WIMP_CLOSE_WINDOW, WIMP_CREATE_WINDOW, WIMP_GET_WINDOW_STATE, WIMP_INITIALISE,
+    WIMP_OPEN_WINDOW, WIMP_POLL, WimpServer,
+};
+
 const DISPLAY_BATCH_FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
 const INKEY_POLL_INTERVAL: Duration = Duration::from_millis(8);
 const MAX_EXTENDED_MODE_PIXELS: u64 = 4_194_304;
@@ -30,12 +37,30 @@ pub const OS_FIND: u32 = 0x0D;
 pub const OS_READ_LINE: u32 = 0x0E;
 pub const OS_FSCONTROL: u32 = 0x29;
 pub const OS_PLOT: u32 = 0x45;
+pub use crate::wimp::{
+    WIMP_CLOSE_DOWN as WIMP_CLOSE_DOWN_SWI, WIMP_CLOSE_WINDOW as WIMP_CLOSE_WINDOW_SWI,
+    WIMP_CREATE_WINDOW as WIMP_CREATE_WINDOW_SWI,
+    WIMP_GET_WINDOW_STATE as WIMP_GET_WINDOW_STATE_SWI, WIMP_INITIALISE as WIMP_INITIALISE_SWI,
+    WIMP_OPEN_WINDOW as WIMP_OPEN_WINDOW_SWI, WIMP_POLL as WIMP_POLL_SWI,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DisplayEvent {
-    WriteByte(u8),
-    Plot { code: u8, x: i32, y: i32 },
-    GraphicsSnapshot(GraphicsSnapshot),
+    WriteByte {
+        task_id: u64,
+        byte: u8,
+    },
+    Plot {
+        task_id: u64,
+        code: u8,
+        x: i32,
+        y: i32,
+    },
+    GraphicsSnapshot {
+        task_id: u64,
+        snapshot: GraphicsSnapshot,
+    },
+    DesktopChanged,
     RuntimeExited,
 }
 
@@ -89,6 +114,8 @@ pub struct SwiDispatcher {
     file_system: HostFileSystem,
     quit_requested: bool,
     display_events: Option<Sender<DisplayEvent>>,
+    display_task_id: u64,
+    wimp: Option<Arc<WimpServer>>,
     display_batch_active: bool,
     last_display_batch_publish: Option<Instant>,
     last_inkey_poll: Instant,
@@ -96,16 +123,27 @@ pub struct SwiDispatcher {
 
 impl SwiDispatcher {
     pub fn new(console: HostConsole) -> Self {
-        Self::with_display_events(console, None)
+        Self::with_display_events(console, None, 1, None)
     }
 
     pub fn windowed(console: HostConsole, display_events: Sender<DisplayEvent>) -> Self {
-        Self::with_display_events(console, Some(display_events))
+        Self::with_display_events(console, Some(display_events), 1, None)
+    }
+
+    pub(crate) fn desktop_task(
+        console: HostConsole,
+        display_events: Sender<DisplayEvent>,
+        task_id: u64,
+        wimp: Arc<WimpServer>,
+    ) -> Self {
+        Self::with_display_events(console, Some(display_events), task_id, Some(wimp))
     }
 
     fn with_display_events(
         console: HostConsole,
         display_events: Option<Sender<DisplayEvent>>,
+        display_task_id: u64,
+        wimp: Option<Arc<WimpServer>>,
     ) -> Self {
         Self {
             console,
@@ -113,6 +151,8 @@ impl SwiDispatcher {
             file_system: HostFileSystem::demo_default(),
             quit_requested: false,
             display_events,
+            display_task_id,
+            wimp,
             display_batch_active: false,
             last_display_batch_publish: None,
             last_inkey_poll: Instant::now(),
@@ -135,7 +175,7 @@ impl SwiDispatcher {
         self.graphics.set_profile(profile)?;
         let snapshot = self.graphics.snapshot().clone();
         if snapshot != previous {
-            self.publish_display_event(DisplayEvent::GraphicsSnapshot(snapshot));
+            self.publish_snapshot(snapshot);
         }
         Ok(())
     }
@@ -228,6 +268,13 @@ impl SwiDispatcher {
                 Ok(())
             }
             "COLOURTRANS_WRITEPALETTE" => Ok(()),
+            "WIMP_INITIALISE" => self.dispatch_wimp(WIMP_INITIALISE, task, context),
+            "WIMP_CREATEWINDOW" => self.dispatch_wimp(WIMP_CREATE_WINDOW, task, context),
+            "WIMP_OPENWINDOW" => self.dispatch_wimp(WIMP_OPEN_WINDOW, task, context),
+            "WIMP_CLOSEWINDOW" => self.dispatch_wimp(WIMP_CLOSE_WINDOW, task, context),
+            "WIMP_POLL" => self.dispatch_wimp(WIMP_POLL, task, context),
+            "WIMP_GETWINDOWSTATE" => self.dispatch_wimp(WIMP_GET_WINDOW_STATE, task, context),
+            "WIMP_CLOSEDOWN" => self.dispatch_wimp(WIMP_CLOSE_DOWN, task, context),
             _ => Err(RuntimeError::Program(format!(
                 "named SWI {name} is not available in the hosted profile"
             ))),
@@ -240,6 +287,18 @@ impl SwiDispatcher {
         task: &mut Task,
         context: &mut SwiContext,
     ) -> Result<(), RuntimeError> {
+        if matches!(
+            number,
+            WIMP_INITIALISE
+                | WIMP_CREATE_WINDOW
+                | WIMP_OPEN_WINDOW
+                | WIMP_CLOSE_WINDOW
+                | WIMP_POLL
+                | WIMP_GET_WINDOW_STATE
+                | WIMP_CLOSE_DOWN
+        ) {
+            return self.dispatch_wimp(number, task, context);
+        }
         match number {
             OS_WRITE_C => {
                 let character = context.registers[R0] as u8;
@@ -247,11 +306,12 @@ impl SwiDispatcher {
                 let output_byte = self.graphics.write_byte(character)?;
                 let mode_changed = self.graphics.snapshot().mode != previous_mode;
                 if mode_changed {
-                    self.publish_display_event(DisplayEvent::GraphicsSnapshot(
-                        self.graphics.snapshot().clone(),
-                    ));
+                    self.publish_snapshot(self.graphics.snapshot().clone());
                 } else if !self.display_batch_active || output_byte.is_some() {
-                    self.publish_display_event(DisplayEvent::WriteByte(character));
+                    self.publish_display_event(DisplayEvent::WriteByte {
+                        task_id: self.display_task_id,
+                        byte: character,
+                    });
                 }
                 if let Some(byte) = output_byte {
                     self.console.write_byte(byte)?;
@@ -282,12 +342,36 @@ impl SwiDispatcher {
                 if self.display_batch_active {
                     self.publish_display_batch_snapshot_if_due();
                 } else {
-                    self.publish_display_event(DisplayEvent::Plot { code, x, y });
+                    self.publish_display_event(DisplayEvent::Plot {
+                        task_id: self.display_task_id,
+                        code,
+                        x,
+                        y,
+                    });
                 }
                 Ok(())
             }
             other => Err(RuntimeError::InvalidSwi(other)),
         }
+    }
+
+    fn dispatch_wimp(
+        &mut self,
+        number: u32,
+        task: &mut Task,
+        context: &mut SwiContext,
+    ) -> Result<(), RuntimeError> {
+        let Some(wimp) = &self.wimp else {
+            return Err(RuntimeError::InvalidSwi(number));
+        };
+        wimp.dispatch(number, task, context)
+    }
+
+    fn publish_snapshot(&self, snapshot: GraphicsSnapshot) {
+        self.publish_display_event(DisplayEvent::GraphicsSnapshot {
+            task_id: self.display_task_id,
+            snapshot,
+        });
     }
 
     pub(crate) fn read_guest_file(
@@ -1145,9 +1229,7 @@ impl SwiDispatcher {
         self.display_batch_active = false;
         self.last_display_batch_publish = None;
         if self.display_events.is_some() {
-            self.publish_display_event(DisplayEvent::GraphicsSnapshot(
-                self.graphics.snapshot().clone(),
-            ));
+            self.publish_snapshot(self.graphics.snapshot().clone());
         }
     }
 
@@ -1161,7 +1243,7 @@ impl SwiDispatcher {
         }
 
         let snapshot = self.graphics.snapshot().clone();
-        self.publish_display_event(DisplayEvent::GraphicsSnapshot(snapshot));
+        self.publish_snapshot(snapshot);
         self.last_display_batch_publish = Some(Instant::now());
     }
 
@@ -1646,6 +1728,14 @@ impl SwiDispatcher {
 
     fn write_new_line(&mut self, task: &mut Task) -> Result<(), RuntimeError> {
         self.dispatch(OS_NEW_LINE, task, &mut SwiContext::default())
+    }
+}
+
+impl Drop for SwiDispatcher {
+    fn drop(&mut self) {
+        if let Some(wimp) = &self.wimp {
+            wimp.task_exited(self.display_task_id);
+        }
     }
 }
 

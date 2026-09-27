@@ -8,7 +8,7 @@ This project was also inspired by [pmirvine/risc-os](https://github.com/pmirvine
 
 ## Project status
 
-The hosted Rust MOS prompt is available in one graphics-capable window: `HELP` displays help and returns to `*`, and `QUIT` exits. The initial display renders MOS/BASIC text and plotted points/lines together using the supplied BBC Micro bitmap font. The tokenised [`text-and-pixels` demo](examples/graphics) prints and plots on the same screen. UTF-8 `.bas64` and `.bas` source and decoded `.bbc` programs now use one parser output and compatibility execution engine; the optional Cranelift JIT consumes the same representation. `REM @BASIC64 MODE=HYBRID TARGET=AGON` selects the Agon graphics mode table at runtime. `BASICLOAD` accepts two observed tokenized saved-program record layouts and preserves their token bytes. `BASICRUN` supports the string echo fixture, a narrow shared-boundary legacy core, ClockSP5 program version 5.08, and the source-derived full Mandelbrot listing through its selected 32-bit extended mode and `ColourTrans` path. These fixtures exercise specific compatibility slices; they do not establish broad BBC BASIC V/VI compatibility or full Agon VDP emulation. See the [tokenized BASIC compatibility matrix](docs/tokenized-basic-compatibility.md) for evidence and gaps.
+The hosted Rust MOS prompt is available in one graphics-capable window: `HELP` displays help and returns to `*`, and `QUIT` exits. The initial display renders MOS/BASIC text and plotted points/lines together using the supplied BBC Micro bitmap font. The tokenised [`text-and-pixels` demo](examples/graphics) prints and plots on the same screen. `cargo run -- --desktop-demo` starts two editable BASIC guest tasks, each with a responsive Wimp-style window in the same host surface. The programs are loaded from [`examples/wimp/two-windows`](examples/wimp/two-windows) at launch. This is a documented first Wimp subset, not a complete RISC OS desktop or redraw implementation; see the design brief for contract and scheduling limits. UTF-8 `.bas64` and `.bas` source and decoded `.bbc` programs now use one parser output and compatibility execution engine; the optional Cranelift JIT consumes the same representation. `REM @BASIC64 MODE=HYBRID TARGET=AGON` selects the Agon graphics mode table at runtime. `BASICLOAD` accepts two observed tokenized saved-program record layouts and preserves their token bytes. `BASICRUN` supports the string echo fixture, a narrow shared-boundary legacy core, ClockSP5 program version 5.08, and the source-derived full Mandelbrot listing through its selected 32-bit extended mode and `ColourTrans` path. These fixtures exercise specific compatibility slices; they do not establish broad BBC BASIC V/VI compatibility or full Agon VDP emulation. See the [tokenized BASIC compatibility matrix](docs/tokenized-basic-compatibility.md) for evidence and gaps.
 
 ## Start here
 
@@ -45,6 +45,14 @@ The app opens one window and displays the `*` prompt. Enter `HELP` to list the b
 Use **Command+V** on macOS to paste clipboard text into the window (Control+V on other hosts). Pasted line breaks act like pressing Enter, so multiple pasted command lines run in sequence. Printable ASCII is sent to the guest input path; tabs become spaces and unsupported characters are skipped.
 
 To keep using the terminal frontend, run `cargo run -- --stdio`.
+
+To run the two-task desktop demo, use:
+
+```sh
+cargo run -- --desktop-demo
+```
+
+The host reads `alpha.bas64` and `beta.bas64` from the example directory each time it starts, so you can edit either BASIC program and relaunch without rebuilding Rust. Each task calls the documented Wimp SWI names with 32-bit guest addresses and handles its own `Wimp_Poll` events; the hosted runtime currently runs the two tasks on separate host threads.
 
 To see text and plotted pixels together, enter:
 

@@ -364,7 +364,13 @@ Build the BASIC64 interpreter and compatibility execution around one internal pr
 
 Load BASIC64 modules through the shared namespace. Establish messaging, windows, input, the Filer, file-type registration, and inspectable application directories. Put higher-level policy in BASIC64.
 
-**Exit:** a BASIC64 desktop component can be inspected, modified, loaded, and communicate with an application through published services.
+The first desktop vertical slice is a pair of separately executing BASIC guest tasks with windows in one hosted desktop surface and one shared Wimp service. The service owns globally unique task/window handles, stacking, and input routing; each caller's handles and guest-memory pointers remain task-scoped. It implements the standard numeric/name SWI entries and register/block shapes for `Wimp_Initialise`, `Wimp_CreateWindow`, `Wimp_OpenWindow`, `Wimp_CloseWindow`, `Wimp_Poll`, `Wimp_GetWindowState`, and `Wimp_CloseDown` against the RISC OS Programmer's Reference Manual ([Wimp chapter](https://www.riscos.com/support/developers/prm/wimp.html)). The supported window definition is intentionally narrow: zero icons, direct plain text titles, bounded on-screen geometry, no poll-word flags, and work-area button types 0 and 3. Resize uses the standard Adjust Size icon and an `Open_Window_Request`/`Wimp_OpenWindow` round trip; scrollbars are rendered but do not yet scroll content. The host currently assigns keyboard focus when a window is clicked as a demo convenience; RISC OS caret and writable-icon services are not implemented.
+
+This milestone does not claim full Wimp compatibility. It does not implement redraw events or `Wimp_RedrawWindow`/`Wimp_GetRectangle`; the guest-visible text/graphics in the demo are a renderer adapter that uses each task's existing display snapshot as window content. Other unimplemented areas include icons, indirect/sprite titles, menus, caret services, poll-word waiting, scrollbar behavior, and the remaining mouse button types. Consult the PRM for the full standard contracts; unsupported forms are rejected rather than assigned a new meaning. The BASIC demo sources are loaded from `examples/wimp/two-windows` at launch and may be edited without rebuilding the Rust host.
+
+The hosted tasks currently execute on separate OS threads and can run simultaneously. `Wimp_Poll` blocks or yields only its calling thread; it is not yet a cooperative scheduler and does not reproduce RISC OS task scheduling. This is an explicit hosted execution deviation while task contexts and service ownership remain separate.
+
+**Exit:** a BASIC64 desktop component can be inspected, modified, loaded, and communicate with an application through published services. The two-task Wimp demo is an early runnable milestone toward this exit, not completion of the desktop phase.
 
 ### Phase 4 — Graphics and typography
 

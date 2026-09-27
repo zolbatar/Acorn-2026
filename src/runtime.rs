@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 
 use crate::{
@@ -6,6 +7,7 @@ use crate::{
     host::HostConsole,
     memory::{GUEST_MEMORY_BASE, Task},
     swi::{DisplayEvent, OS_CLI, OS_READ_LINE, OS_WRITE_C, SwiContext, SwiDispatcher},
+    wimp::WimpServer,
 };
 
 const TASK_ID: u64 = 1;
@@ -27,6 +29,29 @@ impl Runtime {
             task: Task::new(TASK_ID),
             dispatcher: SwiDispatcher::windowed(HostConsole::windowed(input), display_events),
         }
+    }
+
+    /// Construct an independent BASIC task attached to the shared hosted Wimp.
+    pub fn desktop_task(
+        task_id: u64,
+        input: Receiver<u8>,
+        display_events: Sender<DisplayEvent>,
+        wimp: Arc<WimpServer>,
+    ) -> Self {
+        Self {
+            task: Task::new(task_id),
+            dispatcher: SwiDispatcher::desktop_task(
+                HostConsole::windowed(input),
+                display_events,
+                task_id,
+                wimp,
+            ),
+        }
+    }
+
+    /// Run one editable BASIC source program as this task.
+    pub fn run_application(&mut self, source: &str) -> Result<(), RuntimeError> {
+        crate::basic64::run_source(source, &mut self.task, &mut self.dispatcher)
     }
 
     pub fn new(console: HostConsole) -> Self {

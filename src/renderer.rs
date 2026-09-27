@@ -3,7 +3,9 @@
 use crate::{
     font::bbc_micro_glyph,
     graphics::{GraphicsPrimitive, GraphicsSnapshot, GraphicsWindow, Point, graphics_colour},
+    wimp::{DESKTOP_HEIGHT, DESKTOP_WIDTH, DesktopWindow, WorkArea},
 };
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const SCREEN_WIDTH: u32 = 640;
@@ -72,6 +74,341 @@ pub fn render(snapshot: &GraphicsSnapshot, frame: &mut [u8]) {
 
     draw_text(snapshot, frame, width, height);
     draw_cursor(snapshot, frame, width, height);
+}
+
+/// Render the hosted two-task Wimp desktop. Application contents use the
+/// first-slice task-output adapter documented in the design brief; the window
+/// manager still owns all frame, stacking and input routing.
+pub fn render_desktop(
+    windows: &[DesktopWindow],
+    scenes: &HashMap<u64, GraphicsSnapshot>,
+    frame: &mut [u8],
+) {
+    let width = DESKTOP_WIDTH;
+    let height = DESKTOP_HEIGHT;
+    let bytes = width as usize * height as usize * BYTES_PER_PIXEL;
+    if frame.len() < bytes {
+        return;
+    }
+    for pixel in frame[..bytes].chunks_exact_mut(BYTES_PER_PIXEL) {
+        pixel.copy_from_slice(&[35, 42, 54, 255]);
+    }
+
+    // `windows` is front-to-back; paint from the back towards the front.
+    for window in windows.iter().rev() {
+        draw_guest_window(window, scenes.get(&window.owner_task_id), frame);
+    }
+}
+
+fn draw_guest_window(window: &DesktopWindow, scene: Option<&GraphicsSnapshot>, frame: &mut [u8]) {
+    let width = DESKTOP_WIDTH;
+    let height = DESKTOP_HEIGHT;
+    let area = window.work_area;
+    let left = area.min_x;
+    let right = area.max_x + if window.has_vertical_scrollbar { 14 } else { 0 };
+    let top = i32::try_from(height).unwrap_or(i32::MAX)
+        - area.max_y
+        - if window.has_title { 24 } else { 0 };
+    let work_bottom = i32::try_from(height).unwrap_or(i32::MAX) - area.min_y;
+    let bottom = work_bottom + if window.resizable { 14 } else { 0 };
+    let border = if window.focused {
+        [115, 178, 235, 255]
+    } else {
+        [115, 124, 139, 255]
+    };
+    fill_rect(frame, width, height, left, top, right, bottom, border);
+
+    let content_left = left + 2;
+    let content_right = area.max_x - 2;
+    let content_top = i32::try_from(height).unwrap_or(i32::MAX) - area.max_y + 2;
+    let content_bottom = i32::try_from(height).unwrap_or(i32::MAX) - area.min_y - 2;
+    fill_rect(
+        frame,
+        width,
+        height,
+        content_left,
+        content_top,
+        content_right,
+        content_bottom,
+        [245, 246, 248, 255],
+    );
+
+    if let Some(snapshot) = scene {
+        draw_task_scene(
+            snapshot,
+            frame,
+            content_left + 1,
+            content_top + 1,
+            content_right - 1,
+            content_bottom - 1,
+        );
+    }
+
+    if window.has_title {
+        let title_color = if window.focused {
+            [45, 102, 157, 255]
+        } else {
+            [76, 85, 99, 255]
+        };
+        fill_rect(
+            frame,
+            width,
+            height,
+            left + 1,
+            top + 1,
+            right - 1,
+            top + 23,
+            title_color,
+        );
+        draw_small_text_clipped(
+            frame,
+            width,
+            height,
+            left + 8,
+            top + 8,
+            &window.title,
+            [255, 255, 255, 255],
+            left + 4,
+            right - if window.closable { 24 } else { 4 },
+            top + 2,
+            top + 22,
+        );
+        if window.closable {
+            let close_x = right - 20;
+            fill_rect(
+                frame,
+                width,
+                height,
+                close_x,
+                top + 3,
+                right - 3,
+                top + 20,
+                [217, 224, 232, 255],
+            );
+            draw_line(
+                frame,
+                width,
+                height,
+                (close_x + 6, top + 7),
+                (right - 9, top + 16),
+                [62, 69, 78, 255],
+            );
+            draw_line(
+                frame,
+                width,
+                height,
+                (close_x + 6, top + 16),
+                (right - 9, top + 7),
+                [62, 69, 78, 255],
+            );
+        }
+    }
+
+    if window.has_vertical_scrollbar {
+        let scroll_left = area.max_x;
+        let scroll_right = right;
+        let scroll_top = i32::try_from(height).unwrap_or(i32::MAX) - area.max_y;
+        fill_rect(
+            frame,
+            width,
+            height,
+            scroll_left,
+            scroll_top,
+            scroll_right,
+            work_bottom,
+            [206, 211, 219, 255],
+        );
+        fill_rect(
+            frame,
+            width,
+            height,
+            scroll_left + 3,
+            scroll_top + 14,
+            scroll_right - 3,
+            work_bottom - if window.resizable { 14 } else { 0 },
+            [229, 232, 237, 255],
+        );
+        let center_x = (scroll_left + scroll_right) / 2;
+        draw_line(
+            frame,
+            width,
+            height,
+            (center_x - 3, scroll_top + 7),
+            (center_x, scroll_top + 4),
+            [80, 89, 101, 255],
+        );
+        draw_line(
+            frame,
+            width,
+            height,
+            (center_x, scroll_top + 4),
+            (center_x + 3, scroll_top + 7),
+            [80, 89, 101, 255],
+        );
+        if window.resizable {
+            fill_rect(
+                frame,
+                width,
+                height,
+                scroll_left,
+                work_bottom,
+                scroll_right,
+                bottom,
+                [184, 191, 201, 255],
+            );
+        }
+    }
+
+    if window.resizable {
+        let grip_x = area.max_x + 4;
+        let grip_y = work_bottom + 4;
+        for offset in [0, 4, 8] {
+            draw_line(
+                frame,
+                width,
+                height,
+                (grip_x + offset, grip_y),
+                (right - 3, grip_y + offset),
+                [100, 108, 120, 255],
+            );
+        }
+    }
+
+    if let Some(preview) = window.preview_area {
+        draw_preview_outline(frame, window, preview);
+    }
+}
+
+fn draw_task_scene(
+    snapshot: &GraphicsSnapshot,
+    frame: &mut [u8],
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+) {
+    let source_width = snapshot.mode.pixel_width;
+    let source_height = snapshot.mode.pixel_height;
+    if source_width == 0 || source_height == 0 || right <= left || bottom <= top {
+        return;
+    }
+    let mut source = vec![0; source_width as usize * source_height as usize * BYTES_PER_PIXEL];
+    render(snapshot, &mut source);
+    let dest_width = (right - left) as u32;
+    let dest_height = (bottom - top) as u32;
+    let clipped_left = left.max(0);
+    let clipped_right = right.min(DESKTOP_WIDTH as i32);
+    let clipped_top = top.max(0);
+    let clipped_bottom = bottom.min(DESKTOP_HEIGHT as i32);
+    for target_y in clipped_top..clipped_bottom {
+        let dy = (target_y - top) as u32;
+        let sy = dy * source_height / dest_height;
+        for target_x in clipped_left..clipped_right {
+            let dx = (target_x - left) as u32;
+            let sx = dx * source_width / dest_width;
+            let source_at = (sy as usize * source_width as usize + sx as usize) * BYTES_PER_PIXEL;
+            let target_at =
+                (target_y as usize * DESKTOP_WIDTH as usize + target_x as usize) * BYTES_PER_PIXEL;
+            frame[target_at..target_at + BYTES_PER_PIXEL]
+                .copy_from_slice(&source[source_at..source_at + BYTES_PER_PIXEL]);
+        }
+    }
+}
+
+fn draw_preview_outline(frame: &mut [u8], window: &DesktopWindow, area: WorkArea) {
+    let left = area.min_x;
+    let right = area.max_x + if window.has_vertical_scrollbar { 14 } else { 0 };
+    let top = DESKTOP_HEIGHT as i32 - area.max_y - if window.has_title { 24 } else { 0 };
+    let bottom = DESKTOP_HEIGHT as i32 - area.min_y + if window.resizable { 14 } else { 0 };
+    let color = [105, 196, 255, 255];
+    draw_line(
+        frame,
+        DESKTOP_WIDTH,
+        DESKTOP_HEIGHT,
+        (left, top),
+        (right, top),
+        color,
+    );
+    draw_line(
+        frame,
+        DESKTOP_WIDTH,
+        DESKTOP_HEIGHT,
+        (right, top),
+        (right, bottom),
+        color,
+    );
+    draw_line(
+        frame,
+        DESKTOP_WIDTH,
+        DESKTOP_HEIGHT,
+        (right, bottom),
+        (left, bottom),
+        color,
+    );
+    draw_line(
+        frame,
+        DESKTOP_WIDTH,
+        DESKTOP_HEIGHT,
+        (left, bottom),
+        (left, top),
+        color,
+    );
+}
+
+fn draw_small_text_clipped(
+    frame: &mut [u8],
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    text: &str,
+    color: [u8; 4],
+    clip_left: i32,
+    clip_right: i32,
+    clip_top: i32,
+    clip_bottom: i32,
+) {
+    let mut cursor_x = x;
+    for byte in text.bytes() {
+        if byte == 0 || byte < 32 {
+            break;
+        }
+        if let Some(glyph) = bbc_micro_glyph(byte) {
+            for (row, bits) in glyph.iter().enumerate() {
+                for column in 0..8 {
+                    if bits & (0x80 >> column) != 0 {
+                        let pixel_x = cursor_x + column;
+                        let pixel_y = y + row as i32;
+                        if pixel_x >= clip_left
+                            && pixel_x < clip_right
+                            && pixel_y >= clip_top
+                            && pixel_y < clip_bottom
+                        {
+                            set_pixel(frame, width, height, pixel_x, pixel_y, color);
+                        }
+                    }
+                }
+            }
+        }
+        cursor_x += 8;
+    }
+}
+
+fn fill_rect(
+    frame: &mut [u8],
+    width: u32,
+    height: u32,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    color: [u8; 4],
+) {
+    for y in top.max(0)..bottom.min(height as i32) {
+        for x in left.max(0)..right.min(width as i32) {
+            set_pixel(frame, width, height, x, y, color);
+        }
+    }
 }
 
 fn draw_text(snapshot: &GraphicsSnapshot, frame: &mut [u8], width: u32, height: u32) {
