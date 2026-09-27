@@ -234,7 +234,7 @@ mod tests {
             Runtime::desktop_task(2, app_input_receiver, app_display_sender, Arc::clone(&wimp));
         assert!(
             app.run_application("10 DIM A\n20 END").is_err(),
-            "a desktop BASIC task should select StrictJIT from the session preferences"
+            "a desktop BASIC task should select the strict engine from session preferences"
         );
         drop(app);
 

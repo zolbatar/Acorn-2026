@@ -48,15 +48,15 @@ Use MOS-style `CONFIGURE` commands to save the execution defaults for future
 BASIC runs. For example, after starting with `cargo run-jit`:
 
 ```text
-CONFIGURE BASICEngine StrictJIT
+CONFIGURE BASICEngine Strict
 STATUS BASICEngine
 BASIC examples/clocksp5/ClockSP5.bas
 ```
 
 `BASICMode` accepts `Auto`, `Classic`, `BASIC64`, or `Hybrid`; `BASICProfile`
 accepts `Auto` or a profile name; `BASICTarget` accepts `Auto`, `Hosted`,
-`RISCOS`, or `Agon`; and `BASICEngine` accepts `Interpreter`, `HybridJIT`, or
-`StrictJIT`. `STATUS` with no argument shows every saved value. Use
+`RISCOS`, or `Agon`; and `BASICEngine` accepts `Interpreter`, `Hybrid`, or
+`Strict`. `STATUS` with no argument shows every saved value. Use
 `CONFIGURE DEFAULTS` to restore the interpreter and automatic mode, profile,
 and target choices.
 
@@ -192,7 +192,7 @@ physical host clock reading or a strict-JIT speedup claim. See the
 To save strict mode as the default for every BASIC run, enter:
 
 ```text
-CONFIGURE BASICEngine StrictJIT
+CONFIGURE BASICEngine Strict
 BASIC examples/clocksp5/ClockSP5.bas
 ```
 

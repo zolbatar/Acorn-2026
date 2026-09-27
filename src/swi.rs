@@ -1935,7 +1935,7 @@ impl SwiDispatcher {
         if arguments.is_empty() {
             self.write_inline(
                 task,
-                b"Syntax: *CONFIGURE <option> <value>\n\r  BASICMode Auto|Classic|BASIC64|Hybrid\n\r  BASICProfile Auto|<profile>\n\r  BASICTarget Auto|Hosted|RISCOS|Agon\n\r  BASICEngine Interpreter|HybridJIT|StrictJIT\n\r  *CONFIGURE DEFAULTS resets all BASIC preferences.",
+                b"Syntax: *CONFIGURE <option> <value>\n\r  BASICMode Auto|Classic|BASIC64|Hybrid\n\r  BASICProfile Auto|<profile>\n\r  BASICTarget Auto|Hosted|RISCOS|Agon\n\r  BASICEngine Interpreter|Hybrid|Strict\n\r  *CONFIGURE DEFAULTS resets all BASIC preferences.",
             )?;
             return self.write_new_line(task);
         }
@@ -2279,7 +2279,7 @@ mod tests {
     }
 
     #[test]
-    fn configure_accepts_documented_engine_values_and_conf_abbreviation() {
+    fn configure_accepts_canonical_engine_values_and_conf_abbreviation() {
         let (_input_sender, input_receiver) = mpsc::channel();
         let (display_sender, _display_receiver) = mpsc::channel();
         let mut dispatcher =
@@ -2292,22 +2292,27 @@ mod tests {
         dispatcher.configure = ConfigureStore::with_path(&config_path);
         let mut task = Task::new(1);
 
-        dispatch_cli_line(
-            &mut dispatcher,
-            &mut task,
-            "*CONFIGURE BASICEngine StrictJIT",
-        )
-        .unwrap();
+        dispatch_cli_line(&mut dispatcher, &mut task, "*CONFIGURE BASICEngine Strict").unwrap();
         assert_eq!(
             dispatcher.configure.load().unwrap().engine,
             BasicEngine::StrictJit
         );
 
-        dispatch_cli_line(&mut dispatcher, &mut task, "*CONF. BASICEngine HybridJIT").unwrap();
+        dispatch_cli_line(&mut dispatcher, &mut task, "*CONF. BASICEngine Hybrid").unwrap();
         assert_eq!(
             dispatcher.configure.load().unwrap().engine,
             BasicEngine::HybridJit
         );
+
+        for value in ["HybridJIT", "Hybrid-JIT", "StrictJIT", "Strict-JIT"] {
+            let command = format!("*CONFIGURE BASICEngine {value}");
+            dispatch_cli_line(&mut dispatcher, &mut task, &command).unwrap();
+            assert_eq!(
+                dispatcher.configure.load().unwrap().engine,
+                BasicEngine::HybridJit,
+                "accepted {value}"
+            );
+        }
         let _ = std::fs::remove_file(config_path);
     }
 

@@ -59,15 +59,9 @@ impl BasicEngine {
     fn parse(value: &str) -> Option<Self> {
         if value.eq_ignore_ascii_case("INTERPRETER") {
             Some(Self::Interpreter)
-        } else if value.eq_ignore_ascii_case("HYBRID")
-            || value.eq_ignore_ascii_case("HYBRIDJIT")
-            || value.eq_ignore_ascii_case("HYBRID-JIT")
-        {
+        } else if value.eq_ignore_ascii_case("HYBRID") {
             Some(Self::HybridJit)
-        } else if value.eq_ignore_ascii_case("STRICT")
-            || value.eq_ignore_ascii_case("STRICTJIT")
-            || value.eq_ignore_ascii_case("STRICT-JIT")
-        {
+        } else if value.eq_ignore_ascii_case("STRICT") {
             Some(Self::StrictJit)
         } else {
             None
@@ -77,8 +71,8 @@ impl BasicEngine {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Interpreter => "INTERPRETER",
-            Self::HybridJit => "HYBRID-JIT",
-            Self::StrictJit => "STRICT-JIT",
+            Self::HybridJit => "HYBRID",
+            Self::StrictJit => "STRICT",
         }
     }
 }
@@ -123,9 +117,8 @@ impl BasicConfiguration {
             };
             Ok("BASICTarget")
         } else if option.eq_ignore_ascii_case("BASICENGINE") {
-            self.engine = BasicEngine::parse(value).ok_or_else(|| {
-                "BASICEngine must be Interpreter, HybridJIT, or StrictJIT".to_string()
-            })?;
+            self.engine = BasicEngine::parse(value)
+                .ok_or_else(|| "BASICEngine must be Interpreter, Hybrid, or Strict".to_string())?;
             Ok("BASICEngine")
         } else {
             Err(format!(
@@ -359,7 +352,7 @@ fn validate_profile(profile: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BasicConfiguration, ConfigureStore};
+    use super::{BasicConfiguration, BasicEngine, ConfigureStore};
     use std::{
         fs,
         path::PathBuf,
@@ -381,18 +374,17 @@ mod tests {
         let path = temporary_path();
         let store = ConfigureStore::with_path(&path);
 
+        let hybrid = store.set("BASICEngine", "Hybrid").unwrap();
+        assert_eq!(hybrid.engine.as_str(), "HYBRID");
         let configured = store.set("BASICEngine", "Strict").unwrap();
-        assert_eq!(configured.engine.as_str(), "STRICT-JIT");
+        assert_eq!(configured.engine.as_str(), "STRICT");
         store.set("BASICMode", "Classic").unwrap();
         store.set("BASICProfile", "BBCV-1.05").unwrap();
         store.set("BASICTarget", "Agon").unwrap();
 
         let reloaded = store.load().unwrap();
         assert_eq!(reloaded, store.load().unwrap());
-        assert_eq!(
-            reloaded.status_value("BASICEngine").unwrap().1,
-            "STRICT-JIT"
-        );
+        assert_eq!(reloaded.status_value("BASICEngine").unwrap().1, "STRICT");
         assert_eq!(reloaded.status_value("BASICMode").unwrap().1, "CLASSIC");
         assert_eq!(
             reloaded.status_value("BASICProfile").unwrap().1,
@@ -409,10 +401,40 @@ mod tests {
     fn configure_store_rejects_invalid_or_ambiguous_values() {
         let path = temporary_path();
         let store = ConfigureStore::with_path(&path);
-        assert!(store.set("BASICEngine", "maybe").is_err());
+        for value in [
+            "maybe",
+            "HybridJIT",
+            "Hybrid-JIT",
+            "StrictJIT",
+            "Strict-JIT",
+        ] {
+            assert!(store.set("BASICEngine", value).is_err(), "accepted {value}");
+        }
         assert!(store.set("BASICMode", "Strict").is_err());
         assert!(store.set("BASICProfile", "bad profile").is_err());
         assert!(store.set("SomethingElse", "value").is_err());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn persisted_engine_values_accept_only_canonical_names() {
+        for (value, expected) in [
+            ("INTERPRETER", BasicEngine::Interpreter),
+            ("HYBRID", BasicEngine::HybridJit),
+            ("STRICT", BasicEngine::StrictJit),
+        ] {
+            let contents = format!("BASICEngine={value}\n");
+            assert_eq!(
+                BasicConfiguration::parse(&contents).unwrap().engine,
+                expected
+            );
+        }
+        for value in ["HybridJIT", "Hybrid-JIT", "StrictJIT", "Strict-JIT"] {
+            let contents = format!("BASICEngine={value}\n");
+            assert!(
+                BasicConfiguration::parse(&contents).is_err(),
+                "accepted {value}"
+            );
+        }
     }
 }
