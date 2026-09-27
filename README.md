@@ -42,6 +42,32 @@ cargo run
 
 The app opens one window and displays the `*` prompt. Enter `HELP` to list the built-in commands. Enter `DESKTOP` to hand that window to the initially blank shared Wimp desktop; closing the window exits. `--desktop-demo` remains a separate launch path for the two sample windows. Enter `QUIT` to exit from the MOS prompt.
 
+## Persist BASIC execution preferences
+
+Use MOS-style `CONFIGURE` commands to save the execution defaults for future
+BASIC runs. For example, after starting with `cargo run-jit`:
+
+```text
+CONFIGURE BASICEngine StrictJIT
+STATUS BASICEngine
+BASIC examples/clocksp5/ClockSP5.bas
+```
+
+`BASICMode` accepts `Auto`, `Classic`, `BASIC64`, or `Hybrid`; `BASICProfile`
+accepts `Auto` or a profile name; `BASICTarget` accepts `Auto`, `Hosted`,
+`RISCOS`, or `Agon`; and `BASICEngine` accepts `Interpreter`, `HybridJIT`, or
+`StrictJIT`. `STATUS` with no argument shows every saved value. Use
+`CONFIGURE DEFAULTS` to restore the interpreter and automatic mode, profile,
+and target choices.
+
+The settings apply to `BASIC <file>`, `RUN <file>`, `BASICRUN`, and BASIC
+programs launched in the desktop. A program's `REM @BASIC64` fields override
+the matching saved mode, target, or profile; the saved engine preference stays
+in effect. Settings are read again for each run, so they apply to the next
+program without restarting. On macOS they are stored in
+`~/Library/Application Support/Acorn-2026/configure`; set `ACORN_CONFIG_PATH`
+to use another file.
+
 Use **Command+V** on macOS to paste clipboard text into the window (Control+V on other hosts). Pasted line breaks act like pressing Enter, so multiple pasted command lines run in sequence. Printable ASCII is sent to the guest input path; tabs become spaces and unsupported characters are skipped.
 
 In the desktop, left-click is Select, middle-click is Menu, and right-click is Adjust. On a trackpad or two-button mouse, hold Option (Alt on other platforms) and left-click for Menu.
@@ -163,6 +189,15 @@ the program's comparison against its BBC B reference data; they are not a
 physical host clock reading or a strict-JIT speedup claim. See the
 [`ClockSP5 run plan`](docs/clocksp5-run-plan.md) for coverage and limits.
 
+To save strict mode as the default for every BASIC run, enter:
+
+```text
+CONFIGURE BASICEngine StrictJIT
+BASIC examples/clocksp5/ClockSP5.bas
+```
+
+`CONFIGURE DEFAULTS` restores the interpreter default.
+
 ## Try the experimental hybrid JIT
 
 From the repository root, start the optimized UI with Cranelift support:
@@ -198,6 +233,7 @@ iteration math into one Cranelift frame kernel. Per-pixel ColourTrans and
 `OS_Plot` effects go through checked runtime services. Mode setup and the final
 key wait remain interpreted. The reduced fixture uses its verified iteration
 kernel, and ClockSP5 uses its verified nested integer `REPEAT` region.
+`BASICJIT` selects a one-run engine override. With default preferences,
 `BASICRUN` remains the interpreter reference. The summary reports compiled
 calls, rendered pixels where applicable, and elapsed native-region time; this
 is a kernel measurement, not a whole-program speedup. Use the windowed UI to

@@ -6,7 +6,7 @@ The interpreter acceptance run remains available: the checked-in tokenised fixtu
 
 ## Goal
 
-Run the checked-in ARM BASIC V tokenised file with `BASICLOAD` and `BASICRUN`, through the compatibility executor, and have ClockSP5 print its benchmark sections and return to the MOS `*` prompt. Keep `ClockSP5.bas` and `ClockSP5.bbc` as the source and acceptance fixture. This is a program-driven compatibility milestone, not a claim of complete BBC BASIC V/VI support.
+Run the checked-in ARM BASIC V source or tokenised file directly with `*BASIC <file>`, through the configured compatibility executor, and have ClockSP5 print its benchmark sections and return to the MOS `*` prompt. Keep `ClockSP5.bas` and `ClockSP5.bbc` as the source and acceptance fixture. This is a program-driven compatibility milestone, not a claim of complete BBC BASIC V/VI support.
 
 The additional strict-JIT goal is to compile either fixture completely before execution, preserve its measured calls and loops, run every pass without interpreter fallback, and report zero interpreted statements and expressions.
 
@@ -30,7 +30,7 @@ The checked-in program starts with `Z%=&0211`. With no host key pending, bare `I
 
 `BASICJIT STRICT` compiles the full shared `ParsedProgram` into native control flow before running it. Generated code performs numeric expressions, branches, loop arithmetic, and calls directly; checked runtime helpers handle dynamic strings and arrays, DATA, output, clocks, input, logical task memory, star commands, and MOS `CALL`. The helper ABI accepts values and an opaque runtime context. It does not dispatch BASIC statements or evaluate BASIC expressions. Strict success reports separate interpreter statement and expression counts, both zero; legitimate service-helper calls are reported separately. Unsupported compilation returns a BASIC line and reason before execution. A guarded supported AST operation without a native implementation emits an explicit error only if reached. No strict run falls back to BASICRUN or the hybrid JIT.
 
-Use benchmark-validation mode for coverage runs. It turns Cranelift optimization off so empty `PROC` calls and counting loops remain present; do not use these timings to claim performance improvement. The normal strict command uses Cranelift speed optimization. The existing `BASICJIT [file]` command remains the separate hybrid experiment used for Mandelbrot and recursive-procedure support.
+Use benchmark-validation mode for coverage runs. It turns Cranelift optimization off so empty `PROC` calls and counting loops remain present; do not use these timings to claim performance improvement. The normal strict command uses Cranelift speed optimization. The existing `BASICJIT [file]` command remains the separate one-run hybrid override used for Mandelbrot and recursive-procedure support. To make strict the persistent default, enter `CONFIGURE BASICEngine StrictJIT`; `BASIC`, `RUN`, `BASICRUN`, and desktop-launched BASIC programs then select strict execution unless a command explicitly overrides the engine. `REM @BASIC64` fields continue to override saved language, target, and profile preferences for the fields they declare.
 
 Each implementation milestone gets its own focused commit. Run the small echo fixture and Rust checks after interpreter changes, then use the ClockSP5 end-to-end run as the final acceptance check.
 
@@ -43,6 +43,6 @@ BASICJIT STRICT --benchmark-validation examples/clocksp5/ClockSP5.bas
 BASICJIT STRICT --benchmark-validation examples/clocksp5/ClockSP5.bbc
 ```
 
-Each run should print all nine benchmark headings and the final comparison three times, return to the MOS prompt, and report zero interpreter statement and expression counts. Timing-dependent output is variable. To use the interpreter as a reference, run `BASICLOAD examples/clocksp5/ClockSP5.bbc` followed by `BASICRUN`. `QUIT` should still exit normally.
+Each one-shot acceptance run should print all nine benchmark headings and the final comparison three times, return to the MOS prompt, and report zero interpreter statement and expression counts. Timing-dependent output is variable. The same program can use the saved strict preference through `CONFIGURE BASICEngine StrictJIT` followed by `BASIC examples/clocksp5/ClockSP5.bas`; this uses the normal optimized strict path. With default configuration, `BASICRUN` remains the interpreter reference. `QUIT` should still exit normally.
 
 Focused strict-mode regression cases are in `tests/basic_jit_strict.rs`. The MOS service case exercises OSWORD clocks, checked logical memory, and `CALL &FFF1` directly because ClockSP5's normal guard skips that path.

@@ -8,6 +8,7 @@ use std::{fs, path::Path};
 
 use crate::{
     basic_compat::{self, JitExecutionReport, StrictJitOptions},
+    configure::{BasicConfiguration, BasicEngine},
     error::RuntimeError,
     filesystem::{FILETYPE_BASIC, FileMetadata},
     memory::Task,
@@ -70,6 +71,60 @@ pub fn run_guest_file(
 ) -> Result<(), RuntimeError> {
     let (bytes, metadata) = dispatcher.read_guest_file(task, path)?;
     run_guest_bytes(&bytes, &metadata, task, dispatcher)
+}
+
+pub(crate) fn run_guest_file_configured(
+    path: &str,
+    task: &mut Task,
+    dispatcher: &mut SwiDispatcher,
+    configuration: &BasicConfiguration,
+) -> Result<Option<JitExecutionReport>, RuntimeError> {
+    run_guest_file_with_engine_options(
+        path,
+        task,
+        dispatcher,
+        configuration,
+        None,
+        StrictJitOptions::default(),
+    )
+}
+
+pub(crate) fn run_guest_file_with_engine_options(
+    path: &str,
+    task: &mut Task,
+    dispatcher: &mut SwiDispatcher,
+    configuration: &BasicConfiguration,
+    engine_override: Option<BasicEngine>,
+    strict_options: StrictJitOptions,
+) -> Result<Option<JitExecutionReport>, RuntimeError> {
+    let (bytes, metadata) = dispatcher.read_guest_file(task, path)?;
+    if metadata.file_type & 0xFFF == FILETYPE_BASIC {
+        let program = TokenizedBasicProgram::decode(&bytes)
+            .map_err(|error| RuntimeError::Program(error.to_string()))?;
+        basic_compat::run_program_with_engine_options(
+            &program,
+            task,
+            dispatcher,
+            configuration,
+            engine_override,
+            strict_options,
+        )
+    } else {
+        let source = std::str::from_utf8(&bytes).map_err(|error| {
+            RuntimeError::Program(format!(
+                "file type &{:03X} is not tokenized BASIC and the file is not UTF-8 text: {error}",
+                metadata.file_type & 0xFFF
+            ))
+        })?;
+        basic_compat::run_source_with_engine_options(
+            source,
+            task,
+            dispatcher,
+            configuration,
+            engine_override,
+            strict_options,
+        )
+    }
 }
 
 pub fn run_guest_bytes(

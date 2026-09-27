@@ -1,5 +1,6 @@
 pub mod basic64;
 pub mod basic_compat;
+pub(crate) mod configure;
 pub mod error;
 pub mod filesystem;
 pub mod font;

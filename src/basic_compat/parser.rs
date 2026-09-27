@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::{
+    configure::BasicLanguageMode as LanguageMode,
     error::RuntimeError,
     graphics::GraphicsProfile,
     tokenized_basic::{TokenizedBasicLine, TokenizedBasicProgram, decode_line_reference},
@@ -229,19 +230,14 @@ pub(crate) struct ParsedProgram {
     pub options: ProgramOptions,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum LanguageMode {
-    Classic,
-    Basic64,
-    #[default]
-    Hybrid,
-}
-
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ProgramOptions {
     pub mode: LanguageMode,
     pub target: GraphicsProfile,
     pub profile: Option<String>,
+    pub mode_declared: bool,
+    pub target_declared: bool,
+    pub profile_declared: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -454,6 +450,7 @@ fn parse_basic64_directive(
                 return Err(syntax_error(line_number, "duplicate MODE field"));
             }
             mode_seen = true;
+            options.mode_declared = true;
             options.mode = if value.eq_ignore_ascii_case("CLASSIC") {
                 LanguageMode::Classic
             } else if value.eq_ignore_ascii_case("BASIC64") {
@@ -468,6 +465,7 @@ fn parse_basic64_directive(
                 return Err(syntax_error(line_number, "duplicate TARGET field"));
             }
             target_seen = true;
+            options.target_declared = true;
             options.target =
                 if value.eq_ignore_ascii_case("HOSTED") || value.eq_ignore_ascii_case("RISCOS") {
                     GraphicsProfile::Hosted
@@ -481,6 +479,7 @@ fn parse_basic64_directive(
                 return Err(syntax_error(line_number, "duplicate PROFILE field"));
             }
             profile_seen = true;
+            options.profile_declared = true;
             options.profile = Some(value.to_owned());
         } else {
             return Err(syntax_error(
@@ -489,7 +488,7 @@ fn parse_basic64_directive(
             ));
         }
     }
-    if profile_seen && options.mode != LanguageMode::Classic {
+    if profile_seen && options.mode_declared && options.mode != LanguageMode::Classic {
         return Err(syntax_error(
             line_number,
             "PROFILE is only valid with MODE=CLASSIC",
@@ -929,6 +928,10 @@ fn source_keyword_prefix(name: &str) -> Option<(&'static str, u8)> {
 }
 
 fn source_keyword_prefix_is_valid(keyword: u8, previous: Option<&Token>) -> bool {
+    let follows_print_separator = keyword == TOKEN_ELSE && previous == Some(&Token::Symbol(b';'));
+    if follows_print_separator {
+        return true;
+    }
     let statement_boundary = previous.is_none_or(|previous| {
         matches!(
             previous,
@@ -942,7 +945,6 @@ fn source_keyword_prefix_is_valid(keyword: u8, previous: Option<&Token>) -> bool
 
     let starts_definition =
         previous == Some(&Token::Keyword(TOKEN_DEF)) && matches!(keyword, TOKEN_PROC | TOKEN_FN);
-    let follows_print_separator = keyword == TOKEN_ELSE && previous == Some(&Token::Symbol(b';'));
     let adjacent_print_control = matches!(keyword, TOKEN_SPC | TOKEN_TAB)
         && (previous.is_some_and(token_ends_expression)
             || matches!(previous, Some(Token::Symbol(b'\''))));

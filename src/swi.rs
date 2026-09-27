@@ -1,4 +1,5 @@
 use crate::{
+    configure::{BasicConfiguration, BasicEngine, ConfigureStore},
     error::RuntimeError,
     filesystem::{FILETYPE_BASIC, FILETYPE_TEXT, FileMetadata, HostFileSystem, OpenFile},
     graphics::{GraphicsProfile, GraphicsService, GraphicsSnapshot},
@@ -86,7 +87,7 @@ const MAX_CLI_BYTES: usize = 256;
 const MAX_STRING_BYTES: usize = 4096;
 const OUTPUT_BUFFER: u32 = GUEST_MEMORY_BASE + 0x1000;
 const CLI_STRING_BUFFER: u32 = GUEST_MEMORY_BASE + 0x3000;
-const HELP_TEXT: &[u8] = b"Acorn-2026 MOS commands:\n\r  Commands can be abbreviated with a final dot (for example, *CA.); *. is a shortcut for *CAT.\n\r  *CAT [dir]             Catalogue a directory.\n\r  *DIR [dir]             Select the current directory.\n\r  *CDIR <dir>            Create a directory.\n\r  *DELETE <file>         Delete a file.\n\r  *RENAME <old> <new>    Rename a file or directory.\n\r  *FILETYPE <file> <id>  Set a RISC OS file type.\n\r  *TYPE <file>           Display a text file.\n\r  *DISC [name]           Read or set the volume name.\n\r  *HOSTFS                Select the HostFS filing system.\n\r  DESKTOP                Start the hosted Wimp desktop.\n\r  RUN <file>             Run a BASIC source or tokenised file.\n\r  BASICLOAD <file>       Load a tokenised BASIC program.\n\r  BASICRUN               Run the loaded program.\n\r  BASICJIT [file]        Run with experimental native hot regions.\n\r  BASICJIT STRICT [file] Compile and run supported code without fallback.\n\r  HELP                   Show this help.\n\r  QUIT                   Exit the runtime.";
+const HELP_TEXT: &[u8] = b"Acorn-2026 MOS commands:\n\r  Commands can be abbreviated with a final dot (for example, *CA.); *. is a shortcut for *CAT.\n\r  *CAT [dir]             Catalogue a directory.\n\r  *DIR [dir]             Select the current directory.\n\r  *CDIR <dir>            Create a directory.\n\r  *DELETE <file>         Delete a file.\n\r  *RENAME <old> <new>    Rename a file or directory.\n\r  *FILETYPE <file> <id>  Set a RISC OS file type.\n\r  *TYPE <file>           Display a text file.\n\r  *DISC [name]           Read or set the volume name.\n\r  *HOSTFS                Select the HostFS filing system.\n\r  *CONFIGURE <option> <value> Save a BASIC preference.\n\r  *CONFIGURE DEFAULTS    Restore BASIC preferences.\n\r  *STATUS [option]       Show saved BASIC preferences.\n\r  *BASIC <file>          Load and run BASIC with saved preferences.\n\r  DESKTOP                Start the hosted Wimp desktop.\n\r  RUN <file>             Run a BASIC source or tokenised file.\n\r  BASICLOAD <file>       Load a tokenised BASIC program.\n\r  BASICRUN               Run the loaded program.\n\r  BASICJIT [file]        Run with experimental native hot regions.\n\r  BASICJIT STRICT [file] Compile and run supported code without fallback.\n\r  HELP                   Show this help.\n\r  QUIT                   Exit the runtime.";
 
 fn hsv_to_rgb(hue: f64, saturation: f64, value: f64) -> (u8, u8, u8) {
     let hue = hue.rem_euclid(360.0) / 60.0;
@@ -116,6 +117,7 @@ pub struct SwiContext {
 
 pub struct SwiDispatcher {
     mos: mos::MosState,
+    configure: ConfigureStore,
     console: HostConsole,
     graphics: GraphicsService,
     file_system: HostFileSystem,
@@ -166,6 +168,7 @@ impl SwiDispatcher {
     ) -> Self {
         Self {
             mos: mos::MosState::default(),
+            configure: ConfigureStore::default(),
             console,
             graphics: GraphicsService::default(),
             file_system: HostFileSystem::demo_default(),
@@ -191,6 +194,10 @@ impl SwiDispatcher {
 
     pub fn graphics(&self) -> &GraphicsService {
         &self.graphics
+    }
+
+    pub(crate) fn load_basic_configuration(&self) -> Result<BasicConfiguration, RuntimeError> {
+        self.configure.load().map_err(RuntimeError::Program)
     }
 
     pub(crate) fn set_graphics_profile(
@@ -1506,21 +1513,65 @@ impl SwiDispatcher {
         } else if cli_command_matches(verb, "QUIT") && arguments.is_empty() {
             self.quit_requested = true;
             Ok(())
+        } else if cli_command_matches(verb, "CONFIGURE") {
+            self.execute_configure_command(task, arguments)
+        } else if cli_command_matches(verb, "STATUS") {
+            self.execute_status_command(task, arguments)
+        } else if cli_command_matches(verb, "BASIC") {
+            if arguments.is_empty() {
+                self.write_inline(task, b"Syntax: *BASIC <file>")?;
+                return self.write_new_line(task);
+            }
+
+            let configuration = match self.load_basic_configuration() {
+                Ok(configuration) => configuration,
+                Err(error) => {
+                    let message = format!("BASIC configuration error: {error}");
+                    self.write_inline(task, message.as_bytes())?;
+                    return self.write_new_line(task);
+                }
+            };
+            let path = unquote_single_argument(arguments);
+            self.begin_display_batch();
+            let result =
+                crate::basic64::run_guest_file_configured(path, task, self, &configuration);
+            self.finish_display_batch();
+            match result {
+                Ok(Some(report)) => log_jit_report("BASIC", report),
+                Ok(None) => {}
+                Err(error) => {
+                    let message = format!("BASIC error: {error}");
+                    self.write_inline(task, message.as_bytes())?;
+                    self.write_new_line(task)?;
+                }
+            }
+            Ok(())
         } else if cli_command_matches(verb, "RUN") {
             if arguments.is_empty() {
                 self.write_inline(task, b"Syntax: RUN <file.bas64|bas|txt|asc|bbc>")?;
                 return self.write_new_line(task);
             }
 
+            let configuration = match self.load_basic_configuration() {
+                Ok(configuration) => configuration,
+                Err(error) => {
+                    let message = format!("BASIC configuration error: {error}");
+                    self.write_inline(task, message.as_bytes())?;
+                    return self.write_new_line(task);
+                }
+            };
             let path = unquote_single_argument(arguments);
             self.begin_display_batch();
-            match crate::basic64::run_guest_file(path, task, self) {
-                Ok(()) => {
-                    self.finish_display_batch();
+            let result =
+                crate::basic64::run_guest_file_configured(path, task, self, &configuration);
+            self.finish_display_batch();
+            match result {
+                Ok(Some(report)) => {
+                    log_jit_report("RUN", report);
                     Ok(())
                 }
+                Ok(None) => Ok(()),
                 Err(error) => {
-                    self.finish_display_batch();
                     let message = format!("BASIC error: {error}");
                     self.write_inline(task, message.as_bytes())?;
                     self.write_new_line(task)
@@ -1583,11 +1634,26 @@ impl SwiDispatcher {
                 return self.write_new_line(task);
             };
             self.begin_display_batch();
-            let result = crate::basic_compat::run_program(&program, task, self);
+            let configuration = match self.load_basic_configuration() {
+                Ok(configuration) => configuration,
+                Err(error) => {
+                    self.finish_display_batch();
+                    task.loaded_tokenized_program = Some(program);
+                    let message = format!("BASIC configuration error: {error}");
+                    self.write_inline(task, message.as_bytes())?;
+                    return self.write_new_line(task);
+                }
+            };
+            let result =
+                crate::basic_compat::run_program_configured(&program, task, self, &configuration);
             self.finish_display_batch();
             task.loaded_tokenized_program = Some(program);
             match result {
-                Ok(()) => Ok(()),
+                Ok(Some(report)) => {
+                    log_jit_report("BASICRUN", report);
+                    Ok(())
+                }
+                Ok(None) => Ok(()),
                 Err(error) => {
                     let message = format!("BASICRUN error: {error}");
                     self.write_inline(task, message.as_bytes())?;
@@ -1615,6 +1681,19 @@ impl SwiDispatcher {
             let options = crate::basic_compat::StrictJitOptions {
                 benchmark_validation,
             };
+            let configuration = match self.load_basic_configuration() {
+                Ok(configuration) => configuration,
+                Err(error) => {
+                    self.finish_display_batch();
+                    eprintln!("BASICJIT configuration error: {error}");
+                    return Ok(());
+                }
+            };
+            let engine = if strict {
+                BasicEngine::StrictJit
+            } else {
+                BasicEngine::HybridJit
+            };
             let result = if arguments.is_empty() {
                 let Some(program) = task.loaded_tokenized_program.take() else {
                     self.finish_display_batch();
@@ -1624,51 +1703,34 @@ impl SwiDispatcher {
                     )?;
                     return self.write_new_line(task);
                 };
-                let result = if strict {
-                    crate::basic_compat::run_program_jit_strict_with_options(
-                        &program, task, self, options,
-                    )
-                } else {
-                    crate::basic_compat::run_program_jit(&program, task, self)
-                };
+                let result = crate::basic_compat::run_program_with_engine_options(
+                    &program,
+                    task,
+                    self,
+                    &configuration,
+                    Some(engine),
+                    options,
+                );
                 task.loaded_tokenized_program = Some(program);
                 result
             } else {
                 let path = unquote_single_argument(arguments);
-                if strict {
-                    crate::basic64::run_guest_file_jit_strict(path, task, self, options)
-                } else {
-                    crate::basic64::run_guest_file_jit(path, task, self)
-                }
+                crate::basic64::run_guest_file_with_engine_options(
+                    path,
+                    task,
+                    self,
+                    &configuration,
+                    Some(engine),
+                    options,
+                )
             };
             self.finish_display_batch();
             match result {
-                Ok(report) => {
-                    let summary = if report.strict_native {
-                        format!(
-                            "BASICJIT strict native: {} units, {} native calls, {} runtime helpers, {} interpreter statements, {} interpreter expressions (compile {}, run {}).",
-                            report.compiled_units.len(),
-                            report.compiled_calls,
-                            report.runtime_helper_calls,
-                            report.interpreted_statement_count,
-                            report.interpreted_expression_count,
-                            format_elapsed(report.compile_time),
-                            format_elapsed(report.compiled_time),
-                        )
-                    } else {
-                        let fallback = report
-                            .fallback_reason
-                            .unwrap_or_else(|| "remaining statements used the interpreter".into());
-                        format!(
-                            "BASICJIT: {fallback}; {} interpreted statements, {} expressions (compile {}).",
-                            report.interpreted_statement_count,
-                            report.interpreted_expression_count,
-                            format_elapsed(report.compile_time),
-                        )
-                    };
-                    eprintln!("{summary}");
+                Ok(Some(report)) => {
+                    log_jit_report("BASICJIT", report);
                     Ok(())
                 }
+                Ok(None) => Ok(()),
                 Err(error) => {
                     eprintln!("BASICJIT error: {error}");
                     Ok(())
@@ -1841,6 +1903,105 @@ impl SwiDispatcher {
         } else {
             self.write_inline(task, b"Bad command")?;
             self.write_new_line(task)
+        }
+    }
+
+    fn execute_configure_command(
+        &mut self,
+        task: &mut Task,
+        arguments: &str,
+    ) -> Result<(), RuntimeError> {
+        let arguments = arguments.trim();
+        if arguments.is_empty() {
+            self.write_inline(
+                task,
+                b"Syntax: *CONFIGURE <option> <value>\n\r  BASICMode Auto|Classic|BASIC64|Hybrid\n\r  BASICProfile Auto|<profile>\n\r  BASICTarget Auto|Hosted|RISCOS|Agon\n\r  BASICEngine Interpreter|HybridJIT|StrictJIT\n\r  *CONFIGURE DEFAULTS resets all BASIC preferences.",
+            )?;
+            return self.write_new_line(task);
+        }
+        if arguments.eq_ignore_ascii_case("DEFAULTS") {
+            return match self.configure.reset() {
+                Ok(_) => {
+                    self.write_inline(task, b"BASIC preferences restored to defaults.")?;
+                    self.write_new_line(task)
+                }
+                Err(error) => {
+                    let message = format!("CONFIGURE error: {error}");
+                    self.write_inline(task, message.as_bytes())?;
+                    self.write_new_line(task)
+                }
+            };
+        }
+
+        let mut words = arguments.split_ascii_whitespace();
+        let Some(option) = words.next() else {
+            return self.write_new_line(task);
+        };
+        let Some(value) = words.next() else {
+            self.write_inline(task, b"Syntax: *CONFIGURE <option> <value>")?;
+            return self.write_new_line(task);
+        };
+        if words.next().is_some() {
+            self.write_inline(task, b"Syntax: *CONFIGURE <option> <value>")?;
+            return self.write_new_line(task);
+        }
+
+        match self.configure.set(option, value) {
+            Ok(configuration) => {
+                let (canonical, value) = configuration
+                    .status_value(option)
+                    .expect("validated CONFIGURE option");
+                let message = format!("{canonical} set to {value}.");
+                self.write_inline(task, message.as_bytes())?;
+                self.write_new_line(task)
+            }
+            Err(error) => {
+                let message = format!("CONFIGURE error: {error}");
+                self.write_inline(task, message.as_bytes())?;
+                self.write_new_line(task)
+            }
+        }
+    }
+
+    fn execute_status_command(
+        &mut self,
+        task: &mut Task,
+        arguments: &str,
+    ) -> Result<(), RuntimeError> {
+        let arguments = arguments.trim();
+        if arguments.split_ascii_whitespace().nth(1).is_some() {
+            self.write_inline(task, b"Syntax: *STATUS [option]")?;
+            return self.write_new_line(task);
+        }
+        let configuration = match self.load_basic_configuration() {
+            Ok(configuration) => configuration,
+            Err(error) => {
+                let message = format!("STATUS error: {error}");
+                self.write_inline(task, message.as_bytes())?;
+                return self.write_new_line(task);
+            }
+        };
+        if arguments.is_empty() {
+            let mut output = String::new();
+            for (option, value) in configuration.status_entries() {
+                output.push_str(option);
+                output.push('=');
+                output.push_str(&value);
+                output.push_str("\n\r");
+            }
+            return self.write_inline(task, output.as_bytes());
+        }
+        match configuration.status_value(arguments) {
+            Some((option, value)) => {
+                let output = format!("{option}={value}");
+                self.write_inline(task, output.as_bytes())?;
+                self.write_new_line(task)
+            }
+            None => {
+                let message = format!("STATUS error: unknown BASIC option '{arguments}'");
+                self.write_inline(task, message.as_bytes())?;
+                self.write_new_line(task)
+            }
         }
     }
 
@@ -2049,6 +2210,32 @@ fn format_elapsed(duration: Duration) -> String {
     } else {
         format!("{:.2} s", duration.as_secs_f64())
     }
+}
+
+fn log_jit_report(command: &str, report: crate::basic_compat::JitExecutionReport) {
+    let summary = if report.strict_native {
+        format!(
+            "{command} strict native: {} units, {} native calls, {} runtime helpers, {} interpreter statements, {} interpreter expressions (compile {}, run {}).",
+            report.compiled_units.len(),
+            report.compiled_calls,
+            report.runtime_helper_calls,
+            report.interpreted_statement_count,
+            report.interpreted_expression_count,
+            format_elapsed(report.compile_time),
+            format_elapsed(report.compiled_time),
+        )
+    } else {
+        let fallback = report
+            .fallback_reason
+            .unwrap_or_else(|| "remaining statements used the interpreter".into());
+        format!(
+            "{command}: {fallback}; {} interpreted statements, {} expressions (compile {}).",
+            report.interpreted_statement_count,
+            report.interpreted_expression_count,
+            format_elapsed(report.compile_time),
+        )
+    };
+    eprintln!("{summary}");
 }
 
 #[cfg(test)]

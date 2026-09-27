@@ -248,6 +248,35 @@ fn assert_clocksp5_output(output: &[u8]) {
             String::from_utf8_lossy(heading)
         );
     }
+
+    let mhz_values = output
+        .windows(3)
+        .enumerate()
+        .filter_map(|(end, window)| {
+            if window != b"MHz" {
+                return None;
+            }
+            let mut start = end;
+            while start > 0
+                && (output[start - 1].is_ascii_digit() || matches!(output[start - 1], b'.' | b'-'))
+            {
+                start -= 1;
+            }
+            std::str::from_utf8(&output[start..end])
+                .ok()
+                .and_then(|value| value.parse::<f64>().ok())
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        mhz_values.len() >= 33,
+        "expected numeric MHz output for each row in all three passes"
+    );
+    assert!(
+        mhz_values
+            .iter()
+            .all(|value| value.is_finite() && *value > 0.0),
+        "ClockSP5 produced a zero or invalid benchmark result: {mhz_values:?}"
+    );
 }
 
 fn report_clocksp5_observation(label: &str, report: &JitExecutionReport, output: &[u8]) {

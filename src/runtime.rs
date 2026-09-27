@@ -66,7 +66,14 @@ impl Runtime {
 
     /// Run one editable BASIC source program as this task.
     pub fn run_application(&mut self, source: &str) -> Result<(), RuntimeError> {
-        crate::basic64::run_source(source, &mut self.task, &mut self.dispatcher)
+        let configuration = self.dispatcher.load_basic_configuration()?;
+        crate::basic_compat::run_source_configured(
+            source,
+            &mut self.task,
+            &mut self.dispatcher,
+            &configuration,
+        )
+        .map(|_| ())
     }
 
     pub fn new(console: HostConsole) -> Self {
