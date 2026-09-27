@@ -165,10 +165,14 @@ mod tests {
     };
 
     use super::*;
-    use crate::{swi::DisplayEvent, wimp::WimpServer};
+    use crate::{
+        configure::{BasicEngine, ConfigureStore},
+        swi::{DisplayEvent, SwiDispatcher},
+        wimp::WimpServer,
+    };
 
     #[test]
-    fn desktop_command_suspends_prompt_input_until_wimp_session_closes() {
+    fn desktop_command_preserves_configuration_for_later_basic_tasks() {
         let (input_sender, input_receiver) = mpsc::channel();
         for byte in b"*dEsK.\rHELP\r" {
             input_sender.send(*byte).unwrap();
@@ -176,13 +180,22 @@ mod tests {
         drop(input_sender);
 
         let (display_sender, display_receiver) = mpsc::channel();
+        let app_display_sender = display_sender.clone();
         let (updates, _update_receiver) = mpsc::channel();
         let wimp = WimpServer::new(updates);
         let runtime_wimp = wimp.clone();
+        let config_path = std::env::temp_dir().join(format!(
+            "acorn-2026-desktop-engine-{}.configure",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&config_path);
+        let configure = ConfigureStore::with_path(&config_path);
+        configure.set("BASICENGINE", "STRICTJIT").unwrap();
         let (finished_sender, finished_receiver) = mpsc::channel();
         let runtime_thread = thread::spawn(move || {
             let mut runtime =
                 Runtime::windowed_with_desktop(input_receiver, display_sender, runtime_wimp);
+            runtime.dispatcher.set_configure_store_for_test(configure);
             let _ = finished_sender.send(runtime.run());
         });
 
@@ -197,6 +210,14 @@ mod tests {
         }
         assert_eq!(initial_output.first(), Some(&b'*'));
         assert!(wimp.desktop_windows().is_empty());
+        assert_eq!(
+            wimp.configure_store()
+                .expect("DESKTOP should attach its preference store")
+                .load()
+                .unwrap()
+                .engine,
+            BasicEngine::StrictJit
+        );
         assert!(
             display_receiver
                 .recv_timeout(Duration::from_millis(50))
@@ -208,11 +229,35 @@ mod tests {
             Err(TryRecvError::Empty)
         ));
 
+        let (_app_input_sender, app_input_receiver) = mpsc::channel();
+        let mut app =
+            Runtime::desktop_task(2, app_input_receiver, app_display_sender, Arc::clone(&wimp));
+        assert!(
+            app.run_application("10 DIM A\n20 END").is_err(),
+            "a desktop BASIC task should select StrictJIT from the session preferences"
+        );
+        drop(app);
+
+        let (_reference_input_sender, reference_input_receiver) = mpsc::channel();
+        let (reference_display_sender, _reference_display_receiver) = mpsc::channel();
+        let mut reference_dispatcher = SwiDispatcher::windowed(
+            HostConsole::windowed(reference_input_receiver),
+            reference_display_sender,
+        );
+        let mut reference_task = Task::new(3);
+        crate::basic_compat::run_source(
+            "10 DIM A\n20 END",
+            &mut reference_task,
+            &mut reference_dispatcher,
+        )
+        .expect("the execution probe should run in the reference interpreter");
+
         wimp.stop();
         finished_receiver
             .recv_timeout(Duration::from_secs(2))
             .expect("closing the Wimp session must release the suspended MOS task")
             .expect("the MOS runtime should shut down cleanly");
         runtime_thread.join().unwrap();
+        let _ = std::fs::remove_file(config_path);
     }
 }

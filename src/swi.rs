@@ -87,7 +87,7 @@ const MAX_CLI_BYTES: usize = 256;
 const MAX_STRING_BYTES: usize = 4096;
 const OUTPUT_BUFFER: u32 = GUEST_MEMORY_BASE + 0x1000;
 const CLI_STRING_BUFFER: u32 = GUEST_MEMORY_BASE + 0x3000;
-const HELP_TEXT: &[u8] = b"Acorn-2026 MOS commands:\n\r  Commands can be abbreviated with a final dot (for example, *CA.); *. is a shortcut for *CAT.\n\r  *CAT [dir]             Catalogue a directory.\n\r  *DIR [dir]             Select the current directory.\n\r  *CDIR <dir>            Create a directory.\n\r  *DELETE <file>         Delete a file.\n\r  *RENAME <old> <new>    Rename a file or directory.\n\r  *FILETYPE <file> <id>  Set a RISC OS file type.\n\r  *TYPE <file>           Display a text file.\n\r  *DISC [name]           Read or set the volume name.\n\r  *HOSTFS                Select the HostFS filing system.\n\r  *CONFIGURE <option> <value> Save a BASIC preference.\n\r  *CONFIGURE DEFAULTS    Restore BASIC preferences.\n\r  *STATUS [option]       Show saved BASIC preferences.\n\r  *BASIC <file>          Load and run BASIC with saved preferences.\n\r  DESKTOP                Start the hosted Wimp desktop.\n\r  RUN <file>             Run a BASIC source or tokenised file.\n\r  BASICLOAD <file>       Load a tokenised BASIC program.\n\r  BASICRUN               Run the loaded program.\n\r  BASICJIT [file]        Run with experimental native hot regions.\n\r  BASICJIT STRICT [file] Compile and run supported code without fallback.\n\r  HELP                   Show this help.\n\r  QUIT                   Exit the runtime.";
+const HELP_TEXT: &[u8] = b"Acorn-2026 MOS commands:\n\r  Commands can be abbreviated with a final dot (for example, *CA. and *CONF.); *. is a shortcut for *CAT.\n\r  *CAT [dir]             Catalogue a directory.\n\r  *DIR [dir]             Select the current directory.\n\r  *CDIR <dir>            Create a directory.\n\r  *DELETE <file>         Delete a file.\n\r  *RENAME <old> <new>    Rename a file or directory.\n\r  *FILETYPE <file> <id>  Set a RISC OS file type.\n\r  *TYPE <file>           Display a text file.\n\r  *DISC [name]           Read or set the volume name.\n\r  *HOSTFS                Select the HostFS filing system.\n\r  *CONFIGURE <option> <value> Save a BASIC preference.\n\r  *CONFIGURE DEFAULTS    Restore BASIC preferences.\n\r  *STATUS [option]       Show saved BASIC preferences.\n\r  *BASIC <file>          Load and run BASIC with saved preferences.\n\r  DESKTOP                Start the hosted Wimp desktop.\n\r  RUN <file>             Run a BASIC source or tokenised file.\n\r  BASICLOAD <file>       Load a tokenised BASIC program.\n\r  BASICRUN               Run the loaded program.\n\r  BASICJIT [file]        Run with experimental native hot regions.\n\r  BASICJIT STRICT [file] Compile and run supported code without fallback.\n\r  HELP                   Show this help.\n\r  QUIT                   Exit the runtime.";
 
 fn hsv_to_rgb(hue: f64, saturation: f64, value: f64) -> (u8, u8, u8) {
     let hue = hue.rem_euclid(360.0) / 60.0;
@@ -197,7 +197,21 @@ impl SwiDispatcher {
     }
 
     pub(crate) fn load_basic_configuration(&self) -> Result<BasicConfiguration, RuntimeError> {
-        self.configure.load().map_err(RuntimeError::Program)
+        self.effective_configure_store()
+            .load()
+            .map_err(RuntimeError::Program)
+    }
+
+    fn effective_configure_store(&self) -> ConfigureStore {
+        self.wimp
+            .as_ref()
+            .and_then(|wimp| wimp.configure_store())
+            .unwrap_or_else(|| self.configure.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_configure_store_for_test(&mut self, configure: ConfigureStore) {
+        self.configure = configure;
     }
 
     pub(crate) fn set_graphics_profile(
@@ -1877,11 +1891,17 @@ impl SwiDispatcher {
                 self.write_inline(task, b"Syntax: DESKTOP")?;
                 return self.write_new_line(task);
             }
-            let Some(wimp) = self.desktop_service.take() else {
+            let Some(wimp) = self.desktop_service.as_ref().cloned() else {
                 return Err(RuntimeError::Program(
                     "DESKTOP requires the windowed host; restart without --stdio".into(),
                 ));
             };
+
+            // Validate the saved preference at the desktop boundary, then
+            // make the same store available to BASIC tasks started by Wimp.
+            self.load_basic_configuration()?;
+            self.desktop_service = None;
+            wimp.set_configure_store(self.configure.clone());
 
             self.desktop_requested = true;
             self.wimp = Some(Arc::clone(&wimp));
@@ -1920,7 +1940,7 @@ impl SwiDispatcher {
             return self.write_new_line(task);
         }
         if arguments.eq_ignore_ascii_case("DEFAULTS") {
-            return match self.configure.reset() {
+            return match self.effective_configure_store().reset() {
                 Ok(_) => {
                     self.write_inline(task, b"BASIC preferences restored to defaults.")?;
                     self.write_new_line(task)
@@ -1946,7 +1966,7 @@ impl SwiDispatcher {
             return self.write_new_line(task);
         }
 
-        match self.configure.set(option, value) {
+        match self.effective_configure_store().set(option, value) {
             Ok(configuration) => {
                 let (canonical, value) = configuration
                     .status_value(option)
@@ -2256,6 +2276,39 @@ mod tests {
         let mut context = SwiContext::default();
         context.registers[R0] = CLI_STRING_BUFFER;
         dispatcher.dispatch(OS_CLI, task, &mut context)
+    }
+
+    #[test]
+    fn configure_accepts_documented_engine_values_and_conf_abbreviation() {
+        let (_input_sender, input_receiver) = mpsc::channel();
+        let (display_sender, _display_receiver) = mpsc::channel();
+        let mut dispatcher =
+            SwiDispatcher::windowed(HostConsole::windowed(input_receiver), display_sender);
+        let config_path = std::env::temp_dir().join(format!(
+            "acorn-2026-configure-cli-{}.txt",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&config_path);
+        dispatcher.configure = ConfigureStore::with_path(&config_path);
+        let mut task = Task::new(1);
+
+        dispatch_cli_line(
+            &mut dispatcher,
+            &mut task,
+            "*CONFIGURE BASICEngine StrictJIT",
+        )
+        .unwrap();
+        assert_eq!(
+            dispatcher.configure.load().unwrap().engine,
+            BasicEngine::StrictJit
+        );
+
+        dispatch_cli_line(&mut dispatcher, &mut task, "*CONF. BASICEngine HybridJIT").unwrap();
+        assert_eq!(
+            dispatcher.configure.load().unwrap().engine,
+            BasicEngine::HybridJit
+        );
+        let _ = std::fs::remove_file(config_path);
     }
 
     #[test]

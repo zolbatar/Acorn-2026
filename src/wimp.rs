@@ -10,7 +10,7 @@ use std::{
     sync::{Arc, Condvar, Mutex, mpsc::Sender},
 };
 
-use crate::{error::RuntimeError, memory::Task, swi::SwiContext};
+use crate::{configure::ConfigureStore, error::RuntimeError, memory::Task, swi::SwiContext};
 
 pub const WIMP_INITIALISE: u32 = 0x400C0;
 pub const WIMP_CREATE_WINDOW: u32 = 0x400C1;
@@ -364,6 +364,7 @@ pub struct WimpServer {
     state: Mutex<WimpState>,
     changed: Condvar,
     desktop_updates: Sender<()>,
+    configure: Mutex<Option<ConfigureStore>>,
 }
 
 impl WimpServer {
@@ -376,7 +377,22 @@ impl WimpServer {
             }),
             changed: Condvar::new(),
             desktop_updates,
+            configure: Mutex::new(None),
         })
+    }
+
+    pub(crate) fn set_configure_store(&self, configure: ConfigureStore) {
+        *self
+            .configure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(configure);
+    }
+
+    pub(crate) fn configure_store(&self) -> Option<ConfigureStore> {
+        self.configure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub fn dispatch(

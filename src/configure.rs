@@ -59,9 +59,15 @@ impl BasicEngine {
     fn parse(value: &str) -> Option<Self> {
         if value.eq_ignore_ascii_case("INTERPRETER") {
             Some(Self::Interpreter)
-        } else if value.eq_ignore_ascii_case("HYBRID") || value.eq_ignore_ascii_case("HYBRID-JIT") {
+        } else if value.eq_ignore_ascii_case("HYBRID")
+            || value.eq_ignore_ascii_case("HYBRIDJIT")
+            || value.eq_ignore_ascii_case("HYBRID-JIT")
+        {
             Some(Self::HybridJit)
-        } else if value.eq_ignore_ascii_case("STRICT") || value.eq_ignore_ascii_case("STRICT-JIT") {
+        } else if value.eq_ignore_ascii_case("STRICT")
+            || value.eq_ignore_ascii_case("STRICTJIT")
+            || value.eq_ignore_ascii_case("STRICT-JIT")
+        {
             Some(Self::StrictJit)
         } else {
             None
