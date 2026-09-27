@@ -23,7 +23,10 @@ use crate::{
     renderer,
     runtime::Runtime,
     swi::DisplayEvent,
-    wimp::{DESKTOP_HEIGHT, DESKTOP_WIDTH, WimpServer, WindowDrag},
+    wimp::{
+        DESKTOP_OS_UNITS_PER_PIXEL_X, DESKTOP_OS_UNITS_PER_PIXEL_Y, DESKTOP_PIXEL_HEIGHT,
+        DESKTOP_PIXEL_WIDTH, WimpServer, WindowDrag,
+    },
 };
 
 const INITIAL_SCALE: f64 = 1.5;
@@ -181,7 +184,7 @@ impl WindowApp {
 
     fn new_desktop(input: mpsc::Sender<u8>, wimp: std::sync::Arc<WimpServer>) -> Self {
         let mut app = Self::new(input);
-        app.frame_size = (DESKTOP_WIDTH, DESKTOP_HEIGHT);
+        app.frame_size = (DESKTOP_PIXEL_WIDTH, DESKTOP_PIXEL_HEIGHT);
         app.desktop = Some(wimp);
         app
     }
@@ -361,8 +364,11 @@ impl WindowApp {
                 return;
             }
         };
-        let desktop_x = pixel_x as i32;
-        let desktop_y = DESKTOP_HEIGHT as i32 - 1 - pixel_y as i32;
+        let desktop_x =
+            pixel_x as i32 * DESKTOP_OS_UNITS_PER_PIXEL_X + DESKTOP_OS_UNITS_PER_PIXEL_X / 2;
+        let desktop_y = (DESKTOP_PIXEL_HEIGHT as i32 - 1 - pixel_y as i32)
+            * DESKTOP_OS_UNITS_PER_PIXEL_Y
+            + DESKTOP_OS_UNITS_PER_PIXEL_Y / 2;
         self.pointer = Some((desktop_x, desktop_y));
         if let Some(drag) = self.drag {
             wimp.drag_to(drag, desktop_x, desktop_y);

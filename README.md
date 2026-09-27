@@ -2,7 +2,7 @@
 
 > **Build the computer Acorn might have built in 2026.**
 
-Acorn-2026 is a design and implementation project for a modern, tinkerable computer environment inspired by Acorn and RISC OS. It preserves useful ideas and stable interfaces while replacing historical implementation limits. It is not a RISC OS simulator or a retro desktop remake.
+Acorn-2026 is a design and implementation project for a modern, tinkerable computer environment inspired by Acorn and RISC OS. It preserves useful ideas and stable interfaces while replacing historical implementation limits. It is not a full RISC OS simulator or desktop remake; the current Wimp window demo is a narrow visual and service-compatibility study using original 3.71 window furniture and system typography.
 
 This project was also inspired by [pmirvine/risc-os](https://github.com/pmirvine/risc-os).
 
@@ -53,6 +53,22 @@ cargo run -- --desktop-demo
 ```
 
 The host reads `alpha.bas64` and `beta.bas64` from the example directory each time it starts, so you can edit either BASIC program and relaunch without rebuilding Rust. Each task calls the documented Wimp SWI names with 32-bit guest addresses and handles its own `Wimp_Poll` events; the hosted runtime currently runs the two tasks on separate host threads.
+
+To capture the same two real guest tasks and shared Wimp windows without opening a host window, run:
+
+```sh
+cargo run -- --desktop-demo-snapshot /path/to/desktop.ppm
+```
+
+This writes an 800 × 600 P6 PPM image after both demo tasks have reached their initial event loops.
+
+To render a specimen from the original Homerton, Corpus, and Trinity ROM outlines, use:
+
+```sh
+cargo run -- --riscos-font-specimen /path/to/fonts.ppm
+```
+
+This produces a separate 800 × 600 P6 PPM sheet; the desktop does not add a guest `Font_*` SWI as part of this resource test.
 
 To see text and plotted pixels together, enter:
 

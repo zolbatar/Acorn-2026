@@ -1,10 +1,30 @@
 use std::{env, process::ExitCode};
 
-use acorn_2026::{runtime::Runtime, window};
+use acorn_2026::{runtime::Runtime, snapshot, window};
 
 fn main() -> ExitCode {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
-    let result = if arguments.iter().any(|argument| argument == "--stdio") {
+    let result = if let Some(index) = arguments
+        .iter()
+        .position(|argument| argument == "--riscos-font-specimen")
+    {
+        match arguments.get(index + 1) {
+            Some(path) => {
+                snapshot::write_riscos_font_specimen(path).map_err(|error| error.to_string())
+            }
+            None => Err("--riscos-font-specimen requires an output path".into()),
+        }
+    } else if let Some(index) = arguments
+        .iter()
+        .position(|argument| argument == "--desktop-demo-snapshot")
+    {
+        match arguments.get(index + 1) {
+            Some(path) => {
+                snapshot::write_desktop_demo_snapshot(path).map_err(|error| error.to_string())
+            }
+            None => Err("--desktop-demo-snapshot requires an output path".into()),
+        }
+    } else if arguments.iter().any(|argument| argument == "--stdio") {
         let mut runtime = Runtime::stdio();
         runtime.run().map_err(|error| {
             let _ = runtime.report_error(&error);

@@ -204,6 +204,16 @@ impl Default for GraphicsService {
 }
 
 impl GraphicsService {
+    /// Resume a graphics scene from a published task snapshot. The desktop's
+    /// headless renderer uses this same stateful path as the live window.
+    pub(crate) fn from_snapshot(snapshot: GraphicsSnapshot) -> Self {
+        Self {
+            profile: snapshot.mode.profile,
+            snapshot,
+            pending_vdu: None,
+        }
+    }
+
     /// Submit one byte from OS_WriteC. `Some(byte)` is forwarded to the host
     /// console; VDU control bytes and their parameters are consumed here.
     pub fn write_byte(&mut self, byte: u8) -> Result<Option<u8>, RuntimeError> {

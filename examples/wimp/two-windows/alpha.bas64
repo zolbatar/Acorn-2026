@@ -1,26 +1,29 @@
 REM Alpha window task: Wimp events continue through Wimp_Poll.
-MODE 1
+REM Mode 20 is 640x512 with 80x64 text cells; its pixels map 1:1 to the hosted desktop.
+MODE 20
 DIM description% 24
 $description%="Alpha task"
 SYS "Wimp_Initialise",310,&4B534154,description%,0 TO version%,task%
 DIM definition% 87
-REM &B6000002: modern controls, move, title, close, vertical scroll and size.
-REM BASIC integer stores that word as &36000002-2147483648.
-!definition%+28=&36000002-2147483648
+REM &BF000002: RISC OS 3 Back, Close, title, Toggle Size, scroll and resize.
+REM BASIC integer stores that word as &3F000002-2147483648.
+!definition%+28=&3F000002-2147483648
 !definition%+56=1
 title%=definition%+72
 $title%="Alpha App"
-!definition%=30:!definition%+4=80:!definition%+8=390:!definition%+12=360
+!definition%=72:!definition%+4=280:!definition%+8=872:!definition%+12=840
 !definition%+16=0:!definition%+20=0
-!definition%+40=0:!definition%+44=-280:!definition%+48=360:!definition%+52=0
+!definition%+40=0:!definition%+44=-1024:!definition%+48=840:!definition%+52=0
 !definition%+60=&3000:!definition%+68=0:!definition%+84=0
 SYS "Wimp_CreateWindow",,definition% TO window%
 DIM open% 31
-!open%=window%:!open%+4=30:!open%+8=80:!open%+12=390:!open%+16=360
+!open%=window%:!open%+4=72:!open%+8=280:!open%+12=872:!open%+16=840
 !open%+20=0:!open%+24=0:!open%+28=-1
 SYS "Wimp_OpenWindow",,open%
 DIM event% 255
-PRINT "Alpha is ready. Select, Adjust or Menu in this window; press a key while it has focus."
+PRINT "Alpha window"
+PRINT "Select or Adjust a control."
+PRINT "Menu in the work area."
 clicks%=0
 REPEAT
   SYS "Wimp_Poll",1,event% TO reason%
@@ -33,13 +36,13 @@ REPEAT
   IF reason%=6 THEN
     clicks%+=1
     CLS
-    PRINT "Alpha task remains responsive."
+    PRINT "Alpha window"
     PRINT "Mouse clicks: ";clicks%
-    PRINT "Button bits (Select 4, Menu 2, Adjust 1): ";!(event%+8)
+    PRINT "Buttons: ";!(event%+8)
   ENDIF
   IF reason%=8 THEN
     CLS
-    PRINT "Alpha task remains responsive."
+    PRINT "Alpha window"
     PRINT "Key code: ";!(event%+24)
   ENDIF
 UNTIL FALSE

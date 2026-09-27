@@ -27,12 +27,232 @@ const OPEN_BLOCK_SIZE: usize = 32;
 const WINDOW_STATE_BLOCK_SIZE: usize = 36;
 const POLL_BLOCK_SIZE: usize = 256;
 const MAX_EVENT_QUEUE: usize = 256;
-pub const DESKTOP_WIDTH: u32 = 800;
-pub const DESKTOP_HEIGHT: u32 = 600;
-const TITLE_HEIGHT: i32 = 24;
-const VERTICAL_SCROLLBAR_WIDTH: i32 = 14;
-const SIZE_ICON_HEIGHT: i32 = 14;
+/// Hosted desktop scene size in pixels. Host window scaling is a separate step.
+pub const DESKTOP_PIXEL_WIDTH: u32 = 800;
+pub const DESKTOP_PIXEL_HEIGHT: u32 = 600;
+/// RISC OS Wimp coordinates are OS graphics units, not framebuffer pixels.
+/// This hosted desktop uses the classic 2 OS units per square display pixel.
+pub const DESKTOP_OS_UNITS_PER_PIXEL_X: i32 = 2;
+pub const DESKTOP_OS_UNITS_PER_PIXEL_Y: i32 = 2;
+pub const DESKTOP_WIDTH: i32 = DESKTOP_PIXEL_WIDTH as i32 * DESKTOP_OS_UNITS_PER_PIXEL_X;
+pub const DESKTOP_HEIGHT: i32 = DESKTOP_PIXEL_HEIGHT as i32 * DESKTOP_OS_UNITS_PER_PIXEL_Y;
+pub const SYSTEM_FONT_WIDTH: i32 = 16;
+pub const SYSTEM_FONT_HEIGHT: i32 = 32;
+const FRAME_BORDER: i32 = 2;
+const TITLE_HEIGHT: i32 = 44;
+const VERTICAL_SCROLLBAR_WIDTH: i32 = 44;
+const SCROLL_ARROW_SIZE: i32 = 44;
+const MIN_SLIDER_SIZE: i32 = 44;
+const SIZE_ICON_HEIGHT: i32 = 44;
 const MAX_DESKTOP_COORDINATE: i32 = 16_384;
+const SCROLL_ARROW_STEP: i32 = 32;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DesktopRect {
+    pub min_x: i32,
+    pub min_y: i32,
+    pub max_x: i32,
+    pub max_y: i32,
+}
+
+impl DesktopRect {
+    pub fn contains(self, x: i32, y: i32) -> bool {
+        x >= self.min_x && x < self.max_x && y >= self.min_y && y < self.max_y
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.max_x <= self.min_x || self.max_y <= self.min_y
+    }
+}
+
+impl WindowFurnitureLayout {
+    pub fn new(
+        work_area: WorkArea,
+        work_extent: WorkArea,
+        _scroll_x: i32,
+        scroll_y: i32,
+        has_back_icon: bool,
+        has_title: bool,
+        closable: bool,
+        has_toggle_size_icon: bool,
+        has_vertical_scrollbar: bool,
+        resizable: bool,
+    ) -> Self {
+        let work = DesktopRect {
+            min_x: work_area.min_x,
+            min_y: work_area.min_y,
+            max_x: work_area.max_x,
+            max_y: work_area.max_y,
+        };
+        let outer = DesktopRect {
+            min_x: work.min_x - FRAME_BORDER,
+            min_y: work.min_y - if resizable { SIZE_ICON_HEIGHT } else { 0 } - FRAME_BORDER,
+            max_x: work.max_x
+                + if has_vertical_scrollbar {
+                    VERTICAL_SCROLLBAR_WIDTH
+                } else {
+                    0
+                }
+                + FRAME_BORDER,
+            max_y: work.max_y
+                + if has_title || has_toggle_size_icon {
+                    TITLE_HEIGHT
+                } else {
+                    0
+                }
+                + FRAME_BORDER,
+        };
+
+        let mut left = work.min_x;
+        let header_bottom = work.max_y;
+        let header_top = header_bottom + TITLE_HEIGHT;
+        let back_icon = if has_title && has_back_icon {
+            let icon = DesktopRect {
+                min_x: left,
+                min_y: header_bottom,
+                max_x: left + TITLE_HEIGHT,
+                max_y: header_top,
+            };
+            left += TITLE_HEIGHT;
+            Some(icon)
+        } else {
+            None
+        };
+        let close_icon = if has_title && closable {
+            let icon = DesktopRect {
+                min_x: left,
+                min_y: header_bottom,
+                max_x: left + TITLE_HEIGHT,
+                max_y: header_top,
+            };
+            left += TITLE_HEIGHT;
+            Some(icon)
+        } else {
+            None
+        };
+        let right = outer.max_x - FRAME_BORDER;
+        let toggle_size_icon = if has_toggle_size_icon {
+            Some(DesktopRect {
+                min_x: right - TITLE_HEIGHT,
+                min_y: header_bottom,
+                max_x: right,
+                max_y: header_top,
+            })
+        } else {
+            None
+        };
+        let title_bar = if has_title {
+            let title_right = toggle_size_icon.map_or(right, |icon| icon.min_x);
+            Some(DesktopRect {
+                min_x: left,
+                min_y: header_bottom,
+                max_x: title_right.max(left),
+                max_y: header_top,
+            })
+        } else {
+            None
+        };
+
+        let vertical_scrollbar = has_vertical_scrollbar.then(|| {
+            let bounds = DesktopRect {
+                min_x: work.max_x,
+                min_y: work.min_y,
+                max_x: work.max_x + VERTICAL_SCROLLBAR_WIDTH,
+                max_y: work.max_y,
+            };
+            let up_arrow = DesktopRect {
+                min_x: bounds.min_x,
+                min_y: (bounds.max_y - SCROLL_ARROW_SIZE).max(bounds.min_y),
+                max_x: bounds.max_x,
+                max_y: bounds.max_y,
+            };
+            let down_arrow = DesktopRect {
+                min_x: bounds.min_x,
+                min_y: bounds.min_y,
+                max_x: bounds.max_x,
+                max_y: (bounds.min_y + SCROLL_ARROW_SIZE).min(bounds.max_y),
+            };
+            let track = DesktopRect {
+                min_x: bounds.min_x,
+                min_y: down_arrow.max_y.min(up_arrow.min_y),
+                max_x: bounds.max_x,
+                max_y: up_arrow.min_y.max(down_arrow.max_y),
+            };
+            let track_height = (track.max_y - track.min_y).max(0);
+            let visible_height = (work.max_y - work.min_y).max(0);
+            let extent_height = (work_extent.max_y - work_extent.min_y).max(visible_height);
+            let slider_height = if extent_height == 0 {
+                track_height
+            } else {
+                (track_height.saturating_mul(visible_height) / extent_height)
+                    .clamp(track_height.min(MIN_SLIDER_SIZE), track_height)
+            };
+            let scroll_range = (extent_height - visible_height).max(0);
+            let top_scroll = work_extent.max_y - scroll_y;
+            let scroll_position = top_scroll.clamp(0, scroll_range);
+            let slider_travel = (track_height - slider_height).max(0);
+            let slider_top = track.max_y
+                - if scroll_range == 0 {
+                    0
+                } else {
+                    (i64::from(slider_travel) * i64::from(scroll_position)
+                        / i64::from(scroll_range)) as i32
+                };
+            let slider = DesktopRect {
+                min_x: bounds.min_x,
+                min_y: slider_top - slider_height,
+                max_x: bounds.max_x,
+                max_y: slider_top,
+            };
+            VerticalScrollbarLayout {
+                bounds,
+                up_arrow,
+                down_arrow,
+                track,
+                slider,
+            }
+        });
+        let adjust_size_icon = resizable.then(|| DesktopRect {
+            min_x: outer.max_x - VERTICAL_SCROLLBAR_WIDTH - FRAME_BORDER,
+            min_y: work.min_y - SIZE_ICON_HEIGHT,
+            max_x: outer.max_x - FRAME_BORDER,
+            max_y: work.min_y,
+        });
+        Self {
+            outer,
+            work_area: work,
+            back_icon,
+            close_icon,
+            title_bar,
+            toggle_size_icon,
+            vertical_scrollbar,
+            adjust_size_icon,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VerticalScrollbarLayout {
+    pub bounds: DesktopRect,
+    pub up_arrow: DesktopRect,
+    pub down_arrow: DesktopRect,
+    pub track: DesktopRect,
+    pub slider: DesktopRect,
+}
+
+/// One source of truth for Wimp furniture drawing and pointer hit testing.
+/// Rectangles use inclusive-minimum/exclusive-maximum RISC OS screen OS units.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WindowFurnitureLayout {
+    pub outer: DesktopRect,
+    pub work_area: DesktopRect,
+    pub back_icon: Option<DesktopRect>,
+    pub close_icon: Option<DesktopRect>,
+    pub title_bar: Option<DesktopRect>,
+    pub toggle_size_icon: Option<DesktopRect>,
+    pub vertical_scrollbar: Option<VerticalScrollbarLayout>,
+    pub adjust_size_icon: Option<DesktopRect>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WorkArea {
@@ -48,11 +268,18 @@ pub struct DesktopWindow {
     pub owner_task_id: u64,
     pub title: String,
     pub work_area: WorkArea,
+    pub work_extent: WorkArea,
+    pub scroll_x: i32,
+    pub scroll_y: i32,
     /// A move/resize preview remains an outline until the owner accepts its
     /// Open_Window_Request with Wimp_OpenWindow.
     pub preview_area: Option<WorkArea>,
+    pub preview_scroll: Option<(i32, i32)>,
+    pub has_back_icon: bool,
     pub has_title: bool,
     pub has_vertical_scrollbar: bool,
+    pub has_toggle_size_icon: bool,
+    pub maximized: bool,
     pub closable: bool,
     pub movable: bool,
     pub resizable: bool,
@@ -63,6 +290,7 @@ pub struct DesktopWindow {
 pub enum WindowDragKind {
     Move,
     Resize,
+    ScrollSlider,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,6 +300,8 @@ pub struct WindowDrag {
     pub start_x: i32,
     pub start_y: i32,
     pub original: WorkArea,
+    pub original_scroll: (i32, i32),
+    pub slider_grab_offset: i32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,12 +330,20 @@ struct WimpWindow {
     scroll_x: i32,
     scroll_y: i32,
     has_title: bool,
+    has_back_icon: bool,
     has_vertical_scrollbar: bool,
+    has_toggle_size_icon: bool,
     closable: bool,
     movable: bool,
     resizable: bool,
     open: bool,
     preview_area: Option<WorkArea>,
+    preview_scroll: Option<(i32, i32)>,
+    last_user_area: WorkArea,
+    last_user_scroll: (i32, i32),
+    maximized: bool,
+    toggle_request_pending: bool,
+    restore_behind: i32,
 }
 
 #[derive(Debug, Default)]
@@ -173,9 +411,16 @@ impl WimpServer {
                 owner_task_id: window.owner_task_id,
                 title: window.title.clone(),
                 work_area: window.work_area,
+                work_extent: window.work_extent,
+                scroll_x: window.scroll_x,
+                scroll_y: window.scroll_y,
                 preview_area: window.preview_area,
+                preview_scroll: window.preview_scroll,
+                has_back_icon: window.has_back_icon,
                 has_title: window.has_title,
                 has_vertical_scrollbar: window.has_vertical_scrollbar,
+                has_toggle_size_icon: window.has_toggle_size_icon,
+                maximized: window.maximized,
                 closable: window.closable,
                 movable: window.movable,
                 resizable: window.resizable,
@@ -184,8 +429,33 @@ impl WimpServer {
             .collect()
     }
 
-    /// Route a desktop click. `x` and `y` use hosted Wimp coordinates: the
-    /// origin is at the bottom left and one OS unit is one desktop pixel.
+    pub fn furniture_layout(&self) -> Vec<(DesktopWindow, WindowFurnitureLayout)> {
+        self.desktop_windows()
+            .into_iter()
+            .map(|window| {
+                let area = window.preview_area.unwrap_or(window.work_area);
+                let (scroll_x, scroll_y) = window
+                    .preview_scroll
+                    .unwrap_or((window.scroll_x, window.scroll_y));
+                let layout = WindowFurnitureLayout::new(
+                    area,
+                    window.work_extent,
+                    scroll_x,
+                    scroll_y,
+                    window.has_back_icon,
+                    window.has_title,
+                    window.closable,
+                    window.has_toggle_size_icon,
+                    window.has_vertical_scrollbar,
+                    window.resizable,
+                );
+                (window, layout)
+            })
+            .collect()
+    }
+
+    /// Route a desktop click. `x` and `y` use Wimp screen OS units with a
+    /// bottom-left origin; host display pixels are converted at the boundary.
     pub fn mouse_down(&self, x: i32, y: i32, buttons: u32) -> Option<WindowDrag> {
         let mut state = self.state.lock().ok()?;
         let handle = state.stacking.iter().copied().find(|handle| {
@@ -198,41 +468,121 @@ impl WimpServer {
             return None;
         };
         let window = state.windows.get(&handle)?.clone();
-        state.keyboard_focus = Some(handle);
 
-        if buttons == 2 {
-            let _ = enqueue_for_owner(
-                &mut state,
-                window.owner_task_handle,
-                mouse_event(x, y, buttons, window.handle),
-            );
+        let layout = window_furniture(&window);
+        let hovered_icon = system_icon_at(layout, x, y);
+        if buttons & 2 != 0 && hovered_icon.is_some_and(|icon| icon != -1) {
+            // Wimp03 bypasses system furniture for Menu; negative system
+            // handles are pointer-query results, never Mouse_Click icons.
+            drop(state);
+            return None;
+        }
+        state.keyboard_focus = Some(handle);
+        if let Some(icon) = hovered_icon.filter(|icon| *icon != -1) {
+            match icon {
+                -2 if buttons & 4 != 0 || buttons & 1 != 0 => {
+                    send_to_back(&mut state, handle);
+                }
+                -3 if buttons & (4 | 1) != 0 => {
+                    let _ = enqueue_for_owner(
+                        &mut state,
+                        window.owner_task_handle,
+                        event_with_word(3, 0, window.handle),
+                    );
+                }
+                -5 if buttons & (4 | 1) != 0 => {
+                    let select = buttons & 4 != 0;
+                    toggle_window_size(&mut state, handle, select);
+                }
+                -6 | -8 => {
+                    let direction = if icon == -6 { 1 } else { -1 };
+                    request_or_apply_scroll(&mut state, handle, buttons, 0, direction);
+                }
+                -7 => {
+                    if let Some(bar) = layout.vertical_scrollbar {
+                        if bar.slider.contains(x, y) {
+                            let drag = WindowDrag {
+                                handle,
+                                kind: WindowDragKind::ScrollSlider,
+                                start_x: x,
+                                start_y: y,
+                                original: window.work_area,
+                                original_scroll: (window.scroll_x, window.scroll_y),
+                                // Wimp keeps the pointer's offset from the
+                                // thumb's top edge while dragging. This makes
+                                // a press/release without movement a no-op.
+                                slider_grab_offset: y - bar.slider.max_y,
+                            };
+                            drop(state);
+                            self.changed.notify_all();
+                            let _ = self.desktop_updates.send(());
+                            return Some(drag);
+                        }
+                        let direction = if y >= bar.slider.max_y { 2 } else { -2 };
+                        request_or_apply_scroll(&mut state, handle, buttons, 0, direction);
+                    }
+                }
+                -9 => {
+                    let drag = WindowDrag {
+                        handle,
+                        kind: WindowDragKind::Resize,
+                        start_x: x,
+                        start_y: y,
+                        original: window.work_area,
+                        original_scroll: (window.scroll_x, window.scroll_y),
+                        slider_grab_offset: 0,
+                    };
+                    drop(state);
+                    self.changed.notify_all();
+                    let _ = self.desktop_updates.send(());
+                    return Some(drag);
+                }
+                -4 => {
+                    if buttons & 4 != 0 && window.movable {
+                        bring_to_front(&mut state, handle);
+                        let drag = WindowDrag {
+                            handle,
+                            kind: WindowDragKind::Move,
+                            start_x: x,
+                            start_y: y,
+                            original: window.work_area,
+                            original_scroll: (window.scroll_x, window.scroll_y),
+                            slider_grab_offset: 0,
+                        };
+                        drop(state);
+                        self.changed.notify_all();
+                        let _ = self.desktop_updates.send(());
+                        return Some(drag);
+                    } else if buttons & 1 != 0 && window.movable {
+                        let drag = WindowDrag {
+                            handle,
+                            kind: WindowDragKind::Move,
+                            start_x: x,
+                            start_y: y,
+                            original: window.work_area,
+                            original_scroll: (window.scroll_x, window.scroll_y),
+                            slider_grab_offset: 0,
+                        };
+                        drop(state);
+                        self.changed.notify_all();
+                        let _ = self.desktop_updates.send(());
+                        return Some(drag);
+                    }
+                }
+                _ => {}
+            }
             drop(state);
             self.changed.notify_all();
+            let _ = self.desktop_updates.send(());
             return None;
         }
 
-        let outer_right = window_outer_right(&window);
-        let in_title = window.has_title
-            && y >= window.work_area.max_y
-            && y < window.work_area.max_y + TITLE_HEIGHT
-            && x >= window.work_area.min_x
-            && x < outer_right;
-        let in_close = in_title
-            && window.closable
-            && x >= outer_right - 22
-            && y >= window.work_area.max_y.saturating_add(2);
-        let in_resize = window.resizable
-            && x >= window.work_area.max_x
-            && x < outer_right
-            && y >= window.work_area.min_y - SIZE_ICON_HEIGHT
-            && y < window.work_area.min_y;
-
-        if in_close {
-            if buttons == 4 {
+        if buttons & 2 != 0 {
+            if hovered_icon == Some(-1) {
                 let _ = enqueue_for_owner(
                     &mut state,
                     window.owner_task_handle,
-                    event_with_word(3, 0, window.handle),
+                    mouse_event_with_icon(x, y, buttons, window.handle, -1),
                 );
             }
             drop(state);
@@ -240,16 +590,11 @@ impl WimpServer {
             return None;
         }
 
-        let drag = if in_resize {
-            Some(WindowDrag {
-                handle,
-                kind: WindowDragKind::Resize,
-                start_x: x,
-                start_y: y,
-                original: window.work_area,
-            })
-        } else if in_title && window.movable && buttons != 2 {
-            if buttons == 4 {
+        let drag = if layout.title_bar.is_some_and(|rect| rect.contains(x, y))
+            && window.movable
+            && buttons & (4 | 1) != 0
+        {
+            if buttons & 4 != 0 {
                 bring_to_front(&mut state, handle);
             }
             Some(WindowDrag {
@@ -258,17 +603,16 @@ impl WimpServer {
                 start_x: x,
                 start_y: y,
                 original: window.work_area,
+                original_scroll: (window.scroll_x, window.scroll_y),
+                slider_grab_offset: 0,
             })
-        } else if x < window.work_area.max_x
-            && y >= window.work_area.min_y
-            && y < window.work_area.max_y
-        {
+        } else if layout.work_area.contains(x, y) {
             let button_type = ((window.work_area_flags >> 12) & 0xF) as u32;
             if button_type == 3 {
                 let _ = enqueue_for_owner(
                     &mut state,
                     window.owner_task_handle,
-                    mouse_event(x, y, buttons, window.handle),
+                    mouse_event_with_icon(x, y, buttons, window.handle, -1),
                 );
             }
             None
@@ -290,23 +634,36 @@ impl WimpServer {
         };
         let dx = x.saturating_sub(drag.start_x);
         let dy = y.saturating_sub(drag.start_y);
-        let max_width = (window.work_extent.max_x - window.scroll_x)
-            .min(DESKTOP_WIDTH as i32 - drag.original.min_x - window_outer_extra_x(window))
+        let layout = WindowFurnitureLayout::new(
+            drag.original,
+            window.work_extent,
+            drag.original_scroll.0,
+            drag.original_scroll.1,
+            window.has_back_icon,
+            window.has_title,
+            window.closable,
+            window.has_toggle_size_icon,
+            window.has_vertical_scrollbar,
+            window.resizable,
+        );
+        let max_width = (window.work_extent.max_x - drag.original_scroll.0)
+            .min(DESKTOP_WIDTH - drag.original.min_x - window_outer_extra_x(window))
             .max(1);
-        let max_height = (window.scroll_y - window.work_extent.min_y)
+        let max_height = (drag.original_scroll.1 - window.work_extent.min_y)
             .min(drag.original.max_y - window_outer_bottom_extra_y(window))
             .max(1);
+        let mut scroll = drag.original_scroll;
         let area = match drag.kind {
             WindowDragKind::Move => {
                 let width = drag.original.max_x - drag.original.min_x;
                 let height = drag.original.max_y - drag.original.min_y;
                 let min_x = drag.original.min_x.saturating_add(dx).clamp(
-                    0,
-                    DESKTOP_WIDTH as i32 - width - window_outer_extra_x(window),
+                    FRAME_BORDER,
+                    DESKTOP_WIDTH - width - window_outer_extra_x(window),
                 );
                 let min_y = drag.original.min_y.saturating_add(dy).clamp(
                     window_outer_bottom_extra_y(window),
-                    DESKTOP_HEIGHT as i32 - height - window_outer_top_extra_y(window),
+                    DESKTOP_HEIGHT - height - window_outer_top_extra_y(window),
                 );
                 WorkArea {
                     min_x,
@@ -335,12 +692,34 @@ impl WimpServer {
                     ..drag.original
                 }
             }
+            WindowDragKind::ScrollSlider => {
+                if let Some(bar) = layout.vertical_scrollbar {
+                    let track_height = bar.track.max_y - bar.track.min_y;
+                    let slider_height = bar.slider.max_y - bar.slider.min_y;
+                    let slider_travel = (track_height - slider_height).max(0);
+                    let scroll_range = (window.work_extent.max_y
+                        - window.work_extent.min_y
+                        - (drag.original.max_y - drag.original.min_y))
+                        .max(0);
+                    if slider_travel > 0 && scroll_range > 0 {
+                        let slider_top = y.saturating_sub(drag.slider_grab_offset);
+                        if slider_top != bar.slider.max_y {
+                            let slider_offset =
+                                (bar.track.max_y - slider_top).clamp(0, slider_travel);
+                            let scrolled = i64::from(slider_offset) * i64::from(scroll_range)
+                                / i64::from(slider_travel);
+                            scroll.1 = window.work_extent.max_y - scrolled as i32;
+                        }
+                    }
+                }
+                drag.original
+            }
         };
-        window.preview_area =
-            validate_visible_area(window.work_extent, area, window.scroll_x, window.scroll_y)
-                .and_then(|()| validate_screen_area(window, area))
-                .ok()
-                .map(|()| area);
+        let valid = validate_visible_area(window.work_extent, area, scroll.0, scroll.1)
+            .and_then(|()| validate_screen_area(window, area))
+            .is_ok();
+        window.preview_area = valid.then_some(area);
+        window.preview_scroll = valid.then_some(scroll);
         drop(state);
         let _ = self.desktop_updates.send(());
     }
@@ -349,14 +728,21 @@ impl WimpServer {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        let Some(window) = state.windows.get(&drag.handle) else {
+        let behind = window_behind(&state, drag.handle);
+        let Some(window) = state.windows.get_mut(&drag.handle) else {
             return;
         };
-        let event = open_request_event(
-            &state,
-            window,
-            window.preview_area.unwrap_or(window.work_area),
-        );
+        let area = window.preview_area.unwrap_or(window.work_area);
+        let scroll = window
+            .preview_scroll
+            .unwrap_or((window.scroll_x, window.scroll_y));
+        if window.maximized && drag.kind != WindowDragKind::ScrollSlider {
+            window.maximized = false;
+            window.last_user_area = area;
+            window.last_user_scroll = scroll;
+            window.restore_behind = behind;
+        }
+        let event = open_request_event(window, area, scroll, behind, 0, 0);
         let owner = window.owner_task_handle;
         let _ = enqueue_for_owner(&mut state, owner, event);
         drop(state);
@@ -463,7 +849,16 @@ impl WimpServer {
         let title_flags = read_word(&block, 56);
         let modern_controls = flags & (1 << 31) != 0;
         let supported_flags = if modern_controls {
-            (1 << 31) | (1 << 29) | (1 << 28) | (1 << 26) | (1 << 25) | (1 << 1)
+            (1 << 31)
+                | (1 << 29)
+                | (1 << 28)
+                | (1 << 27)
+                | (1 << 26)
+                | (1 << 25)
+                | (1 << 24)
+                | (1 << 9)
+                | (1 << 8)
+                | (1 << 1)
         } else {
             (1 << 7) | (1 << 2) | (1 << 1) | (1 << 0)
         };
@@ -492,6 +887,11 @@ impl WimpServer {
         } else {
             flags & 1 != 0
         };
+        let has_back_icon = if modern_controls {
+            flags & (1 << 24) != 0
+        } else {
+            has_title && flags & (1 << 7) == 0
+        };
         let closable = if modern_controls {
             flags & (1 << 25) != 0
         } else {
@@ -500,6 +900,17 @@ impl WimpServer {
         if closable && !has_title {
             return Err(program_error(
                 "Wimp_CreateWindow Close icon requires a Title Bar",
+            ));
+        }
+        let has_toggle_size_icon = modern_controls && flags & (1 << 27) != 0;
+        if has_back_icon && !has_title {
+            return Err(program_error(
+                "Wimp_CreateWindow Back icon requires a Title Bar",
+            ));
+        }
+        if has_toggle_size_icon && !(has_title || has_vertical_scrollbar) {
+            return Err(program_error(
+                "Wimp_CreateWindow Toggle Size icon requires a Title Bar or vertical scroll bar",
             ));
         }
         if has_title && (title_flags & (1 << 8) != 0 || title_flags & (1 << 1) != 0) {
@@ -524,8 +935,17 @@ impl WimpServer {
             max_y: read_word(&block, 52) as i32,
         };
         validate_geometry(work_extent)?;
-        let min_width = read_halfword(&block, 68) as i32;
-        let min_height = read_halfword(&block, 70) as i32;
+        let declared_min_width = read_halfword(&block, 68) as i32;
+        let declared_min_height = read_halfword(&block, 70) as i32;
+        let min_width = minimum_work_width(
+            declared_min_width,
+            has_title,
+            has_back_icon,
+            closable,
+            has_toggle_size_icon,
+            has_vertical_scrollbar,
+        );
+        let min_height = minimum_work_height(declared_min_height, has_vertical_scrollbar);
         let work_area_flags = read_word(&block, 60);
         let button_type = (work_area_flags >> 12) & 0xF;
         if !matches!(button_type, 0 | 3) {
@@ -556,7 +976,12 @@ impl WimpServer {
                 initial_scroll_y,
             )?;
             validate_min_dimensions(initial_area, min_width, min_height)?;
-            validate_screen_area_parts(initial_area, has_title, has_vertical_scrollbar, resizable)?;
+            validate_screen_area_parts(
+                initial_area,
+                has_title || has_toggle_size_icon,
+                has_vertical_scrollbar,
+                resizable,
+            )?;
         }
 
         let mut state = self.lock_state()?;
@@ -581,12 +1006,20 @@ impl WimpServer {
                 scroll_x: initial_scroll_x,
                 scroll_y: initial_scroll_y,
                 has_title,
+                has_back_icon,
                 has_vertical_scrollbar,
+                has_toggle_size_icon,
                 closable,
                 movable: flags & (1 << 1) != 0,
                 resizable,
                 open: false,
                 preview_area: None,
+                preview_scroll: None,
+                last_user_area: initial_area,
+                last_user_scroll: (initial_scroll_x, initial_scroll_y),
+                maximized: false,
+                toggle_request_pending: false,
+                restore_behind: -1,
             },
         );
         context.registers[0] = handle;
@@ -639,11 +1072,17 @@ impl WimpServer {
         }
         let next_stacking = stacking_after_open(&state, handle, behind)?;
         let window = state.windows.get_mut(&handle).expect("window was checked");
+        if !window.maximized && !window.toggle_request_pending {
+            window.last_user_area = area;
+            window.last_user_scroll = (scroll_x, scroll_y);
+        }
         window.work_area = area;
         window.scroll_x = scroll_x;
         window.scroll_y = scroll_y;
         window.open = true;
         window.preview_area = None;
+        window.preview_scroll = None;
+        window.toggle_request_pending = false;
         state.stacking = next_stacking;
         drop(state);
         self.changed.notify_all();
@@ -683,14 +1122,8 @@ impl WimpServer {
         // Validate the entire caller-owned block before waiting. A bad pointer
         // must not suspend the task or consume a queued event.
         task.memory.read_bytes(address, POLL_BLOCK_SIZE)?;
-        let reserved = (1 << 2)
-            | (1 << 3)
-            | (1 << 7)
-            | (1 << 9)
-            | (1 << 10)
-            | (0x7 << 14)
-            | (0x3 << 20)
-            | (0x7F << 25);
+        let reserved =
+            (1 << 2) | (1 << 3) | (1 << 7) | (1 << 9) | (0x7 << 14) | (0x3 << 20) | (0x7F << 25);
         if mask & reserved != 0 {
             return Err(program_error("Wimp_Poll has a non-zero reserved mask bit"));
         }
@@ -773,10 +1206,33 @@ impl WimpServer {
                 .take_while(|item| **item != handle)
                 .any(|other| {
                     state.windows.get(other).is_some_and(|front_window| {
-                        overlaps(front_window.work_area, window.work_area)
+                        rects_overlap(
+                            window_furniture(front_window).outer,
+                            window_furniture(window).outer,
+                        )
                     })
                 });
-        let mut flags = window.flags & !((1 << 16) | (1 << 17) | (1 << 20));
+        let dynamic_mask = (1 << 16) | (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
+        let control_mask = (1 << 24) | (1 << 25) | (1 << 26) | (1 << 27) | (1 << 28) | (1 << 29);
+        let mut flags = window.flags & !(dynamic_mask | control_mask);
+        if window.has_back_icon {
+            flags |= 1 << 24;
+        }
+        if window.closable {
+            flags |= 1 << 25;
+        }
+        if window.has_title {
+            flags |= 1 << 26;
+        }
+        if window.has_toggle_size_icon {
+            flags |= 1 << 27;
+        }
+        if window.has_vertical_scrollbar {
+            flags |= 1 << 28;
+        }
+        if window.resizable {
+            flags |= 1 << 29;
+        }
         if window.open {
             flags |= 1 << 16;
         }
@@ -785,6 +1241,12 @@ impl WimpServer {
         }
         if state.keyboard_focus == Some(handle) {
             flags |= 1 << 20;
+        }
+        if window.maximized {
+            flags |= 1 << 18;
+        }
+        if window.toggle_request_pending {
+            flags |= 1 << 19;
         }
         let mut result = [0; WINDOW_STATE_BLOCK_SIZE];
         put_word(&mut result, 0, handle);
@@ -830,46 +1292,108 @@ impl WimpServer {
     }
 }
 
-fn point_in_window(window: &WimpWindow, x: i32, y: i32) -> bool {
-    let bottom_extra = if window.resizable {
-        SIZE_ICON_HEIGHT
-    } else {
-        0
-    };
-    x >= window.work_area.min_x
-        && x < window_outer_right(window)
-        && y >= window.work_area.min_y.saturating_sub(bottom_extra)
-        && y < window.work_area.max_y.saturating_add(if window.has_title {
-            TITLE_HEIGHT
-        } else {
-            0
-        })
+pub fn desktop_window_furniture(window: &DesktopWindow) -> WindowFurnitureLayout {
+    let area = window.preview_area.unwrap_or(window.work_area);
+    let (scroll_x, scroll_y) = window
+        .preview_scroll
+        .unwrap_or((window.scroll_x, window.scroll_y));
+    WindowFurnitureLayout::new(
+        area,
+        window.work_extent,
+        scroll_x,
+        scroll_y,
+        window.has_back_icon,
+        window.has_title,
+        window.closable,
+        window.has_toggle_size_icon,
+        window.has_vertical_scrollbar,
+        window.resizable,
+    )
 }
 
-fn window_outer_right(window: &WimpWindow) -> i32 {
-    window
-        .work_area
-        .max_x
-        .saturating_add(window_outer_extra_x(window))
+fn window_furniture(window: &WimpWindow) -> WindowFurnitureLayout {
+    WindowFurnitureLayout::new(
+        window.preview_area.unwrap_or(window.work_area),
+        window.work_extent,
+        window
+            .preview_scroll
+            .map_or(window.scroll_x, |scroll| scroll.0),
+        window
+            .preview_scroll
+            .map_or(window.scroll_y, |scroll| scroll.1),
+        window.has_back_icon,
+        window.has_title,
+        window.closable,
+        window.has_toggle_size_icon,
+        window.has_vertical_scrollbar,
+        window.resizable,
+    )
+}
+
+fn point_in_window(window: &WimpWindow, x: i32, y: i32) -> bool {
+    window_furniture(window).outer.contains(x, y)
+}
+
+fn system_icon_at(layout: WindowFurnitureLayout, x: i32, y: i32) -> Option<i32> {
+    if layout.back_icon.is_some_and(|rect| rect.contains(x, y)) {
+        return Some(-2);
+    }
+    if layout.close_icon.is_some_and(|rect| rect.contains(x, y)) {
+        return Some(-3);
+    }
+    if layout
+        .toggle_size_icon
+        .is_some_and(|rect| rect.contains(x, y))
+    {
+        return Some(-5);
+    }
+    if layout
+        .adjust_size_icon
+        .is_some_and(|rect| rect.contains(x, y))
+    {
+        return Some(-9);
+    }
+    if let Some(bar) = layout.vertical_scrollbar {
+        if bar.up_arrow.contains(x, y) {
+            return Some(-6);
+        }
+        if bar.down_arrow.contains(x, y) {
+            return Some(-8);
+        }
+        if bar.bounds.contains(x, y) {
+            return Some(-7);
+        }
+    }
+    if layout.title_bar.is_some_and(|rect| rect.contains(x, y)) {
+        return Some(-4);
+    }
+    if layout.work_area.contains(x, y) {
+        return Some(-1);
+    }
+    layout.outer.contains(x, y).then_some(-13)
 }
 
 fn window_outer_extra_x(window: &WimpWindow) -> i32 {
     if window.has_vertical_scrollbar {
-        VERTICAL_SCROLLBAR_WIDTH
+        VERTICAL_SCROLLBAR_WIDTH + FRAME_BORDER
     } else {
-        0
+        FRAME_BORDER
     }
 }
 
 fn window_outer_top_extra_y(window: &WimpWindow) -> i32 {
-    if window.has_title { TITLE_HEIGHT } else { 0 }
+    if window.has_title || window.has_toggle_size_icon {
+        TITLE_HEIGHT + FRAME_BORDER
+    } else {
+        FRAME_BORDER
+    }
 }
 
 fn window_outer_bottom_extra_y(window: &WimpWindow) -> i32 {
     if window.resizable {
-        SIZE_ICON_HEIGHT
+        SIZE_ICON_HEIGHT + FRAME_BORDER
     } else {
-        0
+        FRAME_BORDER
     }
 }
 
@@ -922,7 +1446,7 @@ fn validate_min_dimensions(
 ) -> Result<(), RuntimeError> {
     if area.max_x - area.min_x < minimum_width || area.max_y - area.min_y < minimum_height {
         return Err(program_error(
-            "Wimp window is smaller than its declared minimum size",
+            "Wimp window is smaller than its minimum control size",
         ));
     }
     Ok(())
@@ -931,10 +1455,45 @@ fn validate_min_dimensions(
 fn validate_screen_area(window: &WimpWindow, area: WorkArea) -> Result<(), RuntimeError> {
     validate_screen_area_parts(
         area,
-        window.has_title,
+        window.has_title || window.has_toggle_size_icon,
         window.has_vertical_scrollbar,
         window.resizable,
     )
+}
+
+fn minimum_work_width(
+    declared: i32,
+    has_title: bool,
+    has_back_icon: bool,
+    closable: bool,
+    has_toggle_size_icon: bool,
+    has_vertical_scrollbar: bool,
+) -> i32 {
+    let left_icons = if has_title {
+        i32::from(has_back_icon) + i32::from(closable)
+    } else {
+        0
+    };
+    let right_icons = i32::from(has_toggle_size_icon);
+    let title_text = if has_title { SYSTEM_FONT_WIDTH } else { 0 };
+    let furniture_width = left_icons * TITLE_HEIGHT + right_icons * TITLE_HEIGHT + title_text
+        - if has_vertical_scrollbar {
+            VERTICAL_SCROLLBAR_WIDTH
+        } else {
+            0
+        };
+    declared.max(48).max(furniture_width.max(1))
+}
+
+fn minimum_work_height(declared: i32, has_vertical_scrollbar: bool) -> i32 {
+    // Preserve both arrow cells plus enough page track for a minimum-size
+    // thumb and non-zero slider travel.
+    let control_height = if has_vertical_scrollbar {
+        SCROLL_ARROW_SIZE * 2 + MIN_SLIDER_SIZE * 2
+    } else {
+        48
+    };
+    declared.max(48).max(control_height)
 }
 
 fn validate_screen_area_parts(
@@ -943,6 +1502,10 @@ fn validate_screen_area_parts(
     has_vertical_scrollbar: bool,
     resizable: bool,
 ) -> Result<(), RuntimeError> {
+    let left = area
+        .min_x
+        .checked_sub(FRAME_BORDER)
+        .ok_or_else(|| program_error("window system area coordinate overflowed"))?;
     let right = area
         .max_x
         .checked_add(if has_vertical_scrollbar {
@@ -950,16 +1513,22 @@ fn validate_screen_area_parts(
         } else {
             0
         })
+        .and_then(|right| right.checked_add(FRAME_BORDER))
         .ok_or_else(|| program_error("window system area coordinate overflowed"))?;
     let top = area
         .max_y
         .checked_add(if has_title { TITLE_HEIGHT } else { 0 })
+        .and_then(|top| top.checked_add(FRAME_BORDER))
         .ok_or_else(|| program_error("window system area coordinate overflowed"))?;
     let bottom = area
         .min_y
-        .checked_sub(if resizable { SIZE_ICON_HEIGHT } else { 0 })
+        .checked_sub(if resizable {
+            SIZE_ICON_HEIGHT + FRAME_BORDER
+        } else {
+            FRAME_BORDER
+        })
         .ok_or_else(|| program_error("window system area coordinate overflowed"))?;
-    if area.min_x < 0 || bottom < 0 || right > DESKTOP_WIDTH as i32 || top > DESKTOP_HEIGHT as i32 {
+    if left < 0 || bottom < 0 || right > DESKTOP_WIDTH || top > DESKTOP_HEIGHT {
         return Err(program_error(
             "window lies outside the hosted screen (off-screen windows are unsupported)",
         ));
@@ -967,7 +1536,7 @@ fn validate_screen_area_parts(
     Ok(())
 }
 
-fn overlaps(a: WorkArea, b: WorkArea) -> bool {
+fn rects_overlap(a: DesktopRect, b: DesktopRect) -> bool {
     a.min_x < b.max_x && a.max_x > b.min_x && a.min_y < b.max_y && a.max_y > b.min_y
 }
 
@@ -997,7 +1566,7 @@ fn event_with_word(reason: u32, offset: usize, value: u32) -> QueuedEvent {
     event
 }
 
-fn mouse_event(x: i32, y: i32, buttons: u32, window: u32) -> QueuedEvent {
+fn mouse_event_with_icon(x: i32, y: i32, buttons: u32, window: u32, icon: i32) -> QueuedEvent {
     let mut event = QueuedEvent {
         reason: 6,
         block: [0; POLL_BLOCK_SIZE],
@@ -1006,7 +1575,7 @@ fn mouse_event(x: i32, y: i32, buttons: u32, window: u32) -> QueuedEvent {
     put_word(&mut event.block, 4, y as u32);
     put_word(&mut event.block, 8, buttons);
     put_word(&mut event.block, 12, window);
-    put_word(&mut event.block, 16, u32::MAX); // no icon: -1
+    put_word(&mut event.block, 16, icon as u32);
     event
 }
 
@@ -1017,7 +1586,14 @@ fn null_event() -> QueuedEvent {
     }
 }
 
-fn open_request_event(state: &WimpState, window: &WimpWindow, area: WorkArea) -> QueuedEvent {
+fn open_request_event(
+    window: &WimpWindow,
+    area: WorkArea,
+    scroll: (i32, i32),
+    behind: i32,
+    scroll_x_direction: i32,
+    scroll_y_direction: i32,
+) -> QueuedEvent {
     let mut event = QueuedEvent {
         reason: 2,
         block: [0; POLL_BLOCK_SIZE],
@@ -1027,21 +1603,182 @@ fn open_request_event(state: &WimpState, window: &WimpWindow, area: WorkArea) ->
     put_word(&mut event.block, 8, area.min_y as u32);
     put_word(&mut event.block, 12, area.max_x as u32);
     put_word(&mut event.block, 16, area.max_y as u32);
-    put_word(&mut event.block, 20, window.scroll_x as u32);
-    put_word(&mut event.block, 24, window.scroll_y as u32);
-    let behind = state
+    put_word(&mut event.block, 20, scroll.0 as u32);
+    put_word(&mut event.block, 24, scroll.1 as u32);
+    put_word(&mut event.block, 28, behind as u32);
+    if scroll_x_direction != 0 || scroll_y_direction != 0 {
+        event.reason = 10;
+        put_word(&mut event.block, 32, scroll_x_direction as u32);
+        put_word(&mut event.block, 36, scroll_y_direction as u32);
+    }
+    event
+}
+
+fn window_behind(state: &WimpState, handle: u32) -> i32 {
+    state
         .stacking
         .iter()
-        .position(|handle| *handle == window.handle)
+        .position(|stacked| *stacked == handle)
         .and_then(|index| {
             index
                 .checked_sub(1)
                 .and_then(|front| state.stacking.get(front).copied())
         })
-        .map(|handle| handle as i32)
-        .unwrap_or(-1);
-    put_word(&mut event.block, 28, behind as u32);
-    event
+        .map(|front| front as i32)
+        .unwrap_or(-1)
+}
+
+fn valid_restore_depth(state: &WimpState, behind: i32) -> i32 {
+    if behind > 0 && !state.stacking.contains(&(behind as u32)) {
+        -1
+    } else {
+        behind
+    }
+}
+
+fn send_to_back(state: &mut WimpState, handle: u32) {
+    state.stacking.retain(|item| *item != handle);
+    state.stacking.push(handle);
+    if state.keyboard_focus == Some(handle) {
+        state.keyboard_focus = state.stacking.first().copied();
+    }
+}
+
+fn maximum_window_area(window: &WimpWindow) -> WorkArea {
+    let min_x = FRAME_BORDER;
+    let min_y = if window.resizable {
+        SIZE_ICON_HEIGHT + FRAME_BORDER
+    } else {
+        FRAME_BORDER
+    };
+    let width = (window.work_extent.max_x - window.work_extent.min_x)
+        .min(DESKTOP_WIDTH - min_x - window_outer_extra_x(window))
+        .max(1);
+    let height = (window.work_extent.max_y - window.work_extent.min_y)
+        .min(DESKTOP_HEIGHT - min_y - window_outer_top_extra_y(window))
+        .max(1);
+    WorkArea {
+        min_x,
+        min_y,
+        max_x: min_x + width,
+        max_y: min_y + height,
+    }
+}
+
+fn toggle_window_size(state: &mut WimpState, handle: u32, select: bool) {
+    let Some(snapshot) = state.windows.get(&handle).cloned() else {
+        return;
+    };
+    let (area, scroll, behind, is_maximized, restore_behind) = if snapshot.maximized {
+        let restore = valid_restore_depth(state, snapshot.restore_behind);
+        (
+            snapshot.last_user_area,
+            snapshot.last_user_scroll,
+            restore,
+            false,
+            restore,
+        )
+    } else {
+        let current_behind = window_behind(state, handle);
+        let area = maximum_window_area(&snapshot);
+        (
+            area,
+            (snapshot.work_extent.min_x, snapshot.work_extent.max_y),
+            if select { -1 } else { current_behind },
+            true,
+            current_behind,
+        )
+    };
+    let event = open_request_event(&snapshot, area, scroll, behind, 0, 0);
+    let Some(window) = state.windows.get_mut(&handle) else {
+        return;
+    };
+    if !snapshot.maximized {
+        window.last_user_area = snapshot.work_area;
+        window.last_user_scroll = (snapshot.scroll_x, snapshot.scroll_y);
+    }
+    window.restore_behind = restore_behind;
+    window.maximized = is_maximized;
+    window.toggle_request_pending = true;
+    window.preview_area = Some(area);
+    window.preview_scroll = Some(scroll);
+    let owner = window.owner_task_handle;
+    let _ = enqueue_for_owner(state, owner, event);
+    if select && is_maximized {
+        bring_to_front(state, handle);
+    }
+}
+
+fn request_or_apply_scroll(
+    state: &mut WimpState,
+    handle: u32,
+    buttons: u32,
+    scroll_x_direction: i32,
+    scroll_y_direction: i32,
+) {
+    let Some(snapshot) = state.windows.get(&handle).cloned() else {
+        return;
+    };
+    let mut x_direction = scroll_x_direction;
+    let mut y_direction = scroll_y_direction;
+    if buttons & 1 != 0 {
+        x_direction = -x_direction;
+        y_direction = -y_direction;
+    }
+    let mut scroll = (snapshot.scroll_x, snapshot.scroll_y);
+    if snapshot.flags & ((1 << 8) | (1 << 9)) != 0 {
+        let event = open_request_event(
+            &snapshot,
+            snapshot.work_area,
+            scroll,
+            window_behind(state, handle),
+            x_direction,
+            y_direction,
+        );
+        let _ = enqueue_for_owner(state, snapshot.owner_task_handle, event);
+        return;
+    }
+
+    let visible_width = snapshot.work_area.max_x - snapshot.work_area.min_x;
+    let visible_height = snapshot.work_area.max_y - snapshot.work_area.min_y;
+    let x_step = if x_direction.abs() == 1 {
+        SCROLL_ARROW_STEP
+    } else {
+        visible_width
+    };
+    let y_step = if y_direction.abs() == 1 {
+        SCROLL_ARROW_STEP
+    } else {
+        visible_height
+    };
+    let min_x = snapshot.work_extent.min_x;
+    let max_x = (snapshot.work_extent.max_x - visible_width).max(min_x);
+    let min_y = (snapshot.work_extent.min_y + visible_height).min(snapshot.work_extent.max_y);
+    let max_y = snapshot.work_extent.max_y;
+    scroll.0 = scroll
+        .0
+        .saturating_add(x_direction.signum() * x_step)
+        .clamp(min_x, max_x);
+    scroll.1 = scroll
+        .1
+        .saturating_add(y_direction.signum() * y_step)
+        .clamp(min_y, max_y);
+    if scroll == (snapshot.scroll_x, snapshot.scroll_y) {
+        return;
+    }
+    let event = open_request_event(
+        &snapshot,
+        snapshot.work_area,
+        scroll,
+        window_behind(state, handle),
+        0,
+        0,
+    );
+    if let Some(window) = state.windows.get_mut(&handle) {
+        window.preview_area = Some(window.work_area);
+        window.preview_scroll = Some(scroll);
+    }
+    let _ = enqueue_for_owner(state, snapshot.owner_task_handle, event);
 }
 
 fn remove_task(state: &mut WimpState, guest_task_id: u64) {
@@ -1406,7 +2143,9 @@ mod tests {
         assert_eq!(read_task_word(&task, STATE_BLOCK, 28), second);
         let flags = read_task_word(&task, STATE_BLOCK, 32);
         assert_ne!(flags & (1 << 16), 0);
-        assert_ne!(flags & (1 << 17), 0);
+        // The first window's right furniture is overlapped by the second
+        // window's left frame, so Wimp_GetWindowState must clear fully-visible.
+        assert_eq!(flags & (1 << 17), 0);
     }
 
     #[test]
@@ -1482,7 +2221,7 @@ mod tests {
         server.drag_to(drag, 450, 30);
         let preview = WorkArea {
             min_x: 30,
-            min_y: 38,
+            min_y: 46,
             max_x: 440,
             max_y: 360,
         };
