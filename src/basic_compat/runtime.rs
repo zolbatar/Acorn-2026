@@ -1,9 +1,9 @@
-use std::{collections::HashMap, time::Instant};
+use std::collections::HashMap;
 
 use crate::{
     error::RuntimeError,
     memory::{GUEST_MEMORY_BASE, GUEST_MEMORY_SIZE, Task},
-    swi::{OS_CLI, OS_NEW_LINE, OS_READ_LINE, SwiContext, SwiDispatcher},
+    swi::{MosClock, OS_CLI, OS_NEW_LINE, OS_READ_LINE, SwiContext, SwiDispatcher},
 };
 
 #[cfg(feature = "experimental-jit")]
@@ -84,7 +84,7 @@ pub(super) struct Interpreter {
     repeat_loops: Vec<usize>,
     for_pairs: HashMap<usize, usize>,
     if_blocks: HashMap<usize, usize>,
-    started: Instant,
+    clock: MosClock,
     steps: u64,
     print_column: usize,
     print_format: u32,
@@ -369,7 +369,7 @@ impl Interpreter {
             repeat_loops: Vec::new(),
             for_pairs,
             if_blocks,
-            started: Instant::now(),
+            clock: MosClock::default(),
             steps: 0,
             print_column: 0,
             print_format: DEFAULT_PRINT_FORMAT,
@@ -423,10 +423,11 @@ impl Interpreter {
         task: &mut Task,
         dispatcher: &mut SwiDispatcher,
     ) -> Result<(), RuntimeError> {
+        self.clock = dispatcher.system_clock();
         let mut address = 0_usize;
         while address < self.program.instructions.len() {
             self.steps += 1;
-            if self.steps & 0x3FF == 0 {
+            if self.steps & 0x3FF == 0 && self.pending_key.is_none() {
                 if let Some(key) = dispatcher.poll_key() {
                     self.pending_key = Some(key);
                 }
@@ -943,6 +944,13 @@ impl Interpreter {
                                 as u32;
                     }
                 }
+                if swi_name == "OS_READC"
+                    || (swi_name == "OS_BYTE" && matches!(context.registers[0] & 255, 21 | 129))
+                {
+                    if let Some(key) = self.pending_key.take() {
+                        dispatcher.restore_polled_key(key);
+                    }
+                }
                 dispatcher.dispatch_named_swi(&swi_name, task, &mut context)?;
                 for (register, target) in results.iter().enumerate() {
                     self.set_variable(
@@ -953,10 +961,26 @@ impl Interpreter {
                 }
                 Ok(Flow::Next)
             }
-            Statement::Call(_) => Err(program_error(
-                line,
-                "machine-code CALL requires a matching processor compatibility service not available in the hosted profile",
-            )),
+            Statement::Call(expression) => {
+                let address = self.address_value(expression, line, task)?;
+                let mut context = SwiContext::default();
+                for (register, name) in ["A%", "X%", "Y%"].into_iter().enumerate() {
+                    context.registers[register] =
+                        self.get_variable(name).number(line)? as i32 as u32;
+                }
+                context.carry = (self.get_variable("C%").number(line)? as i32 & 1) != 0;
+                if address == 0xFFE0
+                    || (address == 0xFFF4 && matches!(context.registers[0] & 255, 21 | 129))
+                {
+                    if let Some(key) = self.pending_key.take() {
+                        dispatcher.restore_polled_key(key);
+                    }
+                }
+                dispatcher
+                    .dispatch_mos_call(address, task, &mut context)
+                    .map_err(|error| program_error(line, error.to_string()))?;
+                Ok(Flow::Next)
+            }
             Statement::StarCommand(command) => {
                 let command = String::from_utf8_lossy(command);
                 let command_address = GUEST_MEMORY_BASE + 0x6000;
@@ -1258,8 +1282,7 @@ impl Interpreter {
             Expr::Number(value) => Ok(Value::Number(*value)),
             Expr::String(value) => Ok(Value::String(value.clone())),
             Expr::Variable(name) if name == "TIME" => {
-                let ticks = self.started.elapsed().as_millis() / 10;
-                Ok(Value::Number(ticks as f64))
+                Ok(Value::Number(f64::from(self.clock.read() as u32 as i32)))
             }
             Expr::Variable(name) => Ok(self.get_variable(name)),
             Expr::ArrayElement(name, index) => {
@@ -1589,6 +1612,11 @@ impl Interpreter {
     }
 
     fn set_variable(&mut self, name: &str, value: Value, line: u16) -> Result<(), RuntimeError> {
+        if name == "TIME" {
+            self.clock
+                .set(value.number(line)?.trunc() as i32 as u32 as u64);
+            return Ok(());
+        }
         let value = if name.ends_with('$') {
             match value {
                 Value::String(_) => value,

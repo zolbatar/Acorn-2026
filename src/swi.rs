@@ -13,6 +13,9 @@ use std::{
 
 use std::sync::Arc;
 
+mod mos;
+pub(crate) use mos::MosClock;
+
 use crate::wimp::{
     WIMP_CLOSE_DOWN, WIMP_CLOSE_WINDOW, WIMP_CREATE_WINDOW, WIMP_GET_WINDOW_STATE, WIMP_INITIALISE,
     WIMP_OPEN_WINDOW, WIMP_POLL, WimpServer,
@@ -28,6 +31,8 @@ pub const OS_WRITE_0: u32 = 0x02;
 pub const OS_NEW_LINE: u32 = 0x03;
 pub const OS_READ_C: u32 = 0x04;
 pub const OS_CLI: u32 = 0x05;
+pub const OS_BYTE: u32 = 0x06;
+pub const OS_WORD: u32 = 0x07;
 pub const OS_FILE: u32 = 0x08;
 pub const OS_ARGS: u32 = 0x09;
 pub const OS_BGET: u32 = 0x0A;
@@ -110,6 +115,7 @@ pub struct SwiContext {
 }
 
 pub struct SwiDispatcher {
+    mos: mos::MosState,
     console: HostConsole,
     graphics: GraphicsService,
     file_system: HostFileSystem,
@@ -159,6 +165,7 @@ impl SwiDispatcher {
         wimp: Option<Arc<WimpServer>>,
     ) -> Self {
         Self {
+            mos: mos::MosState::default(),
             console,
             graphics: GraphicsService::default(),
             file_system: HostFileSystem::demo_default(),
@@ -204,7 +211,10 @@ impl SwiDispatcher {
             return None;
         }
         self.last_inkey_poll = Instant::now();
-        self.console.try_read_byte()
+        self.mos
+            .input
+            .pop_front()
+            .or_else(|| self.console.try_read_byte())
     }
 
     pub(crate) fn set_mode_from_block(
@@ -265,6 +275,12 @@ impl SwiDispatcher {
         context: &mut SwiContext,
     ) -> Result<(), RuntimeError> {
         match name {
+            "OS_BYTE" => self.dispatch(OS_BYTE, task, context),
+            "OS_WORD" => self.dispatch(OS_WORD, task, context),
+            "OS_WRITEC" => self.dispatch(OS_WRITE_C, task, context),
+            "OS_NEWLINE" => self.dispatch(OS_NEW_LINE, task, context),
+            "OS_READC" => self.dispatch(OS_READ_C, task, context),
+            "OS_CLI" => self.dispatch(OS_CLI, task, context),
             "OS_FILE" => self.os_file(task, context),
             "OS_ARGS" => self.os_args(task, context),
             "OS_BGET" => self.os_bget(task, context),
@@ -345,6 +361,8 @@ impl SwiDispatcher {
             }
             OS_READ_C => self.read_character(context),
             OS_CLI => self.execute_cli(task, context),
+            OS_BYTE => self.os_byte(context),
+            OS_WORD => self.os_word(task, context),
             OS_READ_LINE => self.read_line(task, context),
             OS_FILE => self.os_file(task, context),
             OS_ARGS => self.os_args(task, context),
@@ -572,7 +590,12 @@ impl SwiDispatcher {
             return Ok(());
         }
 
-        let path = read_guest_string(task, context.registers[R1])?;
+        let path = String::from_utf8_lossy(&mos::read_mos_string(
+            task,
+            context.registers[R1],
+            MAX_STRING_BYTES,
+        )?)
+        .into_owned();
         let mode = reason & 0xC0;
         if !matches!(mode, 0x40 | 0x80 | 0xC0) {
             return Err(RuntimeError::Program(format!(
@@ -1349,7 +1372,10 @@ impl SwiDispatcher {
     }
 
     fn read_character(&mut self, context: &mut SwiContext) -> Result<(), RuntimeError> {
-        let byte = self.console.read_byte()?.ok_or(RuntimeError::EndOfInput)?;
+        let byte = match self.mos.input.pop_front() {
+            Some(byte) => byte,
+            None => self.console.read_byte()?.ok_or(RuntimeError::EndOfInput)?,
+        };
         context.registers[R0] = u32::from(byte);
         context.carry = byte == 0x1B;
         Ok(())
@@ -1449,9 +1475,7 @@ impl SwiDispatcher {
         task: &mut Task,
         context: &mut SwiContext,
     ) -> Result<(), RuntimeError> {
-        let bytes = task
-            .memory
-            .read_c_string(context.registers[R0], MAX_CLI_BYTES)?;
+        let bytes = mos::read_mos_string(task, context.registers[R0], MAX_CLI_BYTES)?;
         let command = String::from_utf8_lossy(&bytes);
         let command = command.trim();
         let command = command.trim_start_matches('*').trim_start();

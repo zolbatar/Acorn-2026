@@ -1658,7 +1658,7 @@ fn pseudo_variable_for_assignment(token: u8) -> Option<&'static str> {
     match token {
         0xCF => Some("PTR"),
         0xD0 => Some("PAGE"),
-        0xD1 => Some("TIME"),
+        TOKEN_TIME | 0xD1 => Some("TIME"),
         0xD2 => Some("LOMEM"),
         0xD3 => Some("HIMEM"),
         _ => None,
