@@ -386,7 +386,11 @@ impl SwiDispatcher {
             height as u32,
             x_eigenfactor as u8,
             y_eigenfactor as u8,
-        )
+        )?;
+        // MODE blocks bypass VDU 22: publish the new grid and shared raster
+        // before any subsequent plotting, just as a numbered mode does.
+        self.publish_snapshot(self.current_graphics().snapshot().clone());
+        Ok(())
     }
 
     pub(crate) fn dispatch_named_swi(
@@ -698,6 +702,9 @@ impl SwiDispatcher {
     }
 
     fn publish_snapshot_for_window(&self, window_handle: Option<u32>, snapshot: GraphicsSnapshot) {
+        if let Some(wimp) = &self.wimp {
+            wimp.sync_console_mode(self.display_task_id, window_handle, snapshot.mode);
+        }
         self.publish_display_event(DisplayEvent::GraphicsSnapshot {
             task_id: self.display_task_id,
             window_handle,

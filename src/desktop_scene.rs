@@ -421,16 +421,18 @@ impl DesktopSceneBuilder {
             );
         }
         let title_width = self.text_width(&window.title, 22.0, 600.0);
+        scene.push_clip_layer(Fill::NonZero, transform, &title_rect);
         self.text(
             scene,
             &window.title,
-            (title_rect.x0 + title_rect.x1 - title_width) / 2.0,
+            ((title_rect.x0 + title_rect.x1 - title_width) / 2.0).max(title_rect.x0 + 4.0),
             title_rect.y0 + 3.0,
             22.0,
             (0, 0, 0, 255),
             600.0,
             transform,
         );
+        scene.pop_layer();
         if let Some(back) = f.back_icon {
             self.draw_back_glyph(scene, transform, back);
         }

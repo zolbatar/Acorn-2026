@@ -82,13 +82,15 @@ impl Runtime {
         self.dispatcher
             .set_program_working_directory(&mut self.task, path)?;
         let configuration = self.dispatcher.load_basic_configuration()?;
-        crate::basic64::run_guest_file_configured(
+        self.dispatcher.begin_display_batch();
+        let result = crate::basic64::run_guest_file_configured(
             path,
             &mut self.task,
             &mut self.dispatcher,
             &configuration,
-        )
-        .map(|_| ())
+        );
+        self.dispatcher.finish_display_batch();
+        result.map(|_| ())
     }
 
     pub fn new(console: HostConsole) -> Self {
@@ -299,6 +301,68 @@ mod tests {
         swi::{DisplayEvent, SwiDispatcher},
         wimp::{IconBarSide, WimpServer},
     };
+
+    #[test]
+    fn desktop_mandelbrot_publishes_extended_mode_and_coloured_raster() {
+        // Exercise the actual desktop file-launch entry point with the original
+        // listing, reducing only resolution/iteration count; a queued key ends its wait.
+        let root = std::env::temp_dir().join(format!("acorn-mandelbrot-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut bytes = include_bytes!("../demo-volume/mandelbrot.bbc").to_vec();
+        for (from, to) in [(b"1680", b"0128"), (b"1050", b"0096"), (b"8192", b"0048")] {
+            for offset in 0..bytes.len() - 3 {
+                if &bytes[offset..offset + 4] == from {
+                    bytes[offset..offset + 4].copy_from_slice(to);
+                }
+            }
+        }
+        std::fs::write(root.join("test"), bytes).unwrap();
+        std::fs::write(root.join("test.acornmeta"),
+            include_str!("../demo-volume/mandelbrot.bbc.acornmeta").replace("guest-name=mandelbrot", "guest-name=test")).unwrap();
+        let (input, rx) = mpsc::channel();
+        input.send(b' ').unwrap();
+        let (display, events) = mpsc::channel();
+        let (updates, _updates) = mpsc::channel();
+        let wimp = WimpServer::new(updates);
+        wimp.task_started(900, "mandelbrot").unwrap();
+        let mut runtime = Runtime::desktop_task(900, rx, display, wimp.clone());
+        runtime.dispatcher.set_file_system_for_test(HostFileSystem::new(&root));
+        let configure = ConfigureStore::with_path(root.join("configure"));
+        #[cfg(feature = "experimental-jit")]
+        configure.set("BASICEngine", "HYBRID").unwrap();
+        runtime.dispatcher.set_configure_store_for_test(configure);
+        runtime.run_guest_file("$.test").unwrap();
+        let snapshots: Vec<_> = events.try_iter().filter_map(|event| match event {
+            DisplayEvent::GraphicsSnapshot { snapshot, .. } => Some(snapshot),
+            DisplayEvent::Plot { .. } => panic!("desktop file launch must batch plots"),
+            _ => None,
+        }).collect();
+        assert!(snapshots.len() >= 2, "MODE and final frame must both be published");
+        let snapshot = snapshots.last().unwrap();
+        assert_eq!((snapshot.mode.pixel_width, snapshot.mode.pixel_height), (128, 96));
+        let mut pixels = vec![0; 128 * 96 * 4];
+        crate::renderer::render(snapshot, &mut pixels);
+        assert!(pixels.chunks_exact(4).filter(|p| p[0] != p[1] || p[1] != p[2]).count() > 100,
+            "Mandelbrot must draw a coloured image, not just a black background/cursor");
+        let window = &wimp.desktop_windows()[0];
+        assert_eq!(window.work_area.max_x - window.work_area.min_x, 256);
+        assert_eq!(window.work_area.max_y - window.work_area.min_y, 192);
+        if let Ok(path) = std::env::var("ACORN_CONSOLE_SNAPSHOT") {
+            let mut builder = crate::desktop_scene::DesktopSceneBuilder::new();
+            let scene = builder.build(
+                &wimp.desktop_windows(),
+                &std::collections::HashMap::from([((900, None), snapshot.clone())]),
+                &[], &[], &[], None,
+                crate::desktop_scene::Viewport::new(1600, 1200),
+            );
+            let rgba = crate::vello_backend::snapshot_scene(&scene, 1600, 1200).unwrap();
+            let mut encoder = png::Encoder::new(std::fs::File::create(path).unwrap(), 1600, 1200);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.write_header().unwrap().write_image_data(&rgba).unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn desktop_prompts_accept_commands_and_basic_without_startup_handoff() {

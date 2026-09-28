@@ -1036,6 +1036,46 @@ impl WimpServer {
         Ok(())
     }
 
+    /// Host-owned console surfaces follow their guest MODE. Ordinary Wimp
+    /// applications keep control of their own extents and redraw protocol.
+    pub(crate) fn sync_console_mode(
+        &self,
+        task_id: u64,
+        handle: Option<u32>,
+        mode: crate::graphics::ScreenMode,
+    ) {
+        let Ok(mut state) = self.lock_state() else { return };
+        let mut changed = false;
+        for window in state.windows.values_mut().filter(|window| {
+            window.console_window && window.owner_task_id == task_id
+                && handle.is_none_or(|handle| handle == window.handle)
+        }) {
+            // Match the renderer's integer guest-pixel scale, including modes
+            // whose logical dimensions are not exact multiples of pixel size.
+            let width = mode.pixel_width as i32
+                * (mode.logical_width / mode.pixel_width.max(1) as i32).max(1);
+            let height = mode.pixel_height as i32
+                * (mode.logical_height / mode.pixel_height.max(1) as i32).max(1);
+            let extent = WorkArea { min_x: 0, min_y: -height, max_x: width, max_y: 0 };
+            if window.work_extent == extent { continue; }
+            window.work_extent = extent;
+            window.work_area.max_x = (window.work_area.min_x + width)
+                .min(DESKTOP_WIDTH - VERTICAL_SCROLLBAR_WIDTH - FRAME_BORDER);
+            window.work_area.min_y = (window.work_area.max_y - height)
+                .max(DESKTOP_ICONBAR_HEIGHT + FRAME_BORDER);
+            window.scroll_x = 0;
+            window.scroll_y = 0;
+            window.last_user_area = window.work_area;
+            window.last_user_scroll = (0, 0);
+            window.preview_area = None;
+            window.preview_scroll = None;
+            window.maximized = false;
+            changed = true;
+        }
+        drop(state);
+        if changed { let _ = self.desktop_updates.send(()); }
+    }
+
     pub fn furniture_layout(&self) -> Vec<(DesktopWindow, WindowFurnitureLayout)> {
         self.desktop_windows()
             .into_iter()
@@ -4664,15 +4704,15 @@ fn insert_console_window(
     let handle = allocate_handle(&mut state.next_window_handle)?;
     let area = WorkArea {
         min_x: 48,
-        min_y: DESKTOP_ICONBAR_HEIGHT + SIZE_ICON_HEIGHT + FRAME_BORDER + 8,
-        max_x: DESKTOP_WIDTH - 48,
+        min_y: DESKTOP_HEIGHT - 72 - 1024,
+        max_x: 48 + 1280,
         max_y: DESKTOP_HEIGHT - 72,
     };
     let extent = WorkArea {
         min_x: 0,
         min_y: -1024,
-        max_x: DESKTOP_WIDTH,
-        max_y: area.max_y,
+        max_x: 1280,
+        max_y: 0,
     };
     state.windows.insert(
         handle,
@@ -4694,7 +4734,7 @@ fn insert_console_window(
             min_width: 48,
             min_height: 176,
             scroll_x: 0,
-            scroll_y: area.max_y,
+            scroll_y: 0,
             has_title: true,
             has_back_icon: true,
             has_vertical_scrollbar: true,
@@ -4707,7 +4747,7 @@ fn insert_console_window(
             preview_area: None,
             preview_scroll: None,
             last_user_area: area,
-            last_user_scroll: (0, area.max_y),
+            last_user_scroll: (0, 0),
             maximized: false,
             toggle_request_pending: false,
             restore_behind: -1,
@@ -4961,6 +5001,28 @@ mod tests {
             &task.memory.read_bytes(address + offset as u32, 4).unwrap(),
             0,
         )
+    }
+
+    #[test]
+    fn console_geometry_matches_content_and_ignores_repeated_frames() {
+        let server = new_server();
+        server.task_started(901, "*Commands").unwrap();
+        let window = server.desktop_windows()[0].clone();
+        assert_eq!(window.work_area.max_x - window.work_area.min_x, 1280);
+        assert_eq!(window.work_area.max_y - window.work_area.min_y, 1024);
+        assert_eq!(window.work_extent.max_y, window.scroll_y);
+        let mode = crate::graphics::GraphicsService::default().snapshot().mode;
+        server.sync_console_mode(901, None, mode);
+        assert_eq!(server.desktop_windows()[0].work_area, window.work_area);
+        let grip = desktop_window_furniture(&window).adjust_size_icon.unwrap();
+        let x = (grip.min_x + grip.max_x) / 2;
+        let y = (grip.min_y + grip.max_y) / 2;
+        let drag = server.mouse_down(x, y, 4).unwrap();
+        server.drag_to(drag, x - 100, y + 100);
+        server.finish_drag(drag);
+        let resized = server.desktop_windows()[0].work_area;
+        server.sync_console_mode(901, None, mode);
+        assert_eq!(server.desktop_windows()[0].work_area, resized);
     }
 
     #[test]

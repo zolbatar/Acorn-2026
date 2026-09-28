@@ -572,3 +572,14 @@ complete BBC BASIC editor (LOAD/SAVE/EDIT are not implemented). A numbered progr
 executes as one source unit. Commands uses the existing MOS dispatcher, including
 CONFIGURE, STATUS and BASIC file launching. Closing an idle console disconnects
 its input so ReadLine exits; CPU-bound program cancellation remains separate.
+
+Desktop console windows start with a visible work area matching the default
+1280 × 1024 OS-unit guest surface. A guest MODE change updates only its host-owned
+console extent and fits the visible area within the desktop; repeated frames do
+not undo user resizes. Larger guest surfaces remain clipped at their native
+integer pixel scale, with vertical scrolling (horizontal scroll furniture is not
+yet implemented). Ordinary Wimp windows retain application-owned extents.
+Extended MODE blocks publish their new raster immediately, just like numbered
+VDU modes. Desktop file launches use the same throttled snapshot batching and
+final-frame publication as MOS BASIC launches, so ColourTrans drawing and shared
+true-colour surfaces reach the compositor without replaying millions of plots.
