@@ -1,0 +1,113 @@
+REM BASIC64 policy for the hosted desktop icon bar.
+MODE 20
+DIM description% 31
+$description%="Acorn Desktop"
+SYS "Wimp_Initialise",310,&4B534154,description%,0 TO version%,task%
+
+DIM icon% 55
+DIM label% 31
+DIM sprval% 31
+DIM volume_buffer% 255
+DIM volume_image% 16383
+SYS "Acorn_Desktop",2,volume_buffer%,256 TO volume_length%
+IF volume_length%>12 THEN volume_length%=12
+volume_name$=""
+FOR character_index%=0 TO volume_length%-1
+  volume_name$+=CHR$(?(volume_buffer%+character_index%))
+NEXT
+$label%=volume_name$
+$sprval%="Sharddisc"
+PROCmake_volume_image
+!icon%=-2
+!icon%+4=0:!icon%+8=4:!icon%+16=96
+!icon%+12=volume_length%*16+48
+!icon%+20=&A11B
+!icon%+24=label%
+!icon%+28=sprval%
+!icon%+32=32
+!icon%+36=1
+!icon%+40=volume_image%
+!icon%+44=64
+!icon%+48=64
+!icon%+52=2
+SYS "Wimp_CreateIconEx",,icon% TO volume_icon%
+
+DIM command% 255
+DIM event% 255
+DIM task_menu% 127
+DIM commands_label% 31
+DIM basic_label% 31
+$commands_label%="*Commands"
+$basic_label%="BASIC window"
+$task_menu%="Task"
+?(task_menu%+12)=7:?(task_menu%+13)=2
+?(task_menu%+14)=7:?(task_menu%+15)=0
+!(task_menu%+16)=240:!(task_menu%+20)=32:!(task_menu%+24)=0
+FOR menu_item%=0 TO 1
+  menu_row%=task_menu%+28+menu_item%*24
+  !menu_row%=0
+  IF menu_item%=1 THEN !menu_row%=&80
+  !(menu_row%+4)=-1:!(menu_row%+8)=&101
+  !(menu_row%+12)=commands_label%
+  IF menu_item%=1 THEN !(menu_row%+12)=basic_label%
+  !(menu_row%+16)=0:!(menu_row%+20)=32
+NEXT
+SYS "Acorn_Desktop",4
+REPEAT
+  SYS "Wimp_Poll",1,event% TO reason%
+  IF reason%=1 THEN
+    SYS "Wimp_RedrawWindow",,event% TO more%
+    IF more% THEN
+      REPEAT
+        SYS "Wimp_GetRectangle",,event% TO more%
+      UNTIL more%=0
+    ENDIF
+  ENDIF
+  IF reason%=9 THEN
+    IF !event%=0 THEN $command%="Commands"
+    IF !event%=1 THEN $command%="BASIC"
+    SYS "Wimp_StartTask",command% TO console_task%
+  ENDIF
+  IF reason%=6 THEN
+    IF !(event%+12)=-1 AND !(event%+16)=-1 AND !(event%+8)=2 THEN
+      SYS "Wimp_CreateMenu",,task_menu%,!(event%),192
+    ENDIF
+    IF !(event%+12)=-2 AND !(event%+16)=volume_icon% THEN
+      $command%="BASIC $.System.Filer"
+      SYS "Wimp_StartTask",command% TO filer_task%
+    ENDIF
+  ENDIF
+UNTIL FALSE
+
+DEF PROCmake_volume_image
+FOR y%=0 TO 63
+  FOR x%=0 TO 63
+    pixel%=volume_image%+(y%*64+x%)*4
+    ?pixel%=0:?(pixel%+1)=0:?(pixel%+2)=0:?(pixel%+3)=0
+  NEXT
+NEXT
+
+REM Flat data-volume bands with one consistent outline and no lighting.
+FOR band%=0 TO 2
+  FOR y%=10+band%*15 TO 22+band%*15
+    FOR x%=10 TO 53
+      PROCvolume_pixel(x%,y%,59,59,59,255)
+    NEXT
+  NEXT
+  FOR y%=13+band%*15 TO 19+band%*15
+    FOR x%=13 TO 50
+      PROCvolume_pixel(x%,y%,65,106,228,255)
+    NEXT
+  NEXT
+  FOR y%=15+band%*15 TO 17+band%*15
+    FOR x%=44 TO 47
+      PROCvolume_pixel(x%,y%,236,236,238,255)
+    NEXT
+  NEXT
+NEXT
+ENDPROC
+
+DEF PROCvolume_pixel(x%,y%,red%,green%,blue%,alpha%)
+pixel%=volume_image%+(y%*64+x%)*4
+?pixel%=red%:?(pixel%+1)=green%:?(pixel%+2)=blue%:?(pixel%+3)=alpha%
+ENDPROC

@@ -2,7 +2,7 @@
 name = "acorn-2026"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Hosted Acorn-2026 MOS and BASIC64 prototype"
 license = "MIT"
 
@@ -23,5 +23,9 @@ cranelift-frontend = { version = "=0.136.1", optional = true }
 cranelift-jit = { version = "=0.136.1", optional = true }
 cranelift-module = { version = "=0.136.1", optional = true }
 cranelift-native = { version = "=0.136.1", optional = true }
-pixels = "0.17.2"
+parley = "=0.11.1"
+pollster = "1.0.1"
+png = "=0.18.1"
+vello = "=0.10.0"
+wgpu = "=29.0.4"
 winit = { version = "0.30.13", features = ["rwh_06"] }

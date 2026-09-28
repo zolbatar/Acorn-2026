@@ -1,12 +1,15 @@
 use crate::{
-    configure::{BasicConfiguration, BasicEngine, ConfigureStore},
+    configure::{BasicConfiguration, BasicEngine, ConfigureStore, StartupLanguage},
     error::RuntimeError,
-    filesystem::{FILETYPE_BASIC, FILETYPE_TEXT, FileMetadata, HostFileSystem, OpenFile},
-    graphics::{GraphicsProfile, GraphicsService, GraphicsSnapshot},
+    filesystem::{
+        FILETYPE_BASIC, FILETYPE_BASIC64, FILETYPE_TEXT, FileMetadata, HostFileSystem, OpenFile,
+    },
+    graphics::{GraphicsProfile, GraphicsService, GraphicsSnapshot, GraphicsWindow},
     host::HostConsole,
     memory::{GUEST_MEMORY_BASE, Task},
 };
 use std::{
+    collections::HashMap,
     io::{Read, Seek, SeekFrom, Write},
     sync::mpsc::Sender,
     time::{Duration, Instant},
@@ -18,13 +21,17 @@ mod mos;
 pub(crate) use mos::MosClock;
 
 use crate::wimp::{
-    WIMP_CLOSE_DOWN, WIMP_CLOSE_WINDOW, WIMP_CREATE_WINDOW, WIMP_GET_WINDOW_STATE, WIMP_INITIALISE,
-    WIMP_OPEN_WINDOW, WIMP_POLL, WimpServer,
+    WIMP_CLOSE_DOWN, WIMP_CLOSE_WINDOW, WIMP_CREATE_ICON, WIMP_CREATE_ICON_EX, WIMP_CREATE_MENU,
+    WIMP_CREATE_WINDOW, WIMP_DELETE_ICON, WIMP_FORCE_REDRAW, WIMP_GET_POINTER_INFO,
+    WIMP_GET_RECTANGLE, WIMP_GET_WINDOW_STATE, WIMP_INITIALISE, WIMP_OPEN_WINDOW, WIMP_POLL,
+    WIMP_REDRAW_WINDOW, WIMP_SET_EXTENT, WIMP_SET_ICON_STATE, WIMP_START_TASK, WIMP_UPDATE_WINDOW,
+    WimpServer, WorkArea,
 };
 
 const DISPLAY_BATCH_FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
 const INKEY_POLL_INTERVAL: Duration = Duration::from_millis(8);
 const MAX_EXTENDED_MODE_PIXELS: u64 = 4_194_304;
+const MAX_TASK_GRAPHICS_PIXELS: u64 = 8_388_608;
 
 pub const OS_WRITE_C: u32 = 0x00;
 pub const OS_WRITE_S: u32 = 0x01;
@@ -42,28 +49,39 @@ pub const OS_GBPB: u32 = 0x0C;
 pub const OS_FIND: u32 = 0x0D;
 pub const OS_READ_LINE: u32 = 0x0E;
 pub const OS_FSCONTROL: u32 = 0x29;
+pub const OS_READ_POINT: u32 = 0x32;
 pub const OS_PLOT: u32 = 0x45;
 pub use crate::wimp::{
     WIMP_CLOSE_DOWN as WIMP_CLOSE_DOWN_SWI, WIMP_CLOSE_WINDOW as WIMP_CLOSE_WINDOW_SWI,
-    WIMP_CREATE_WINDOW as WIMP_CREATE_WINDOW_SWI,
+    WIMP_CREATE_ICON as WIMP_CREATE_ICON_SWI, WIMP_CREATE_ICON_EX as WIMP_CREATE_ICON_EX_SWI,
+    WIMP_CREATE_MENU as WIMP_CREATE_MENU_SWI, WIMP_CREATE_WINDOW as WIMP_CREATE_WINDOW_SWI,
+    WIMP_DELETE_ICON as WIMP_DELETE_ICON_SWI, WIMP_FORCE_REDRAW as WIMP_FORCE_REDRAW_SWI,
+    WIMP_GET_POINTER_INFO as WIMP_GET_POINTER_INFO_SWI,
+    WIMP_GET_RECTANGLE as WIMP_GET_RECTANGLE_SWI,
     WIMP_GET_WINDOW_STATE as WIMP_GET_WINDOW_STATE_SWI, WIMP_INITIALISE as WIMP_INITIALISE_SWI,
     WIMP_OPEN_WINDOW as WIMP_OPEN_WINDOW_SWI, WIMP_POLL as WIMP_POLL_SWI,
+    WIMP_REDRAW_WINDOW as WIMP_REDRAW_WINDOW_SWI, WIMP_SET_EXTENT as WIMP_SET_EXTENT_SWI,
+    WIMP_SET_ICON_STATE as WIMP_SET_ICON_STATE_SWI, WIMP_START_TASK as WIMP_START_TASK_SWI,
+    WIMP_UPDATE_WINDOW as WIMP_UPDATE_WINDOW_SWI,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DisplayEvent {
     WriteByte {
         task_id: u64,
+        window_handle: Option<u32>,
         byte: u8,
     },
     Plot {
         task_id: u64,
+        window_handle: Option<u32>,
         code: u8,
         x: i32,
         y: i32,
     },
     GraphicsSnapshot {
         task_id: u64,
+        window_handle: Option<u32>,
         snapshot: GraphicsSnapshot,
     },
     DesktopStarted,
@@ -87,7 +105,24 @@ const MAX_CLI_BYTES: usize = 256;
 const MAX_STRING_BYTES: usize = 4096;
 const OUTPUT_BUFFER: u32 = GUEST_MEMORY_BASE + 0x1000;
 const CLI_STRING_BUFFER: u32 = GUEST_MEMORY_BASE + 0x3000;
-const HELP_TEXT: &[u8] = b"Acorn-2026 MOS commands:\n\r  Commands can be abbreviated with a final dot (for example, *CA. and *CONF.); *. is a shortcut for *CAT.\n\r  *CAT [dir]             Catalogue a directory.\n\r  *DIR [dir]             Select the current directory.\n\r  *CDIR <dir>            Create a directory.\n\r  *DELETE <file>         Delete a file.\n\r  *RENAME <old> <new>    Rename a file or directory.\n\r  *FILETYPE <file> <id>  Set a RISC OS file type.\n\r  *TYPE <file>           Display a text file.\n\r  *DISC [name]           Read or set the volume name.\n\r  *HOSTFS                Select the HostFS filing system.\n\r  *CONFIGURE <option> <value> Save a BASIC preference.\n\r  *CONFIGURE DEFAULTS    Restore BASIC preferences.\n\r  *STATUS [option]       Show saved BASIC preferences.\n\r  *BASIC <file>          Load and run BASIC with saved preferences.\n\r  DESKTOP                Start the hosted Wimp desktop.\n\r  RUN <file>             Run a BASIC source or tokenised file.\n\r  BASICLOAD <file>       Load a tokenised BASIC program.\n\r  BASICRUN               Run the loaded program.\n\r  BASICJIT [file]        Run with experimental native hot regions.\n\r  BASICJIT STRICT [file] Compile and run supported code without fallback.\n\r  HELP                   Show this help.\n\r  QUIT                   Exit the runtime.";
+const HELP_TEXT: &[u8] = b"Acorn-2026 MOS commands:\n\r  Commands can be abbreviated with a final dot (for example, *CA. and *CONF.); *. is a shortcut for *CAT.\n\r  *CAT [dir]             Catalogue a directory.\n\r  *DIR [dir]             Select the current directory.\n\r  *CDIR <dir>            Create a directory.\n\r  *DELETE <file>         Delete a file.\n\r  *RENAME <old> <new>    Rename a file or directory.\n\r  *FILETYPE <file> <id>  Set a RISC OS file type.\n\r  *TYPE <file>           Display a text file.\n\r  *DISC [name]           Read or set the volume name.\n\r  *HOSTFS                Select the HostFS filing system.\n\r  *CONFIGURE <option> <value> Save a BASIC or startup preference.\n\r  *CONFIGURE Language 0  Open the MOS prompt on load.\n\r  *CONFIGURE Language 3  Open the desktop on load.\n\r  *CONFIGURE DEFAULTS    Restore configuration defaults.\n\r  *STATUS [option]       Show saved configuration.\n\r  *BASIC <file>          Load and run BASIC with saved preferences.\n\r  DESKTOP                Start the hosted Wimp desktop.\n\r  RUN <file>             Run a BASIC source or tokenised file.\n\r  BASICLOAD <file>       Load a tokenised BASIC program.\n\r  BASICRUN               Run the loaded program.\n\r  BASICJIT [file]        Run with experimental native hot regions.\n\r  BASICJIT STRICT [file] Compile and run supported code without fallback.\n\r  HELP                   Show this help.\n\r  QUIT                   Exit the runtime.";
+
+fn work_area_to_graphics_clip(
+    work: WorkArea,
+    extent: WorkArea,
+    logical_height: i32,
+) -> GraphicsWindow {
+    let left = i64::from(work.min_x) - i64::from(extent.min_x);
+    let right = i64::from(work.max_x) - 1 - i64::from(extent.min_x);
+    let bottom = i64::from(logical_height) + i64::from(work.min_y) - i64::from(extent.max_y);
+    let top = i64::from(logical_height) + i64::from(work.max_y) - 1 - i64::from(extent.max_y);
+    GraphicsWindow {
+        left: left.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        bottom: bottom.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        right: right.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        top: top.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+    }
+}
 
 fn hsv_to_rgb(hue: f64, saturation: f64, value: f64) -> (u8, u8, u8) {
     let hue = hue.rem_euclid(360.0) / 60.0;
@@ -120,6 +155,8 @@ pub struct SwiDispatcher {
     configure: ConfigureStore,
     console: HostConsole,
     graphics: GraphicsService,
+    window_graphics: HashMap<u32, GraphicsService>,
+    active_graphics_window: Option<u32>,
     file_system: HostFileSystem,
     quit_requested: bool,
     desktop_requested: bool,
@@ -171,6 +208,8 @@ impl SwiDispatcher {
             configure: ConfigureStore::default(),
             console,
             graphics: GraphicsService::default(),
+            window_graphics: HashMap::new(),
+            active_graphics_window: None,
             file_system: HostFileSystem::demo_default(),
             quit_requested: false,
             desktop_requested: false,
@@ -193,13 +232,65 @@ impl SwiDispatcher {
     }
 
     pub fn graphics(&self) -> &GraphicsService {
-        &self.graphics
+        self.current_graphics()
+    }
+
+    fn current_graphics(&self) -> &GraphicsService {
+        self.active_graphics_window
+            .and_then(|handle| self.window_graphics.get(&handle))
+            .unwrap_or(&self.graphics)
+    }
+
+    fn current_graphics_mut(&mut self) -> &mut GraphicsService {
+        if let Some(handle) = self.active_graphics_window {
+            if let Some(graphics) = self.window_graphics.get_mut(&handle) {
+                return graphics;
+            }
+        }
+        &mut self.graphics
+    }
+
+    fn ensure_graphics_pixel_budget(
+        &self,
+        target_window: Option<u32>,
+        replacement_pixels: u64,
+    ) -> Result<(), RuntimeError> {
+        let mut total = if target_window.is_none() {
+            replacement_pixels
+        } else {
+            self.graphics.mode_pixel_count()
+        };
+        for (handle, graphics) in &self.window_graphics {
+            total = total.saturating_add(if Some(*handle) == target_window {
+                replacement_pixels
+            } else {
+                graphics.mode_pixel_count()
+            });
+        }
+        if let Some(handle) = target_window {
+            if !self.window_graphics.contains_key(&handle) {
+                total = total.saturating_add(replacement_pixels);
+            }
+        }
+        if total > MAX_TASK_GRAPHICS_PIXELS {
+            return Err(RuntimeError::Program(
+                "hosted Wimp graphics surface budget for this task is exhausted".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn load_basic_configuration(&self) -> Result<BasicConfiguration, RuntimeError> {
         self.effective_configure_store()
             .load()
             .map_err(RuntimeError::Program)
+    }
+
+    pub(crate) fn desktop_is_configured_for_startup(&self) -> Result<bool, RuntimeError> {
+        if self.desktop_service.is_none() {
+            return Ok(false);
+        }
+        Ok(self.load_basic_configuration()?.startup_language == StartupLanguage::Desktop)
     }
 
     fn effective_configure_store(&self) -> ConfigureStore {
@@ -214,13 +305,18 @@ impl SwiDispatcher {
         self.configure = configure;
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_file_system_for_test(&mut self, file_system: HostFileSystem) {
+        self.file_system = file_system;
+    }
+
     pub(crate) fn set_graphics_profile(
         &mut self,
         profile: GraphicsProfile,
     ) -> Result<(), RuntimeError> {
-        let previous = self.graphics.snapshot().clone();
-        self.graphics.set_profile(profile)?;
-        let snapshot = self.graphics.snapshot().clone();
+        let previous = self.current_graphics().snapshot().clone();
+        self.current_graphics_mut().set_profile(profile)?;
+        let snapshot = self.current_graphics().snapshot().clone();
         if snapshot != previous {
             self.publish_snapshot(snapshot);
         }
@@ -281,7 +377,11 @@ impl SwiDispatcher {
                 "extended mode dimensions or eigenfactors are outside the hosted profile".into(),
             ));
         }
-        self.graphics.set_extended_mode(
+        self.ensure_graphics_pixel_budget(
+            self.active_graphics_window,
+            u64::from(width as u32) * u64::from(height as u32),
+        )?;
+        self.current_graphics_mut().set_extended_mode(
             width as u32,
             height as u32,
             x_eigenfactor as u8,
@@ -301,6 +401,7 @@ impl SwiDispatcher {
             "OS_WRITEC" => self.dispatch(OS_WRITE_C, task, context),
             "OS_NEWLINE" => self.dispatch(OS_NEW_LINE, task, context),
             "OS_READC" => self.dispatch(OS_READ_C, task, context),
+            "OS_READPOINT" => self.dispatch(OS_READ_POINT, task, context),
             "OS_CLI" => self.dispatch(OS_CLI, task, context),
             "OS_FILE" => self.os_file(task, context),
             "OS_ARGS" => self.os_args(task, context),
@@ -320,17 +421,31 @@ impl SwiDispatcher {
                 Ok(())
             }
             "COLOURTRANS_SETGCOL" => {
-                self.graphics.set_rgb_gcol(context.registers[R0]);
+                self.current_graphics_mut()
+                    .set_rgb_gcol(context.registers[R0]);
                 Ok(())
             }
             "COLOURTRANS_WRITEPALETTE" => Ok(()),
             "WIMP_INITIALISE" => self.dispatch_wimp(WIMP_INITIALISE, task, context),
             "WIMP_CREATEWINDOW" => self.dispatch_wimp(WIMP_CREATE_WINDOW, task, context),
+            "WIMP_CREATEICON" => self.dispatch_wimp(WIMP_CREATE_ICON, task, context),
+            "WIMP_CREATEICONEX" => self.dispatch_wimp(WIMP_CREATE_ICON_EX, task, context),
+            "WIMP_CREATEMENU" => self.dispatch_wimp(WIMP_CREATE_MENU, task, context),
+            "WIMP_DELETEICON" => self.dispatch_wimp(WIMP_DELETE_ICON, task, context),
             "WIMP_OPENWINDOW" => self.dispatch_wimp(WIMP_OPEN_WINDOW, task, context),
+            "WIMP_REDRAWWINDOW" => self.dispatch_wimp(WIMP_REDRAW_WINDOW, task, context),
+            "WIMP_UPDATEWINDOW" => self.dispatch_wimp(WIMP_UPDATE_WINDOW, task, context),
+            "WIMP_GETRECTANGLE" => self.dispatch_wimp(WIMP_GET_RECTANGLE, task, context),
+            "WIMP_FORCEREDRAW" => self.dispatch_wimp(WIMP_FORCE_REDRAW, task, context),
             "WIMP_CLOSEWINDOW" => self.dispatch_wimp(WIMP_CLOSE_WINDOW, task, context),
             "WIMP_POLL" => self.dispatch_wimp(WIMP_POLL, task, context),
             "WIMP_GETWINDOWSTATE" => self.dispatch_wimp(WIMP_GET_WINDOW_STATE, task, context),
+            "WIMP_GETPOINTERINFO" => self.dispatch_wimp(WIMP_GET_POINTER_INFO, task, context),
+            "WIMP_SETICONSTATE" => self.dispatch_wimp(WIMP_SET_ICON_STATE, task, context),
+            "WIMP_SETEXTENT" => self.dispatch_wimp(WIMP_SET_EXTENT, task, context),
             "WIMP_CLOSEDOWN" => self.dispatch_wimp(WIMP_CLOSE_DOWN, task, context),
+            "WIMP_STARTTASK" => self.dispatch_wimp(WIMP_START_TASK, task, context),
+            "ACORN_DESKTOP" => self.acorn_desktop(task, context),
             _ => Err(RuntimeError::Program(format!(
                 "named SWI {name} is not available in the hosted profile"
             ))),
@@ -347,27 +462,48 @@ impl SwiDispatcher {
             number,
             WIMP_INITIALISE
                 | WIMP_CREATE_WINDOW
+                | WIMP_REDRAW_WINDOW
+                | WIMP_UPDATE_WINDOW
+                | WIMP_GET_RECTANGLE
+                | WIMP_FORCE_REDRAW
+                | WIMP_CREATE_ICON
+                | WIMP_CREATE_ICON_EX
+                | WIMP_DELETE_ICON
                 | WIMP_OPEN_WINDOW
                 | WIMP_CLOSE_WINDOW
                 | WIMP_POLL
                 | WIMP_GET_WINDOW_STATE
+                | WIMP_SET_ICON_STATE
+                | WIMP_GET_POINTER_INFO
+                | WIMP_CREATE_MENU
+                | WIMP_SET_EXTENT
                 | WIMP_CLOSE_DOWN
+                | WIMP_START_TASK
         ) {
             return self.dispatch_wimp(number, task, context);
         }
         match number {
             OS_WRITE_C => {
                 let character = context.registers[R0] as u8;
-                let previous_mode = self.graphics.snapshot().mode;
-                let output_byte = self.graphics.write_byte(character)?;
-                let mode_changed = self.graphics.snapshot().mode != previous_mode;
+                if let Some(mode) = self.current_graphics().mode_after_vdu_byte(character) {
+                    self.ensure_graphics_pixel_budget(
+                        self.active_graphics_window,
+                        u64::from(mode.pixel_width) * u64::from(mode.pixel_height),
+                    )?;
+                }
+                let previous_mode = self.current_graphics().snapshot().mode;
+                let output_byte = self.current_graphics_mut().write_byte(character)?;
+                let mode_changed = self.current_graphics().snapshot().mode != previous_mode;
                 if mode_changed {
-                    self.publish_snapshot(self.graphics.snapshot().clone());
+                    self.publish_snapshot(self.current_graphics().snapshot().clone());
                 } else if !self.display_batch_active || output_byte.is_some() {
                     self.publish_display_event(DisplayEvent::WriteByte {
                         task_id: self.display_task_id,
+                        window_handle: self.active_graphics_window,
                         byte: character,
                     });
+                } else {
+                    self.publish_snapshot(self.current_graphics().snapshot().clone());
                 }
                 if let Some(byte) = output_byte {
                     self.console.write_byte(byte)?;
@@ -396,16 +532,31 @@ impl SwiDispatcher {
                 let code = context.registers[R0] as u8;
                 let x = context.registers[R1] as i32;
                 let y = context.registers[R2] as i32;
-                self.graphics.plot(code, x, y)?;
+                self.current_graphics_mut().plot(code, x, y)?;
                 if self.display_batch_active {
                     self.publish_display_batch_snapshot_if_due();
                 } else {
                     self.publish_display_event(DisplayEvent::Plot {
                         task_id: self.display_task_id,
+                        window_handle: self.active_graphics_window,
                         code,
                         x,
                         y,
                     });
+                }
+                Ok(())
+            }
+            OS_READ_POINT => {
+                let x = context.registers[R0] as i32;
+                let y = context.registers[R1] as i32;
+                if let Some((colour, tint)) = self.current_graphics().read_point(x, y) {
+                    context.registers[R2] = colour;
+                    context.registers[R3] = tint;
+                    context.registers[R4] = 0;
+                } else {
+                    context.registers[R2] = u32::MAX;
+                    context.registers[R3] = 0;
+                    context.registers[R4] = u32::MAX;
                 }
                 Ok(())
             }
@@ -419,15 +570,137 @@ impl SwiDispatcher {
         task: &mut Task,
         context: &mut SwiContext,
     ) -> Result<(), RuntimeError> {
-        let Some(wimp) = &self.wimp else {
+        let Some(wimp) = self.wimp.clone() else {
             return Err(RuntimeError::InvalidSwi(number));
         };
-        wimp.dispatch(number, task, context)
+        wimp.dispatch(number, task, context)?;
+        if let Some((window_handle, work, extent)) = wimp.current_graphics_context(task.id) {
+            if self.active_graphics_window != Some(window_handle) {
+                if !self.window_graphics.contains_key(&window_handle) {
+                    self.ensure_graphics_pixel_budget(
+                        Some(window_handle),
+                        self.graphics.mode_pixel_count(),
+                    )?;
+                    self.window_graphics
+                        .insert(window_handle, self.graphics.new_window_output());
+                }
+                self.active_graphics_window = Some(window_handle);
+            }
+            let mode_height = self.current_graphics().snapshot().mode.logical_height;
+            let clip = work_area_to_graphics_clip(work, extent, mode_height);
+            self.current_graphics_mut().set_wimp_redraw_clip(Some(clip));
+            if wimp.current_redraw_clears_background(task.id) {
+                let background = wimp.current_redraw_background_colour(task.id).unwrap_or(7);
+                self.current_graphics_mut()
+                    .clear_wimp_region(clip, background);
+            }
+            self.publish_snapshot(self.current_graphics().snapshot().clone());
+        } else if let Some(window_handle) = self.active_graphics_window.take() {
+            if let Some(graphics) = self.window_graphics.get_mut(&window_handle) {
+                graphics.set_wimp_redraw_clip(None);
+                let snapshot = graphics.snapshot().clone();
+                self.publish_snapshot_for_window(Some(window_handle), snapshot);
+            }
+        }
+        Ok(())
+    }
+
+    /// Project extension for the BASIC64 Filer. It exposes checked HostFS
+    /// catalogue records and the mounted volume name; Filer navigation and
+    /// activation policy remain in BASIC64.
+    fn acorn_desktop(
+        &mut self,
+        task: &mut Task,
+        context: &mut SwiContext,
+    ) -> Result<(), RuntimeError> {
+        match context.registers[R0] {
+            1 => {
+                let path = read_guest_control_string(task, context.registers[R1])?;
+                let index = context.registers[R2] as usize;
+                let capacity = context.registers[R4] as usize;
+                if capacity == 0 || capacity > crate::memory::GUEST_MEMORY_SIZE as usize {
+                    return Err(RuntimeError::Program(
+                        "Acorn_Desktop entry buffer size is outside the hosted limit".into(),
+                    ));
+                }
+                let entries = self.file_system.enumerate(&task.file_system, &path, "*")?;
+                let Some(entry) = entries.get(index) else {
+                    task.memory.write_byte(context.registers[R3], 0)?;
+                    context.registers[R0] = 0;
+                    context.registers[R1] = 0;
+                    return Ok(());
+                };
+                if entry.guest_name.len() + 1 > capacity {
+                    return Err(RuntimeError::Program(
+                        "Acorn_Desktop entry name does not fit the caller buffer".into(),
+                    ));
+                }
+                write_guest_string(task, context.registers[R3], &entry.guest_name)?;
+                context.registers[R0] = if entry.is_directory {
+                    2
+                } else if matches!(
+                    entry.metadata.file_type & 0xFFF,
+                    FILETYPE_BASIC | FILETYPE_BASIC64
+                ) {
+                    1
+                } else if entry.metadata.file_type & 0xFFF == FILETYPE_TEXT {
+                    3
+                } else {
+                    4
+                };
+                context.registers[R1] = entry.metadata.file_type;
+                context.registers[R2] = entry.length;
+                Ok(())
+            }
+            2 => {
+                let capacity = context.registers[R2] as usize;
+                let name = self.file_system.volume_name();
+                if name.len() + 1 > capacity {
+                    return Err(RuntimeError::Program(
+                        "Acorn_Desktop volume name does not fit the caller buffer".into(),
+                    ));
+                }
+                write_guest_string(task, context.registers[R1], name)?;
+                context.registers[R0] = u32::try_from(name.len()).unwrap_or(u32::MAX);
+                Ok(())
+            }
+            4 => self
+                .wimp
+                .as_ref()
+                .ok_or(RuntimeError::InvalidSwi(0x4FF00))?
+                .register_system_menu(task.id),
+            3 => {
+                // Additive hosted catalogue metadata: leave reason 1 unchanged.
+                let path = read_guest_control_string(task, context.registers[R1])?;
+                let index = context.registers[R2] as usize;
+                let entries = self.file_system.enumerate(&task.file_system, &path, "*")?;
+                let modified = entries.get(index).and_then(|entry| {
+                    std::fs::metadata(&entry.host_path)
+                        .ok()?
+                        .modified()
+                        .ok()?
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .and_then(|duration| u32::try_from(duration.as_secs()).ok())
+                });
+                context.registers[R0] = u32::from(modified.is_some());
+                context.registers[R1] = modified.unwrap_or(0);
+                Ok(())
+            }
+            action => Err(RuntimeError::Program(format!(
+                "Acorn_Desktop action {action} is not supported"
+            ))),
+        }
     }
 
     fn publish_snapshot(&self, snapshot: GraphicsSnapshot) {
+        self.publish_snapshot_for_window(self.active_graphics_window, snapshot);
+    }
+
+    fn publish_snapshot_for_window(&self, window_handle: Option<u32>, snapshot: GraphicsSnapshot) {
         self.publish_display_event(DisplayEvent::GraphicsSnapshot {
             task_id: self.display_task_id,
+            window_handle,
             snapshot,
         });
     }
@@ -438,6 +711,28 @@ impl SwiDispatcher {
         path: &str,
     ) -> Result<(Vec<u8>, FileMetadata), RuntimeError> {
         self.file_system.read_file(&task.file_system, path)
+    }
+
+    pub(crate) fn set_program_working_directory(
+        &self,
+        task: &mut Task,
+        path: &str,
+    ) -> Result<(), RuntimeError> {
+        let resolved = self
+            .file_system
+            .canonical_guest_path(&task.file_system, path)?;
+        if resolved.is_directory {
+            return Err(RuntimeError::Program(format!("'{path}' is a directory")));
+        }
+        let parent = resolved
+            .guest_path
+            .rsplit_once('.')
+            .map(|(parent, _)| parent)
+            .filter(|parent| !parent.is_empty())
+            .map(|parent| format!("$.{parent}"))
+            .unwrap_or_else(|| "$".to_string());
+        self.file_system
+            .set_current_directory(&mut task.file_system, &parent)
     }
 
     fn os_file(&mut self, task: &mut Task, context: &mut SwiContext) -> Result<(), RuntimeError> {
@@ -1292,7 +1587,7 @@ impl SwiDispatcher {
         self.display_batch_active = false;
         self.last_display_batch_publish = None;
         if self.display_events.is_some() {
-            self.publish_snapshot(self.graphics.snapshot().clone());
+            self.publish_snapshot(self.current_graphics().snapshot().clone());
         }
     }
 
@@ -1305,7 +1600,7 @@ impl SwiDispatcher {
             return;
         }
 
-        let snapshot = self.graphics.snapshot().clone();
+        let snapshot = self.current_graphics().snapshot().clone();
         self.publish_snapshot(snapshot);
         self.last_display_batch_publish = Some(Instant::now());
     }
@@ -1935,14 +2230,14 @@ impl SwiDispatcher {
         if arguments.is_empty() {
             self.write_inline(
                 task,
-                b"Syntax: *CONFIGURE <option> <value>\n\r  BASICMode Auto|Classic|BASIC64|Hybrid\n\r  BASICProfile Auto|<profile>\n\r  BASICTarget Auto|Hosted|RISCOS|Agon\n\r  BASICEngine Interpreter|Hybrid|Strict\n\r  *CONFIGURE DEFAULTS resets all BASIC preferences.",
+                b"Syntax: *CONFIGURE <option> <value>\n\r  Language 0|3 (MOS prompt|desktop on load)\n\r  WindowFurniture Flat|Bevelled (restart app to apply)\n\r  BASICMode Auto|Classic|BASIC64|Hybrid\n\r  BASICProfile Auto|<profile>\n\r  BASICTarget Auto|Hosted|RISCOS|Agon\n\r  BASICEngine Interpreter|Hybrid|Strict\n\r  *CONFIGURE DEFAULTS resets all configuration preferences.",
             )?;
             return self.write_new_line(task);
         }
         if arguments.eq_ignore_ascii_case("DEFAULTS") {
             return match self.effective_configure_store().reset() {
                 Ok(_) => {
-                    self.write_inline(task, b"BASIC preferences restored to defaults.")?;
+                    self.write_inline(task, b"Configuration preferences restored to defaults.")?;
                     self.write_new_line(task)
                 }
                 Err(error) => {
@@ -2018,7 +2313,7 @@ impl SwiDispatcher {
                 self.write_new_line(task)
             }
             None => {
-                let message = format!("STATUS error: unknown BASIC option '{arguments}'");
+                let message = format!("STATUS error: unknown configuration option '{arguments}'");
                 self.write_inline(task, message.as_bytes())?;
                 self.write_new_line(task)
             }
@@ -2052,6 +2347,25 @@ fn cli_command_matches(command_token: &str, command_name: &str) -> bool {
 fn read_guest_string(task: &Task, address: u32) -> Result<String, RuntimeError> {
     let bytes = task.memory.read_c_string(address, MAX_STRING_BYTES)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn read_guest_control_string(task: &Task, address: u32) -> Result<String, RuntimeError> {
+    let mut bytes = Vec::new();
+    for offset in 0..MAX_STRING_BYTES {
+        let current = address
+            .checked_add(
+                u32::try_from(offset).map_err(|_| crate::memory::MemoryError::AddressOverflow)?,
+            )
+            .ok_or(crate::memory::MemoryError::AddressOverflow)?;
+        let byte = task.memory.read_byte(current)?;
+        if byte <= 31 {
+            return Ok(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        bytes.push(byte);
+    }
+    Err(RuntimeError::Program(
+        "guest control-terminated string is too long".into(),
+    ))
 }
 
 fn write_guest_string(task: &mut Task, address: u32, value: &str) -> Result<(), RuntimeError> {
@@ -2145,6 +2459,7 @@ fn file_type_name(file_type: u32) -> [u8; 8] {
     let numeric;
     let name = match file_type & 0xFFF {
         0xFFB => "BASIC",
+        FILETYPE_BASIC64 => "BASIC64",
         0xFFF => "Text",
         0xFEB => "Obey",
         0xFFD => "Data",
@@ -2163,6 +2478,8 @@ fn parse_file_type(value: &str) -> Result<u32, RuntimeError> {
     let value = value.trim();
     let named = if value.eq_ignore_ascii_case("BASIC") {
         Some(FILETYPE_BASIC)
+    } else if value.eq_ignore_ascii_case("BASIC64") {
+        Some(FILETYPE_BASIC64)
     } else if value.eq_ignore_ascii_case("TEXT") {
         Some(FILETYPE_TEXT)
     } else if value.eq_ignore_ascii_case("OBEY") {
@@ -2264,6 +2581,139 @@ mod tests {
 
     use super::*;
 
+    fn put_word(block: &mut [u8], offset: usize, value: u32) {
+        block[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn get_word(task: &Task, address: u32) -> u32 {
+        u32::from_le_bytes(
+            task.memory
+                .read_bytes(address, 4)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        )
+    }
+
+    fn initialise_wimp_task(dispatcher: &mut SwiDispatcher, task: &mut Task) {
+        const DESCRIPTION: u32 = 0x1000;
+        task.memory
+            .write_bytes(DESCRIPTION, b"Graphics routing test\0")
+            .unwrap();
+        let mut context = SwiContext::default();
+        context.registers[R0] = 310;
+        context.registers[R1] = u32::from_le_bytes(*b"TASK");
+        context.registers[R2] = DESCRIPTION;
+        dispatcher
+            .dispatch(WIMP_INITIALISE, task, &mut context)
+            .unwrap();
+    }
+
+    fn create_wimp_window(
+        dispatcher: &mut SwiDispatcher,
+        task: &mut Task,
+        block_address: u32,
+        title: &str,
+        area: WorkArea,
+    ) -> u32 {
+        let mut definition = [0_u8; 88];
+        put_word(&mut definition, 0, area.min_x as u32);
+        put_word(&mut definition, 4, area.min_y as u32);
+        put_word(&mut definition, 8, area.max_x as u32);
+        put_word(&mut definition, 12, area.max_y as u32);
+        put_word(&mut definition, 28, 0xB600_0002);
+        put_word(&mut definition, 40, 0);
+        put_word(&mut definition, 44, (-512_i32) as u32);
+        put_word(&mut definition, 48, 640);
+        put_word(&mut definition, 52, 0);
+        put_word(&mut definition, 56, 1);
+        put_word(&mut definition, 60, 0);
+        definition[72..72 + title.len()].copy_from_slice(title.as_bytes());
+        task.memory.write_bytes(block_address, &definition).unwrap();
+        let mut context = SwiContext::default();
+        context.registers[R1] = block_address;
+        dispatcher
+            .dispatch(WIMP_CREATE_WINDOW, task, &mut context)
+            .unwrap();
+        let handle = context.registers[R0];
+
+        let mut open = [0_u8; 32];
+        put_word(&mut open, 0, handle);
+        put_word(&mut open, 4, area.min_x as u32);
+        put_word(&mut open, 8, area.min_y as u32);
+        put_word(&mut open, 12, area.max_x as u32);
+        put_word(&mut open, 16, area.max_y as u32);
+        put_word(&mut open, 28, u32::MAX);
+        task.memory
+            .write_bytes(block_address + 0x100, &open)
+            .unwrap();
+        let mut context = SwiContext::default();
+        context.registers[R1] = block_address + 0x100;
+        dispatcher
+            .dispatch(WIMP_OPEN_WINDOW, task, &mut context)
+            .unwrap();
+        handle
+    }
+
+    fn paint_next_wimp_redraw(
+        dispatcher: &mut SwiDispatcher,
+        task: &mut Task,
+        address: u32,
+        character: u8,
+    ) -> (u32, i32, i32, u32) {
+        let mut poll = SwiContext::default();
+        poll.registers[R1] = address;
+        dispatcher.dispatch(WIMP_POLL, task, &mut poll).unwrap();
+        assert_eq!(poll.registers[R0], 1);
+        let mut redraw = SwiContext::default();
+        redraw.registers[R1] = address;
+        dispatcher
+            .dispatch(WIMP_REDRAW_WINDOW, task, &mut redraw)
+            .unwrap();
+        let handle = get_word(task, address);
+        let colour = u32::from(character - b'A' + 1);
+        let mut painted_point = None;
+        while redraw.registers[R0] != 0 {
+            for byte in [18, 0, colour as u8] {
+                let mut output = SwiContext::default();
+                output.registers[R0] = u32::from(byte);
+                dispatcher.dispatch(OS_WRITE_C, task, &mut output).unwrap();
+            }
+            let clip = dispatcher
+                .graphics()
+                .snapshot()
+                .wimp_clip
+                .expect("Wimp redraw installs a graphics clip");
+            let point = (clip.left + 1, clip.bottom + 1);
+            let mut plot = SwiContext::default();
+            plot.registers[R0] = 0x45;
+            plot.registers[R1] = point.0 as u32;
+            plot.registers[R2] = point.1 as u32;
+            dispatcher.dispatch(OS_PLOT, task, &mut plot).unwrap();
+            let mut read = SwiContext::default();
+            read.registers[R0] = point.0 as u32;
+            read.registers[R1] = point.1 as u32;
+            dispatcher.dispatch(OS_READ_POINT, task, &mut read).unwrap();
+            assert_eq!(
+                (read.registers[R2], read.registers[R3], read.registers[R4]),
+                (colour, 0, 0)
+            );
+            painted_point = Some(point);
+
+            let mut output = SwiContext::default();
+            output.registers[R0] = u32::from(character);
+            dispatcher.dispatch(OS_WRITE_C, task, &mut output).unwrap();
+            let mut rectangle = SwiContext::default();
+            rectangle.registers[R1] = address;
+            dispatcher
+                .dispatch(WIMP_GET_RECTANGLE, task, &mut rectangle)
+                .unwrap();
+            redraw.registers[R0] = rectangle.registers[R0];
+        }
+        let (x, y) = painted_point.expect("the Wimp redraw had a visible rectangle");
+        (handle, x, y, colour)
+    }
+
     fn dispatch_cli_line(
         dispatcher: &mut SwiDispatcher,
         task: &mut Task,
@@ -2279,9 +2729,9 @@ mod tests {
     }
 
     #[test]
-    fn configure_accepts_canonical_engine_values_and_conf_abbreviation() {
+    fn configure_accepts_supported_values_and_conf_abbreviation() {
         let (_input_sender, input_receiver) = mpsc::channel();
-        let (display_sender, _display_receiver) = mpsc::channel();
+        let (display_sender, display_receiver) = mpsc::channel();
         let mut dispatcher =
             SwiDispatcher::windowed(HostConsole::windowed(input_receiver), display_sender);
         let config_path = std::env::temp_dir().join(format!(
@@ -2304,6 +2754,28 @@ mod tests {
             BasicEngine::HybridJit
         );
 
+        dispatch_cli_line(&mut dispatcher, &mut task, "*CONFIGURE Language 3").unwrap();
+        assert_eq!(
+            dispatcher
+                .configure
+                .load()
+                .unwrap()
+                .status_value("Language")
+                .unwrap()
+                .1,
+            "3"
+        );
+        let _ = display_receiver.try_iter().count();
+        dispatch_cli_line(&mut dispatcher, &mut task, "*STATUS Language").unwrap();
+        let status_output = display_receiver
+            .try_iter()
+            .filter_map(|event| match event {
+                DisplayEvent::WriteByte { byte, .. } => Some(byte),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(String::from_utf8_lossy(&status_output).contains("Language=3"));
+
         for value in ["HybridJIT", "Hybrid-JIT", "StrictJIT", "Strict-JIT"] {
             let command = format!("*CONFIGURE BASICEngine {value}");
             dispatch_cli_line(&mut dispatcher, &mut task, &command).unwrap();
@@ -2314,6 +2786,208 @@ mod tests {
             );
         }
         let _ = std::fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn os_read_point_reads_immediate_pixels_and_preserves_coordinates() {
+        let mut dispatcher = SwiDispatcher::new(HostConsole::stdio());
+        let mut task = Task::new(1);
+        for byte in [22_u8, 2, 18, 0, 2] {
+            let mut output = SwiContext::default();
+            output.registers[R0] = u32::from(byte);
+            dispatcher
+                .dispatch(OS_WRITE_C, &mut task, &mut output)
+                .unwrap();
+        }
+        assert_eq!(dispatcher.graphics().snapshot().graphics_colour, 2);
+        for byte in [29_u8, 5, 0, 7, 0] {
+            let mut output = SwiContext::default();
+            output.registers[R0] = u32::from(byte);
+            dispatcher
+                .dispatch(OS_WRITE_C, &mut task, &mut output)
+                .unwrap();
+        }
+        let mut plot = SwiContext::default();
+        plot.registers[R0] = 0x45;
+        plot.registers[R1] = 10;
+        plot.registers[R2] = 20;
+        dispatcher.dispatch(OS_PLOT, &mut task, &mut plot).unwrap();
+        assert!(dispatcher.graphics().snapshot().graphics_content_present);
+        let mut read = SwiContext::default();
+        read.registers[R0] = 10;
+        read.registers[R1] = 20;
+        dispatcher
+            .dispatch_named_swi("OS_READPOINT", &mut task, &mut read)
+            .unwrap();
+        assert_eq!((read.registers[R0], read.registers[R1]), (10, 20));
+        assert_eq!(
+            (read.registers[R2], read.registers[R3], read.registers[R4]),
+            (2, 0, 0)
+        );
+
+        let mut off_screen = SwiContext::default();
+        off_screen.registers[R0] = (-10_000_i32) as u32;
+        off_screen.registers[R1] = 20;
+        dispatcher
+            .dispatch(OS_READ_POINT, &mut task, &mut off_screen)
+            .unwrap();
+        assert_eq!(off_screen.registers[R0], (-10_000_i32) as u32);
+        assert_eq!(off_screen.registers[R1], 20);
+        assert_eq!(off_screen.registers[R2], u32::MAX);
+        assert_eq!(off_screen.registers[R4], u32::MAX);
+    }
+
+    #[test]
+    fn wimp_redraw_routes_to_independent_window_surfaces_and_restores_task_default() {
+        let (input_sender, input_receiver) = mpsc::channel();
+        let (display_sender, _display_receiver) = mpsc::channel();
+        let (desktop_sender, _desktop_receiver) = mpsc::channel();
+        let wimp = WimpServer::new(desktop_sender);
+        let mut dispatcher = SwiDispatcher::desktop_task(
+            HostConsole::windowed(input_receiver),
+            display_sender,
+            77,
+            wimp,
+        );
+        let mut task = Task::new(77);
+        for byte in [22_u8, 2] {
+            let mut output = SwiContext::default();
+            output.registers[R0] = u32::from(byte);
+            dispatcher
+                .dispatch(OS_WRITE_C, &mut task, &mut output)
+                .unwrap();
+        }
+        initialise_wimp_task(&mut dispatcher, &mut task);
+
+        let first = create_wimp_window(
+            &mut dispatcher,
+            &mut task,
+            0x2000,
+            "First",
+            WorkArea {
+                min_x: 100,
+                min_y: 400,
+                max_x: 600,
+                max_y: 900,
+            },
+        );
+        let second = create_wimp_window(
+            &mut dispatcher,
+            &mut task,
+            0x2200,
+            "Second",
+            WorkArea {
+                min_x: 700,
+                min_y: 400,
+                max_x: 1200,
+                max_y: 900,
+            },
+        );
+
+        let (first_painted, first_x, first_y, first_colour) =
+            paint_next_wimp_redraw(&mut dispatcher, &mut task, 0x2400, b'A');
+        let (second_painted, second_x, second_y, second_colour) =
+            paint_next_wimp_redraw(&mut dispatcher, &mut task, 0x2600, b'B');
+        assert_eq!([first_painted, second_painted], [first, second]);
+        assert_eq!(
+            dispatcher.window_graphics[&first].read_point(first_x, first_y),
+            Some((first_colour, 0))
+        );
+        assert_eq!(
+            dispatcher.window_graphics[&second].read_point(second_x, second_y),
+            Some((second_colour, 0))
+        );
+        assert_eq!(dispatcher.active_graphics_window, None);
+        assert_eq!(dispatcher.graphics().snapshot().text_cells[0], b' ');
+        assert_eq!(
+            dispatcher.window_graphics[&first].snapshot().text_cells[0],
+            b'A'
+        );
+        assert_eq!(
+            dispatcher.window_graphics[&second].snapshot().text_cells[0],
+            b'B'
+        );
+
+        let mut update_block = [0_u8; 44];
+        put_word(&mut update_block, 0, first);
+        put_word(&mut update_block, 4, 0);
+        put_word(&mut update_block, 8, (-512_i32) as u32);
+        put_word(&mut update_block, 12, 640);
+        put_word(&mut update_block, 16, 0);
+        task.memory.write_bytes(0x2800, &update_block).unwrap();
+        let mut update = SwiContext::default();
+        update.registers[R1] = 0x2800;
+        dispatcher
+            .dispatch(WIMP_UPDATE_WINDOW, &mut task, &mut update)
+            .unwrap();
+        while update.registers[R0] != 0 {
+            for byte in [31, 1, 0, b'U'] {
+                let mut output = SwiContext::default();
+                output.registers[R0] = u32::from(byte);
+                dispatcher
+                    .dispatch(OS_WRITE_C, &mut task, &mut output)
+                    .unwrap();
+            }
+            let mut rectangle = SwiContext::default();
+            rectangle.registers[R1] = 0x2800;
+            dispatcher
+                .dispatch(WIMP_GET_RECTANGLE, &mut task, &mut rectangle)
+                .unwrap();
+            update.registers[R0] = rectangle.registers[R0];
+        }
+        assert_eq!(dispatcher.active_graphics_window, None);
+        assert_eq!(
+            dispatcher.window_graphics[&first].snapshot().text_cells[0],
+            b'A'
+        );
+        assert_eq!(
+            dispatcher.window_graphics[&first].snapshot().text_cells[1],
+            b'U'
+        );
+
+        let mut default_output = SwiContext::default();
+        default_output.registers[R0] = u32::from(b'D');
+        dispatcher
+            .dispatch(OS_WRITE_C, &mut task, &mut default_output)
+            .unwrap();
+        assert_eq!(dispatcher.graphics().snapshot().text_cells[0], b'D');
+        assert_eq!(
+            dispatcher.window_graphics[&first].snapshot().text_cells[0],
+            b'A'
+        );
+        assert_eq!(
+            dispatcher.window_graphics[&second].snapshot().text_cells[0],
+            b'B'
+        );
+        drop(input_sender);
+    }
+
+    #[test]
+    fn wimp_redraw_clip_maps_half_open_work_area_to_local_graphics_coordinates() {
+        let clip = work_area_to_graphics_clip(
+            WorkArea {
+                min_x: 10,
+                min_y: -300,
+                max_x: 210,
+                max_y: -100,
+            },
+            WorkArea {
+                min_x: 10,
+                min_y: -600,
+                max_x: 400,
+                max_y: 0,
+            },
+            512,
+        );
+        assert_eq!(
+            clip,
+            GraphicsWindow {
+                left: 0,
+                bottom: 212,
+                right: 199,
+                top: 411,
+            }
+        );
     }
 
     #[test]
@@ -2346,6 +3020,108 @@ mod tests {
 
         dispatch_cli_line(&mut dispatcher, &mut task, "*D.").unwrap();
         assert!(!dispatcher.desktop_requested());
+    }
+
+    #[test]
+    fn basic64_source_type_is_named_and_launchable_without_tokenisation() {
+        assert_eq!(parse_file_type("BASIC64").unwrap(), FILETYPE_BASIC64);
+        assert_eq!(parse_file_type("&064").unwrap(), FILETYPE_BASIC64);
+        assert_eq!(file_type_name(FILETYPE_BASIC64), *b"BASIC64 ");
+        assert_ne!(FILETYPE_BASIC64, FILETYPE_BASIC);
+        let mut dispatcher = SwiDispatcher::new(HostConsole::stdio());
+        dispatcher.set_file_system_for_test(HostFileSystem::new(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("demo-volume"),
+        ));
+        let mut task = Task::new(31);
+        task.memory.write_bytes(0x1800, b"$.System\0").unwrap();
+        for index in 0..2 {
+            let mut context = SwiContext::default();
+            context.registers[R0] = 1;
+            context.registers[R1] = 0x1800;
+            context.registers[R2] = index;
+            context.registers[R3] = 0x1900;
+            context.registers[R4] = 256;
+            dispatcher
+                .dispatch_named_swi("ACORN_DESKTOP", &mut task, &mut context)
+                .unwrap();
+            assert_eq!(
+                context.registers[R0], 1,
+                "BASIC64 source must be launchable"
+            );
+            assert_eq!(context.registers[R1], FILETYPE_BASIC64);
+        }
+    }
+
+    #[test]
+    fn acorn_desktop_catalogue_uses_checked_guest_buffers_and_hostfs_metadata() {
+        let mut dispatcher = SwiDispatcher::new(HostConsole::stdio());
+        dispatcher.set_file_system_for_test(HostFileSystem::new(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("demo-volume"),
+        ));
+        let mut task = Task::new(31);
+        const DIRECTORY: u32 = 0x1800;
+        const ENTRY: u32 = 0x1900;
+        task.memory.write_bytes(DIRECTORY, b"$.Examples\0").unwrap();
+
+        let mut context = SwiContext::default();
+        context.registers[R0] = 1;
+        context.registers[R1] = DIRECTORY;
+        context.registers[R2] = 0;
+        context.registers[R3] = ENTRY;
+        context.registers[R4] = 256;
+        dispatcher
+            .dispatch_named_swi("ACORN_DESKTOP", &mut task, &mut context)
+            .unwrap();
+        assert!([1, 2, 3, 4].contains(&context.registers[R0]));
+        let name = task.memory.read_c_string(ENTRY, 256).unwrap();
+        assert!(!name.is_empty());
+        if context.registers[R0] != 2 {
+            assert!(matches!(
+                context.registers[R1] & 0xFFF,
+                FILETYPE_BASIC | FILETYPE_BASIC64 | FILETYPE_TEXT
+            ));
+        }
+
+        let mut date = SwiContext::default();
+        date.registers[R0] = 3;
+        date.registers[R1] = DIRECTORY;
+        date.registers[R2] = 0;
+        dispatcher
+            .dispatch_named_swi("ACORN_DESKTOP", &mut task, &mut date)
+            .unwrap();
+        assert_eq!(date.registers[R0], 1);
+        assert!(date.registers[R1] > 0);
+        date.registers[R0] = 3;
+        date.registers[R1] = DIRECTORY;
+        date.registers[R2] = u32::MAX;
+        dispatcher
+            .dispatch_named_swi("ACORN_DESKTOP", &mut task, &mut date)
+            .unwrap();
+        assert_eq!((date.registers[R0], date.registers[R1]), (0, 0));
+
+        task.memory.write_bytes(DIRECTORY, b"../../etc\0").unwrap();
+        let mut invalid = SwiContext::default();
+        invalid.registers[R0] = 1;
+        invalid.registers[R1] = DIRECTORY;
+        invalid.registers[R3] = ENTRY;
+        invalid.registers[R4] = 256;
+        assert!(
+            dispatcher
+                .dispatch_named_swi("ACORN_DESKTOP", &mut task, &mut invalid)
+                .is_err()
+        );
+
+        task.memory.write_bytes(DIRECTORY, b"$.Examples\0").unwrap();
+        let mut bad_buffer = SwiContext::default();
+        bad_buffer.registers[R0] = 1;
+        bad_buffer.registers[R1] = DIRECTORY;
+        bad_buffer.registers[R3] = u32::MAX - 4;
+        bad_buffer.registers[R4] = 256;
+        assert!(
+            dispatcher
+                .dispatch_named_swi("ACORN_DESKTOP", &mut task, &mut bad_buffer)
+                .is_err()
+        );
     }
 
     #[test]

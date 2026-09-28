@@ -4,7 +4,9 @@ use crate::filesystem::OpenFile;
 use crate::tokenized_basic::TokenizedBasicProgram;
 
 pub const GUEST_MEMORY_BASE: u32 = 0x1000;
-pub const GUEST_MEMORY_SIZE: usize = 64 * 1024;
+// Room for BASIC64 desktop artwork, menu trees and catalogue state. Addresses
+// remain caller-scoped and every access still passes the same bounds checks.
+pub const GUEST_MEMORY_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug)]
 pub enum MemoryError {

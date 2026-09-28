@@ -14,9 +14,10 @@ use acorn_2026::{
     runtime::Runtime,
     swi::{DisplayEvent, SwiContext},
     wimp::{
-        DESKTOP_HEIGHT, DESKTOP_WIDTH, DesktopRect, DesktopWindow, VerticalScrollbarLayout,
-        WIMP_CREATE_WINDOW, WIMP_GET_WINDOW_STATE, WIMP_INITIALISE, WIMP_OPEN_WINDOW, WIMP_POLL,
-        WimpServer, WindowDragKind, WindowFurnitureLayout, WorkArea, desktop_window_furniture,
+        DESKTOP_HEIGHT, DESKTOP_ICONBAR_HEIGHT, DESKTOP_WIDTH, DesktopRect, DesktopWindow,
+        VerticalScrollbarLayout, WIMP_CREATE_WINDOW, WIMP_GET_WINDOW_STATE, WIMP_INITIALISE,
+        WIMP_OPEN_WINDOW, WIMP_POLL, WimpServer, WindowDragKind, WindowFurnitureLayout, WorkArea,
+        desktop_window_furniture,
     },
 };
 
@@ -156,7 +157,9 @@ impl WimpFixture {
 
     fn poll(&mut self) -> (u32, Vec<u8>) {
         let mut context = SwiContext::default();
-        context.registers[0] = 0;
+        // These fixture tests exercise desktop input and stacking. Mask redraw
+        // requests here; the redraw protocol has its own focused unit coverage.
+        context.registers[0] = 1 << 1;
         context.registers[1] = POLL_BLOCK_ADDRESS;
         self.wimp
             .dispatch(WIMP_POLL, &mut self.task, &mut context)
@@ -204,9 +207,11 @@ impl WimpFixture {
 
 const TEST_AREA: WorkArea = WorkArea {
     min_x: 30,
-    min_y: 80,
+    // Keep the resize cell and frame above the desktop's icon bar.
+    // 48-unit resize cell plus the two-unit outer rule.
+    min_y: DESKTOP_ICONBAR_HEIGHT + 50,
     max_x: 390,
-    max_y: 360,
+    max_y: 400,
 };
 const TEST_EXTENT: WorkArea = WorkArea {
     min_x: 0,
@@ -466,7 +471,7 @@ impl DesktopAcceptance {
     }
 
     fn record_display_event(&mut self, event: DisplayEvent) {
-        if let DisplayEvent::WriteByte { task_id, byte } = event {
+        if let DisplayEvent::WriteByte { task_id, byte, .. } = event {
             self.output.entry(task_id).or_default().push(byte);
         }
     }
@@ -801,7 +806,8 @@ fn wimp_default_scrollbars_use_os_unit_steps_pages_and_extent_clamps() {
     fixture.wimp.mouse_down(page_up.0, page_up.1, 4);
     let (reason, request) = fixture.poll();
     assert_eq!(reason, 2);
-    assert_eq!(read_word(&request, 24) as i32, -552); // Visible work-area height is 280 OS units.
+    let page_step = (TEST_AREA.max_y - TEST_AREA.min_y) * 2 / 3;
+    assert_eq!(read_word(&request, 24) as i32, -832 + page_step);
     fixture.accept_open_request();
 
     let bar = fixture.layout(handle).vertical_scrollbar.unwrap();
@@ -817,7 +823,7 @@ fn wimp_default_scrollbars_use_os_unit_steps_pages_and_extent_clamps() {
     fixture.wimp.mouse_down(page_up.0, page_up.1, 1);
     let (reason, request) = fixture.poll();
     assert_eq!(reason, 2);
-    assert_eq!(read_word(&request, 24) as i32, -1_112);
+    assert_eq!(read_word(&request, 24) as i32, -832 - page_step);
     fixture.accept_open_request();
 
     let bar = fixture.layout(handle).vertical_scrollbar.unwrap();
@@ -851,7 +857,7 @@ fn wimp_default_scrollbars_use_os_unit_steps_pages_and_extent_clamps() {
     fixture.wimp.mouse_down(page_down.0, page_down.1, 4);
     let (reason, request) = fixture.poll();
     assert_eq!(reason, 2);
-    assert_eq!(read_word(&request, 24) as i32, minimum_scroll_y);
+    assert_eq!(read_word(&request, 24) as i32, -1_500 - page_step);
     fixture.accept_open_request();
 }
 
@@ -1003,7 +1009,7 @@ fn wimp_resize_clamps_to_extent_screen_and_control_cell_geometry() {
         .drag_to(drag, DESKTOP_WIDTH * 4, -DESKTOP_HEIGHT * 4);
     let screen_layout = screen_fixture.layout(screen_window);
     assert_eq!(screen_layout.outer.max_x, DESKTOP_WIDTH);
-    assert_eq!(screen_layout.outer.min_y, 0);
+    assert_eq!(screen_layout.outer.min_y, DESKTOP_ICONBAR_HEIGHT);
 
     let mut minimum_fixture = WimpFixture::new(251);
     let narrow = minimum_fixture.create_window("Narrow", TEST_EXTENT, MODERN_CONTROLS, 48, 48);

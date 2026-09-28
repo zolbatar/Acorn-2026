@@ -4,11 +4,10 @@ use std::{
     collections::HashMap,
     error::Error,
     sync::{Arc, mpsc},
-    thread,
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
-use pixels::{Pixels, SurfaceTexture};
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
@@ -19,10 +18,12 @@ use winit::{
 };
 
 use crate::{
+    desktop_scene::{DesktopSceneBuilder, Viewport},
     graphics::{GraphicsService, GraphicsSnapshot},
     renderer,
     runtime::Runtime,
     swi::DisplayEvent,
+    vello_backend::VelloSurface,
     wimp::{
         DESKTOP_OS_UNITS_PER_PIXEL_X, DESKTOP_OS_UNITS_PER_PIXEL_Y, DESKTOP_PIXEL_HEIGHT,
         DESKTOP_PIXEL_WIDTH, WimpServer, WindowDrag,
@@ -89,8 +90,7 @@ fn run_frontend(desktop_demo: bool) -> Result<(), Box<dyn Error>> {
         .name("acorn-window-events".into())
         .spawn(move || {
             while let Ok(event) = display_receiver.recv() {
-                let finished = matches!(&event, DisplayEvent::RuntimeExited);
-                if proxy.send_event(WindowUserEvent::Display(event)).is_err() || finished {
+                if proxy.send_event(WindowUserEvent::Display(event)).is_err() {
                     break;
                 }
             }
@@ -99,8 +99,10 @@ fn run_frontend(desktop_demo: bool) -> Result<(), Box<dyn Error>> {
     let mut guest_threads = Vec::new();
     if let Some(programs) = programs {
         for (task_id, source, name) in programs {
+            wimp.task_started(task_id, name)?;
             let task_wimp = wimp.clone();
             let task_display = display_sender.clone();
+            let cleanup_wimp = task_wimp.clone();
             guest_threads.push(thread::Builder::new().name(name.into()).spawn(move || {
                 let (_input_sender, input_receiver) = mpsc::channel();
                 let mut runtime =
@@ -108,19 +110,25 @@ fn run_frontend(desktop_demo: bool) -> Result<(), Box<dyn Error>> {
                 if let Err(error) = runtime.run_application(&source) {
                     if !matches!(&error, crate::error::RuntimeError::EndOfInput) {
                         let _ = runtime.report_error(&error);
+                        cleanup_wimp.post_notice(format!("{name}: {error}"));
                         eprintln!("{name} stopped: {error}");
                     }
                 }
+                cleanup_wimp.task_exited(task_id);
             })?);
         }
     } else {
         let exit_sender = display_sender.clone();
+        let runtime_display_sender = display_sender.clone();
         let runtime_wimp = wimp.clone();
         thread::Builder::new()
             .name("acorn-basic-runtime".into())
             .spawn(move || {
-                let mut runtime =
-                    Runtime::windowed_with_desktop(input_receiver, display_sender, runtime_wimp);
+                let mut runtime = Runtime::windowed_with_desktop(
+                    input_receiver,
+                    runtime_display_sender,
+                    runtime_wimp,
+                );
                 if let Err(error) = runtime.run() {
                     let _ = runtime.report_error(&error);
                 }
@@ -129,15 +137,18 @@ fn run_frontend(desktop_demo: bool) -> Result<(), Box<dyn Error>> {
     }
 
     let mut app = if desktop_demo {
-        WindowApp::new_desktop(input_sender, wimp)
+        WindowApp::new_desktop(input_sender, wimp, display_sender)
     } else {
-        WindowApp::new_windowed(input_sender, wimp)
+        WindowApp::new_windowed(input_sender, wimp, display_sender)
     };
     let event_loop_result = event_loop.run_app(&mut app);
     if let Some(wimp) = &app.wimp_service {
         wimp.stop();
     }
     for guest in guest_threads {
+        let _ = guest.join();
+    }
+    for guest in app.guest_threads.drain(..) {
         let _ = guest.join();
     }
     event_loop_result?;
@@ -154,44 +165,60 @@ struct WindowApp {
     input: mpsc::Sender<u8>,
     modifiers: ModifiersState,
     window: Option<Arc<Window>>,
-    pixels: Option<Pixels<'static>>,
+    gpu: Option<VelloSurface>,
+    desktop_scene: DesktopSceneBuilder,
     frame_size: (u32, u32),
     next_teletext_flash: Option<Instant>,
     desktop: Option<std::sync::Arc<WimpServer>>,
     wimp_service: Option<std::sync::Arc<WimpServer>>,
     task_graphics: HashMap<u64, GraphicsService>,
+    window_graphics: HashMap<(u64, u32), GraphicsService>,
+    display_sender: mpsc::Sender<DisplayEvent>,
+    guest_threads: Vec<JoinHandle<()>>,
     pointer: Option<(i32, i32)>,
     drag: Option<WindowDrag>,
 }
 
 impl WindowApp {
-    fn new(input: mpsc::Sender<u8>) -> Self {
+    fn new(input: mpsc::Sender<u8>, display_sender: mpsc::Sender<DisplayEvent>) -> Self {
         Self {
             graphics: GraphicsService::default(),
             input,
             modifiers: ModifiersState::empty(),
             window: None,
-            pixels: None,
+            gpu: None,
+            desktop_scene: DesktopSceneBuilder::new(),
             frame_size: (renderer::SCREEN_WIDTH, renderer::SCREEN_HEIGHT),
             next_teletext_flash: None,
             desktop: None,
             wimp_service: None,
             task_graphics: HashMap::new(),
+            window_graphics: HashMap::new(),
+            display_sender,
+            guest_threads: Vec::new(),
             pointer: None,
             drag: None,
         }
     }
 
-    fn new_desktop(input: mpsc::Sender<u8>, wimp: std::sync::Arc<WimpServer>) -> Self {
-        let mut app = Self::new(input);
+    fn new_desktop(
+        input: mpsc::Sender<u8>,
+        wimp: std::sync::Arc<WimpServer>,
+        display_sender: mpsc::Sender<DisplayEvent>,
+    ) -> Self {
+        let mut app = Self::new(input, display_sender);
         app.frame_size = (DESKTOP_PIXEL_WIDTH, DESKTOP_PIXEL_HEIGHT);
         app.desktop = Some(wimp.clone());
         app.wimp_service = Some(wimp);
         app
     }
 
-    fn new_windowed(input: mpsc::Sender<u8>, wimp: std::sync::Arc<WimpServer>) -> Self {
-        let mut app = Self::new(input);
+    fn new_windowed(
+        input: mpsc::Sender<u8>,
+        wimp: std::sync::Arc<WimpServer>,
+        display_sender: mpsc::Sender<DisplayEvent>,
+    ) -> Self {
+        let mut app = Self::new(input, display_sender);
         app.wimp_service = Some(wimp);
         app
     }
@@ -211,7 +238,55 @@ impl WindowApp {
         self.pointer = None;
         self.drag = None;
         self.desktop = Some(wimp);
+        if let Some(wimp) = &self.wimp_service
+            && let Err(error) = wimp.start_system_task("$.System.Desktop", "Acorn Desktop")
+        {
+            wimp.post_notice(format!("Could not start Acorn Desktop: {error}"));
+        }
         self.request_redraw();
+    }
+
+    fn start_pending_tasks(&mut self) {
+        let Some(wimp) = self.wimp_service.clone() else {
+            return;
+        };
+        for request in wimp.take_pending_launches() {
+            let (input_sender, input_receiver) = mpsc::channel();
+            wimp.set_task_input(request.task_id, input_sender);
+            let task_wimp = wimp.clone();
+            let display_sender = self.display_sender.clone();
+            let title = request.title.clone();
+            let guest_path = request.guest_path.clone();
+            match thread::Builder::new()
+                .name(format!("acorn-task-{}", request.task_id))
+                .spawn(move || {
+                    let mut runtime = Runtime::desktop_task(
+                        request.task_id,
+                        input_receiver,
+                        display_sender,
+                        task_wimp.clone(),
+                    );
+                    let result = match request.kind {
+                        crate::wimp::DesktopTaskKind::File => runtime.run_guest_file(&guest_path),
+                        crate::wimp::DesktopTaskKind::Commands => {
+                            runtime.run_desktop_console(false)
+                        }
+                        crate::wimp::DesktopTaskKind::BasicWindow => {
+                            runtime.run_desktop_console(true)
+                        }
+                    };
+                    if let Err(error) = result {
+                        task_wimp.post_notice(format!("{title}: {error}"));
+                    }
+                    task_wimp.task_exited(request.task_id);
+                }) {
+                Ok(thread) => self.guest_threads.push(thread),
+                Err(error) => {
+                    wimp.post_notice(format!("Could not start {}: {error}", request.title));
+                    wimp.task_exited(request.task_id);
+                }
+            }
+        }
     }
 
     fn handle_key(&self, event: KeyEvent) {
@@ -298,9 +373,19 @@ impl WindowApp {
 
     fn apply_display_event(&mut self, event: DisplayEvent, event_loop: &ActiveEventLoop) {
         match event {
-            DisplayEvent::WriteByte { task_id, byte } => {
+            DisplayEvent::WriteByte {
+                task_id,
+                window_handle,
+                byte,
+            } => {
+                if self.desktop.is_some() && !self.is_active_desktop_task(task_id) {
+                    return;
+                }
                 let graphics = if self.desktop.is_some() {
-                    self.task_graphics.entry(task_id).or_default()
+                    match window_handle {
+                        Some(handle) => self.window_graphics.entry((task_id, handle)).or_default(),
+                        None => self.task_graphics.entry(task_id).or_default(),
+                    }
                 } else {
                     &mut self.graphics
                 };
@@ -314,26 +399,57 @@ impl WindowApp {
             }
             DisplayEvent::Plot {
                 task_id,
+                window_handle,
                 code,
                 x,
                 y,
             } => {
+                if self.desktop.is_some() && !self.is_active_desktop_task(task_id) {
+                    return;
+                }
                 let graphics = if self.desktop.is_some() {
-                    self.task_graphics.entry(task_id).or_default()
+                    match window_handle {
+                        Some(handle) => self.window_graphics.entry((task_id, handle)).or_default(),
+                        None => self.task_graphics.entry(task_id).or_default(),
+                    }
                 } else {
                     &mut self.graphics
                 };
-                if let Err(error) = graphics.plot(code, x, y) {
+                let result = if graphics.snapshot().raster_surface.is_some() {
+                    // The task updates the shared authoritative CPU raster
+                    // before publishing this event. Replaying the plot here
+                    // would apply XOR/logical actions a second time.
+                    graphics.note_external_plot(code & 3 != 0);
+                    Ok(())
+                } else {
+                    graphics.plot(code, x, y)
+                };
+                if let Err(error) = result {
                     eprintln!("Acorn-2026 graphics state error: {error}");
                 }
             }
-            DisplayEvent::GraphicsSnapshot { task_id, snapshot } => {
+            DisplayEvent::GraphicsSnapshot {
+                task_id,
+                window_handle,
+                snapshot,
+            } => {
+                if self.desktop.is_some() && !self.is_active_desktop_task(task_id) {
+                    return;
+                }
                 let size = (snapshot.mode.pixel_width, snapshot.mode.pixel_height);
                 if self.desktop.is_some() {
-                    self.task_graphics
-                        .entry(task_id)
-                        .or_default()
-                        .replace_snapshot(snapshot);
+                    match window_handle {
+                        Some(handle) => self
+                            .window_graphics
+                            .entry((task_id, handle))
+                            .or_default()
+                            .replace_snapshot(snapshot),
+                        None => self
+                            .task_graphics
+                            .entry(task_id)
+                            .or_default()
+                            .replace_snapshot(snapshot),
+                    }
                 } else {
                     self.graphics.replace_snapshot(snapshot);
                     self.resize_buffer(size);
@@ -342,11 +458,47 @@ impl WindowApp {
             DisplayEvent::DesktopStarted => self.activate_desktop(),
             DisplayEvent::DesktopChanged => {}
             DisplayEvent::RuntimeExited => {
-                event_loop.exit();
-                return;
+                if self.should_exit_on_runtime_exit() {
+                    event_loop.exit();
+                    return;
+                }
             }
         }
         self.request_redraw();
+    }
+
+    fn is_active_desktop_task(&self, task_id: u64) -> bool {
+        self.wimp_service
+            .as_ref()
+            .is_some_and(|wimp| wimp.is_guest_task_active(task_id))
+    }
+
+    fn prune_finished_task_graphics(&mut self) {
+        let active = self
+            .wimp_service
+            .as_ref()
+            .map(|wimp| wimp.active_guest_task_ids())
+            .unwrap_or_default();
+        self.task_graphics
+            .retain(|task_id, _| active.contains(task_id));
+        self.window_graphics
+            .retain(|(task_id, _), _| active.contains(task_id));
+        let mut active_surfaces = active
+            .iter()
+            .map(|task_id| (*task_id, None))
+            .collect::<Vec<_>>();
+        if let Some(wimp) = &self.wimp_service {
+            active_surfaces.extend(
+                wimp.desktop_windows()
+                    .into_iter()
+                    .map(|window| (window.owner_task_id, Some(window.handle))),
+            );
+        }
+        self.desktop_scene.retain_active_surfaces(&active_surfaces);
+    }
+
+    fn should_exit_on_runtime_exit(&self) -> bool {
+        self.desktop.is_none()
     }
 
     fn resize_buffer(&mut self, size: (u32, u32)) {
@@ -355,12 +507,6 @@ impl WindowApp {
         }
         if self.frame_size == size || size.0 == 0 || size.1 == 0 {
             return;
-        }
-        if let Some(pixels) = &mut self.pixels {
-            if let Err(error) = pixels.resize_buffer(size.0, size.1) {
-                eprintln!("Acorn-2026 could not resize its pixel buffer: {error}");
-                return;
-            }
         }
         self.frame_size = size;
         if let Some(window) = &self.window {
@@ -374,28 +520,33 @@ impl WindowApp {
         }
     }
 
-    fn update_pointer(&mut self, x: f64, y: f64) {
+    fn update_pointer(&mut self, physical_x: f64, physical_y: f64) {
         let Some(wimp) = &self.desktop else {
             return;
         };
-        let Some(pixels) = &self.pixels else {
+        let Some(window) = &self.window else {
             return;
         };
-        let position = (x as f32, y as f32);
-        let (pixel_x, pixel_y) = match pixels.window_pos_to_pixel(position) {
-            Ok(position) => position,
-            Err(outside) if self.drag.is_some() => pixels.clamp_pixel_pos(outside),
-            Err(_) => {
+        let size = window.inner_size();
+        let viewport = Viewport::new(size.width, size.height);
+        let point = match viewport.desktop_point(physical_x, physical_y) {
+            Some(point) => point,
+            None if self.drag.is_some() => viewport.clamped_desktop_point(physical_x, physical_y),
+            None => {
                 self.pointer = None;
+                if wimp.mouse_move(-1, -1) {
+                    self.request_redraw();
+                }
                 return;
             }
         };
-        let desktop_x =
-            pixel_x as i32 * DESKTOP_OS_UNITS_PER_PIXEL_X + DESKTOP_OS_UNITS_PER_PIXEL_X / 2;
-        let desktop_y = (DESKTOP_PIXEL_HEIGHT as i32 - 1 - pixel_y as i32)
-            * DESKTOP_OS_UNITS_PER_PIXEL_Y
-            + DESKTOP_OS_UNITS_PER_PIXEL_Y / 2;
+        let (desktop_x, desktop_y) = point;
+        let desktop_x = desktop_x * DESKTOP_OS_UNITS_PER_PIXEL_X + DESKTOP_OS_UNITS_PER_PIXEL_X / 2;
+        let desktop_y = desktop_y * DESKTOP_OS_UNITS_PER_PIXEL_Y + DESKTOP_OS_UNITS_PER_PIXEL_Y / 2;
         self.pointer = Some((desktop_x, desktop_y));
+        if wimp.mouse_move(desktop_x, desktop_y) {
+            self.request_redraw();
+        }
         if let Some(drag) = self.drag {
             wimp.drag_to(drag, desktop_x, desktop_y);
             self.request_redraw();
@@ -414,8 +565,11 @@ impl WindowApp {
             self.drag = self
                 .pointer
                 .and_then(|(x, y)| wimp.mouse_down(x, y, buttons));
-        } else if let Some(drag) = self.drag.take() {
-            wimp.finish_drag(drag);
+        } else {
+            wimp.mouse_button_up(buttons);
+            if let Some(drag) = self.drag.take() {
+                wimp.finish_drag(drag);
+            }
         }
         self.request_redraw();
     }
@@ -460,18 +614,16 @@ impl ApplicationHandler<WindowUserEvent> for WindowApp {
             }
         };
 
-        let size = window.inner_size();
-        let surface = SurfaceTexture::new(size.width, size.height, window.clone());
-        let pixels = match Pixels::new(frame_size.0, frame_size.1, surface) {
-            Ok(pixels) => pixels,
+        let gpu = match VelloSurface::new(window.clone()) {
+            Ok(gpu) => gpu,
             Err(error) => {
-                eprintln!("Acorn-2026 could not create its pixel surface: {error}");
+                eprintln!("Acorn-2026 could not initialize Vello/wgpu: {error}");
                 event_loop.exit();
                 return;
             }
         };
 
-        self.pixels = Some(pixels);
+        self.gpu = Some(gpu);
         self.window = Some(window.clone());
         window.request_redraw();
     }
@@ -499,41 +651,82 @@ impl ApplicationHandler<WindowUserEvent> for WindowApp {
             }
             WindowEvent::Resized(size) => {
                 if size.width > 0 && size.height > 0 {
-                    if let Some(pixels) = &mut self.pixels {
-                        if let Err(error) = pixels.resize_surface(size.width, size.height) {
-                            eprintln!("Acorn-2026 could not resize its pixel surface: {error}");
-                            event_loop.exit();
-                        }
+                    if let Some(gpu) = &mut self.gpu {
+                        gpu.resize(size.width, size.height);
                     }
+                    self.request_redraw();
                 }
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
             }
-            WindowEvent::KeyboardInput { event, .. } => self.handle_key(event),
+            WindowEvent::KeyboardInput { event, .. } => {
+                self.handle_key(event);
+                self.request_redraw();
+            }
             WindowEvent::CursorMoved { position, .. } => {
+                // Winit's CursorMoved position is already in physical pixels.
                 self.update_pointer(position.x, position.y)
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if self.drag.is_none() {
+                    self.pointer = None;
+                    if let Some(wimp) = &self.desktop {
+                        if wimp.mouse_move(-1, -1) {
+                            self.request_redraw();
+                        }
+                    }
+                }
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 self.handle_mouse_button(button, state)
             }
             WindowEvent::RedrawRequested => {
-                let Some(pixels) = &mut self.pixels else {
+                let Some(window) = &self.window else {
                     return;
                 };
-                if let Some(wimp) = &self.desktop {
-                    let scenes = self
+                let size = window.inner_size();
+                let scene = if let Some(wimp) = &self.desktop {
+                    let windows = wimp.desktop_windows();
+                    let mut scenes = self
                         .task_graphics
                         .iter()
-                        .map(|(task_id, graphics)| (*task_id, graphics.snapshot().clone()))
-                        .collect::<HashMap<u64, GraphicsSnapshot>>();
-                    renderer::render_desktop(&wimp.desktop_windows(), &scenes, pixels.frame_mut());
+                        .map(|(task_id, graphics)| ((*task_id, None), graphics.snapshot().clone()))
+                        .collect::<HashMap<(u64, Option<u32>), GraphicsSnapshot>>();
+                    for visible in &windows {
+                        if let Some(graphics) = self
+                            .window_graphics
+                            .get(&(visible.owner_task_id, visible.handle))
+                        {
+                            scenes.insert(
+                                (visible.owner_task_id, Some(visible.handle)),
+                                graphics.snapshot().clone(),
+                            );
+                        }
+                    }
+                    self.desktop_scene
+                        .retain_active_surfaces(&scenes.keys().copied().collect::<Vec<_>>());
+                    self.desktop_scene.build(
+                        &windows,
+                        &scenes,
+                        &wimp.desktop_icons(),
+                        &wimp.desktop_window_icons(),
+                        &wimp.desktop_menus(),
+                        wimp.desktop_notice().as_deref(),
+                        Viewport::new(size.width, size.height),
+                    )
                 } else {
-                    renderer::render(self.graphics.snapshot(), pixels.frame_mut());
-                }
-                if let Err(error) = pixels.render() {
-                    eprintln!("Acorn-2026 could not render its pixel surface: {error}");
-                    event_loop.exit();
+                    self.desktop_scene.build_classic(
+                        self.graphics.snapshot(),
+                        size.width,
+                        size.height,
+                    )
+                };
+                if let Some(gpu) = &mut self.gpu {
+                    if let Err(error) = gpu.render(&scene) {
+                        eprintln!("Acorn-2026 could not present its Vello scene: {error}");
+                        event_loop.exit();
+                    }
                 }
             }
             _ => {}
@@ -543,13 +736,23 @@ impl ApplicationHandler<WindowUserEvent> for WindowApp {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WindowUserEvent) {
         match event {
             WindowUserEvent::Display(event) => self.apply_display_event(event, event_loop),
-            WindowUserEvent::DesktopChanged => self.request_redraw(),
+            WindowUserEvent::DesktopChanged => {
+                self.start_pending_tasks();
+                self.prune_finished_task_graphics();
+                self.request_redraw();
+            }
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.desktop.is_some() {
-            event_loop.set_control_flow(ControlFlow::Wait);
+        if let Some(wimp) = &self.desktop {
+            if wimp.advance_menu_hover_at(Instant::now()) {
+                self.request_redraw();
+            }
+            event_loop.set_control_flow(match wimp.next_menu_hover_deadline() {
+                Some(deadline) => ControlFlow::WaitUntil(deadline),
+                None => ControlFlow::Wait,
+            });
             return;
         }
         let snapshot = self.graphics.snapshot();
@@ -606,12 +809,15 @@ mod tests {
         let (updates, _update_receiver) = mpsc::channel();
         let wimp = WimpServer::new(updates);
         let (input_sender, input_receiver) = mpsc::channel();
-        let mut app = WindowApp::new_windowed(input_sender, wimp.clone());
+        let (display_sender, _display_receiver) = mpsc::channel();
+        let mut app = WindowApp::new_windowed(input_sender, wimp.clone(), display_sender);
 
         assert!(app.desktop.is_none());
+        assert!(app.should_exit_on_runtime_exit());
         app.activate_desktop();
 
         assert_eq!(app.frame_size, (DESKTOP_PIXEL_WIDTH, DESKTOP_PIXEL_HEIGHT));
+        assert!(!app.should_exit_on_runtime_exit());
         assert!(
             app.desktop
                 .as_ref()
@@ -633,5 +839,24 @@ mod tests {
 
         app.send_input(b'X');
         assert!(input_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn completed_desktop_tasks_release_their_cached_display_snapshot() {
+        let (updates, _update_receiver) = mpsc::channel();
+        let wimp = WimpServer::new(updates);
+        wimp.task_started(77, "Snapshot task").unwrap();
+        let (input_sender, _input_receiver) = mpsc::channel();
+        let (display_sender, _display_receiver) = mpsc::channel();
+        let mut app = WindowApp::new_desktop(input_sender, wimp.clone(), display_sender);
+        app.task_graphics.insert(77, GraphicsService::default());
+        app.window_graphics
+            .insert((77, 9), GraphicsService::default());
+
+        wimp.task_exited(77);
+        app.prune_finished_task_graphics();
+
+        assert!(!app.task_graphics.contains_key(&77));
+        assert!(!app.window_graphics.contains_key(&(77, 9)));
     }
 }

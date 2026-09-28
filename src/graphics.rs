@@ -47,6 +47,10 @@ pub struct ScreenMode {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GraphicsPrimitive {
+    ClearRectangle {
+        bounds: GraphicsWindow,
+        logical_colour: u32,
+    },
     Line {
         from: Point,
         to: Point,
@@ -66,9 +70,22 @@ pub enum GraphicsPrimitive {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphicsSnapshot {
+    /// Monotonically advances when guest-visible display state changes. Used
+    /// by the compositor to avoid rebuilding an unchanged raster image.
+    pub revision: u64,
     pub mode: ScreenMode,
     pub text_window: TextWindow,
     pub graphics_window: GraphicsWindow,
+    /// Temporary Wimp rectangle clip active while painting a redraw/update.
+    /// This remains caller-visible only inside the hosted renderer adapter.
+    pub wimp_clip: Option<GraphicsWindow>,
+    /// Logical palette metadata is retained separately from the RGBA backing.
+    /// Guest palette mutation and indexed storage are still compatibility gaps.
+    pub logical_palette: Vec<[u8; 4]>,
+    /// Tracks whether guest graphics drawing should replace the modern
+    /// text-only paper base with the classic raster.
+    pub graphics_content_present: bool,
+    pub modern_text_background: bool,
     pub graphics_origin: Point,
     pub graphics_cursor: Point,
     pub text_cursor: Point,
@@ -137,6 +154,18 @@ impl SharedRasterSurface {
         data.pixels[offset..offset + 4].copy_from_slice(&color);
     }
 
+    fn read_pixel(&self, x: u32, y: u32) -> Option<[u8; 4]> {
+        let data = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if x >= data.width || y >= data.height {
+            return None;
+        }
+        let offset = (y as usize * data.width as usize + x as usize) * 4;
+        Some(data.pixels[offset..offset + 4].try_into().ok()?)
+    }
+
     fn clear(&self) {
         let mut data = self
             .0
@@ -155,8 +184,23 @@ impl SharedRasterSurface {
         let length = target.len().min(data.pixels.len());
         target[..length].copy_from_slice(&data.pixels[..length]);
     }
+
+    fn fill_rect(&self, bounds: (u32, u32, u32, u32), color: [u8; 4]) {
+        let mut data = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (left, top, right, bottom) = bounds;
+        for y in top.min(data.height)..bottom.min(data.height) {
+            for x in left.min(data.width)..right.min(data.width) {
+                let offset = (y as usize * data.width as usize + x as usize) * 4;
+                data.pixels[offset..offset + 4].copy_from_slice(&color);
+            }
+        }
+    }
 }
 
+#[derive(Clone)]
 struct PendingVdu {
     command: u8,
     parameters: Vec<u8>,
@@ -181,9 +225,14 @@ impl Default for GraphicsService {
         let graphics_window = default_graphics_window(mode);
         Self {
             snapshot: GraphicsSnapshot {
+                revision: 0,
                 mode,
                 text_window,
                 graphics_window,
+                wimp_clip: None,
+                logical_palette: default_palette(mode),
+                graphics_content_present: false,
+                modern_text_background: !is_teletext_mode(mode.number),
                 graphics_origin: Point::default(),
                 graphics_cursor: Point::default(),
                 text_cursor: Point::default(),
@@ -195,7 +244,10 @@ impl Default for GraphicsService {
                     usize::from(mode.text_columns) * usize::from(mode.text_rows)
                 ],
                 primitives: Vec::new(),
-                raster_surface: None,
+                raster_surface: Some(SharedRasterSurface::new(
+                    mode.pixel_width,
+                    mode.pixel_height,
+                )),
             },
             pending_vdu: None,
             profile: GraphicsProfile::Hosted,
@@ -214,9 +266,114 @@ impl GraphicsService {
         }
     }
 
+    /// Copy the current mode and drawing state into an independent output
+    /// destination, including a separate authoritative true-colour raster.
+    pub(crate) fn new_window_output(&self) -> Self {
+        let mut snapshot = self.snapshot.clone();
+        snapshot.text_cells.fill(b' ');
+        snapshot.text_cursor = Point::default();
+        snapshot.graphics_cursor = Point::default();
+        snapshot.primitives.clear();
+        snapshot.raster_surface = self.snapshot.raster_surface.as_ref().map(|_| {
+            SharedRasterSurface::new(snapshot.mode.pixel_width, snapshot.mode.pixel_height)
+        });
+        snapshot.wimp_clip = None;
+        snapshot.graphics_content_present = false;
+        snapshot.revision = snapshot.revision.wrapping_add(1);
+        Self {
+            snapshot,
+            pending_vdu: None,
+            profile: self.profile,
+        }
+    }
+
+    pub(crate) fn mode_pixel_count(&self) -> u64 {
+        u64::from(self.snapshot.mode.pixel_width) * u64::from(self.snapshot.mode.pixel_height)
+    }
+
+    /// Read a pixel from the active CPU raster and return the closest
+    /// representable guest colour/tint pair. Indexed RGBA surfaces cannot
+    /// preserve every logical index or plot action, so those reads are
+    /// necessarily approximate until indexed backing storage is added.
+    pub(crate) fn read_point(&self, x: i32, y: i32) -> Option<(u32, u32)> {
+        let mode = self.snapshot.mode;
+        if !mode.graphics_enabled {
+            return None;
+        }
+        let point = Point {
+            x: x.saturating_add(self.snapshot.graphics_origin.x),
+            y: y.saturating_add(self.snapshot.graphics_origin.y),
+        };
+        if point.x < 0
+            || point.y < 0
+            || point.x >= mode.logical_width
+            || point.y >= mode.logical_height
+        {
+            return None;
+        }
+        let surface = self.snapshot.raster_surface.as_ref()?;
+        let (pixel_x, pixel_y) = screen_point(point, &self.snapshot);
+        let pixel = surface.read_pixel(pixel_x, pixel_y)?;
+
+        if mode.bits_per_pixel == 32 {
+            // The hosted C16M path stores colours in the byte order accepted
+            // by ColourTrans_SetGCOL: BB GG RR 00.
+            let colour = (u32::from(pixel[2]) << 24)
+                | (u32::from(pixel[1]) << 16)
+                | (u32::from(pixel[0]) << 8);
+            return Some((colour, 0));
+        }
+
+        let nearest = self
+            .snapshot
+            .logical_palette
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, candidate)| {
+                let channel_distance = |actual: u8, expected: u8| {
+                    let difference = i32::from(actual) - i32::from(expected);
+                    difference * difference
+                };
+                channel_distance(pixel[0], candidate[0])
+                    + channel_distance(pixel[1], candidate[1])
+                    + channel_distance(pixel[2], candidate[2])
+            })
+            .map(|(index, _)| index as u32)?;
+        if mode.bits_per_pixel == 8 {
+            let tint = if nearest & 0x80 == 0 { 255 } else { 0 };
+            Some((nearest & 0x3F, tint))
+        } else {
+            Some((nearest, 0))
+        }
+    }
+
+    pub(crate) fn mode_after_vdu_byte(&self, byte: u8) -> Option<ScreenMode> {
+        let pending = self.pending_vdu.as_ref()?;
+        if pending.command == 22 && pending.parameters.is_empty() {
+            screen_mode_for_profile(byte, self.profile)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn set_wimp_redraw_clip(&mut self, clip: Option<GraphicsWindow>) {
+        if self.snapshot.wimp_clip != clip {
+            self.snapshot.wimp_clip = clip;
+            self.snapshot.revision = self.snapshot.revision.wrapping_add(1);
+        }
+    }
+
+    pub(crate) fn note_external_plot(&mut self, draws_pixels: bool) {
+        if draws_pixels {
+            self.snapshot.graphics_content_present = true;
+        }
+        self.snapshot.revision = self.snapshot.revision.wrapping_add(1);
+    }
+
     /// Submit one byte from OS_WriteC. `Some(byte)` is forwarded to the host
     /// console; VDU control bytes and their parameters are consumed here.
     pub fn write_byte(&mut self, byte: u8) -> Result<Option<u8>, RuntimeError> {
+        self.snapshot.revision = self.snapshot.revision.wrapping_add(1);
         if let Some(pending) = &mut self.pending_vdu {
             pending.parameters.push(byte);
             if pending.parameters.len() == pending.expected {
@@ -249,6 +406,7 @@ impl GraphicsService {
 
     /// Apply one OS_Plot operation using RISC OS logical coordinates.
     pub fn plot(&mut self, plot_code: u8, x: i32, y: i32) -> Result<(), RuntimeError> {
+        self.snapshot.revision = self.snapshot.revision.wrapping_add(1);
         if !self.snapshot.mode.graphics_enabled {
             return Ok(());
         }
@@ -267,6 +425,12 @@ impl GraphicsService {
                 y: y.saturating_add(self.snapshot.graphics_origin.y),
             }
         };
+        let clip = self.effective_graphics_clip().unwrap_or(GraphicsWindow {
+            left: 1,
+            bottom: 1,
+            right: 0,
+            top: 0,
+        });
 
         match group {
             0 | 8 | 16 | 24 | 32 | 40 | 48 | 56 => {
@@ -280,7 +444,7 @@ impl GraphicsService {
                         plot_code,
                         action: self.snapshot.graphics_action,
                         logical_colour: self.snapshot.graphics_colour,
-                        clip: self.snapshot.graphics_window,
+                        clip,
                     };
                     self.record_primitive(primitive);
                     self.snapshot.graphics_cursor = target;
@@ -295,7 +459,7 @@ impl GraphicsService {
                         plot_code,
                         action: self.snapshot.graphics_action,
                         logical_colour: self.snapshot.graphics_colour,
-                        clip: self.snapshot.graphics_window,
+                        clip,
                     };
                     self.record_primitive(primitive);
                     self.snapshot.graphics_cursor = target;
@@ -312,6 +476,34 @@ impl GraphicsService {
 
     pub fn set_rgb_gcol(&mut self, palette_entry: u32) {
         self.snapshot.graphics_colour = palette_entry;
+        self.snapshot.revision = self.snapshot.revision.wrapping_add(1);
+    }
+
+    pub(crate) fn clear_wimp_region(&mut self, bounds: GraphicsWindow, logical_colour: u32) {
+        self.clear_graphics_region(bounds, logical_colour, false);
+        self.clear_text_cells_in_graphics_region(bounds);
+        self.snapshot.revision = self.snapshot.revision.wrapping_add(1);
+    }
+
+    fn clear_graphics_region(
+        &mut self,
+        bounds: GraphicsWindow,
+        logical_colour: u32,
+        guest_graphics_operation: bool,
+    ) {
+        let primitive = GraphicsPrimitive::ClearRectangle {
+            bounds,
+            logical_colour,
+        };
+        if let Some(surface) = &self.snapshot.raster_surface {
+            rasterize_primitive(surface, &self.snapshot, &primitive);
+        } else {
+            self.snapshot.primitives.push(primitive);
+        }
+        if guest_graphics_operation {
+            self.snapshot.graphics_content_present = true;
+        }
+        self.snapshot.revision = self.snapshot.revision.wrapping_add(1);
     }
 
     pub fn set_extended_mode(
@@ -321,6 +513,7 @@ impl GraphicsService {
         x_eigenfactor: u8,
         y_eigenfactor: u8,
     ) -> Result<(), RuntimeError> {
+        self.snapshot.revision = self.snapshot.revision.wrapping_add(1);
         let logical_width = pixel_width
             .checked_mul(1_u32 << x_eigenfactor)
             .and_then(|width| i32::try_from(width).ok())
@@ -352,6 +545,9 @@ impl GraphicsService {
             vec![b' '; usize::from(mode.text_columns) * usize::from(mode.text_rows)];
         self.snapshot.primitives.clear();
         self.snapshot.raster_surface = Some(SharedRasterSurface::new(pixel_width, pixel_height));
+        self.snapshot.logical_palette = Vec::new();
+        self.snapshot.graphics_content_present = false;
+        self.snapshot.modern_text_background = false;
         self.snapshot.text_colour = default_foreground_colour(mode);
         self.snapshot.graphics_action = 0;
         self.snapshot.graphics_colour = u32::from(default_foreground_colour(mode));
@@ -364,6 +560,7 @@ impl GraphicsService {
         } else {
             self.snapshot.primitives.push(primitive);
         }
+        self.snapshot.graphics_content_present = true;
     }
 
     pub fn snapshot(&self) -> &GraphicsSnapshot {
@@ -375,6 +572,7 @@ impl GraphicsService {
             return Ok(());
         }
         self.profile = profile;
+        self.snapshot.revision = self.snapshot.revision.wrapping_add(1);
         self.pending_vdu = None;
         // A different target can assign a different meaning to the current
         // mode number (or not support it at all). Start that target from its
@@ -404,12 +602,7 @@ impl GraphicsService {
                 self.snapshot.text_cursor.x = 0;
                 return Ok(Some(command));
             }
-            16 => {
-                self.snapshot.primitives.clear();
-                if let Some(surface) = &self.snapshot.raster_surface {
-                    surface.clear();
-                }
-            }
+            16 => self.clear_graphics(),
             17 => self.snapshot.text_colour = parameters[0],
             18 => {
                 self.snapshot.graphics_action = parameters[0];
@@ -469,7 +662,13 @@ impl GraphicsService {
         self.snapshot.text_cells =
             vec![b' '; usize::from(mode.text_columns) * usize::from(mode.text_rows)];
         self.snapshot.primitives.clear();
-        self.snapshot.raster_surface = None;
+        self.snapshot.raster_surface = Some(SharedRasterSurface::new(
+            mode.pixel_width,
+            mode.pixel_height,
+        ));
+        self.snapshot.logical_palette = default_palette(mode);
+        self.snapshot.graphics_content_present = false;
+        self.snapshot.modern_text_background = !is_teletext_mode(mode.number);
         self.snapshot.text_colour = default_foreground_colour(mode);
         self.snapshot.graphics_action = 0;
         self.snapshot.graphics_colour = u32::from(default_foreground_colour(mode));
@@ -516,7 +715,10 @@ impl GraphicsService {
             i32::from(self.snapshot.text_window.bottom - self.snapshot.text_window.top + 1);
         let x = self.snapshot.text_window.left + self.snapshot.text_cursor.x as u16;
         let y = self.snapshot.text_window.top + self.snapshot.text_cursor.y as u16;
-        if x < self.snapshot.mode.text_columns && y < self.snapshot.mode.text_rows {
+        if x < self.snapshot.mode.text_columns
+            && y < self.snapshot.mode.text_rows
+            && self.text_cell_intersects_wimp_clip(x, y)
+        {
             let index =
                 usize::from(y) * usize::from(self.snapshot.mode.text_columns) + usize::from(x);
             self.snapshot.text_cells[index] = byte;
@@ -563,11 +765,61 @@ impl GraphicsService {
     fn clear_text_window(&mut self) {
         for y in self.snapshot.text_window.top..=self.snapshot.text_window.bottom {
             for x in self.snapshot.text_window.left..=self.snapshot.text_window.right {
+                if !self.text_cell_intersects_wimp_clip(x, y) {
+                    continue;
+                }
                 let index =
                     usize::from(y) * usize::from(self.snapshot.mode.text_columns) + usize::from(x);
                 self.snapshot.text_cells[index] = b' ';
             }
         }
+    }
+
+    fn effective_graphics_clip(&self) -> Option<GraphicsWindow> {
+        let clip = self.snapshot.graphics_window;
+        let Some(wimp) = self.snapshot.wimp_clip else {
+            return Some(clip);
+        };
+        let intersection = GraphicsWindow {
+            left: clip.left.max(wimp.left),
+            bottom: clip.bottom.max(wimp.bottom),
+            right: clip.right.min(wimp.right),
+            top: clip.top.min(wimp.top),
+        };
+        (intersection.left <= intersection.right && intersection.bottom <= intersection.top)
+            .then_some(intersection)
+    }
+
+    fn text_cell_intersects_wimp_clip(&self, x: u16, y: u16) -> bool {
+        self.snapshot.wimp_clip.is_none_or(|clip| {
+            graphics_regions_intersect(text_cell_bounds(x, y, self.snapshot.mode), clip)
+        })
+    }
+
+    fn clear_text_cells_in_graphics_region(&mut self, region: GraphicsWindow) {
+        for y in self.snapshot.text_window.top..=self.snapshot.text_window.bottom {
+            for x in self.snapshot.text_window.left..=self.snapshot.text_window.right {
+                if !graphics_regions_intersect(text_cell_bounds(x, y, self.snapshot.mode), region) {
+                    continue;
+                }
+                let index =
+                    usize::from(y) * usize::from(self.snapshot.mode.text_columns) + usize::from(x);
+                self.snapshot.text_cells[index] = b' ';
+            }
+        }
+    }
+
+    fn clear_graphics(&mut self) {
+        if let Some(clip) = self.snapshot.wimp_clip {
+            self.clear_graphics_region(clip, 0, true);
+            return;
+        }
+        self.snapshot.primitives.clear();
+        if let Some(surface) = &self.snapshot.raster_surface {
+            surface.clear();
+        }
+        self.snapshot.graphics_content_present = false;
+        self.snapshot.revision = self.snapshot.revision.wrapping_add(1);
     }
 
     fn scroll_text_window(&mut self) {
@@ -588,6 +840,29 @@ impl GraphicsService {
             self.snapshot.text_cells[last_row + column] = b' ';
         }
     }
+}
+
+fn text_cell_bounds(x: u16, y: u16, mode: ScreenMode) -> GraphicsWindow {
+    let columns = i64::from(mode.text_columns.max(1));
+    let rows = i64::from(mode.text_rows.max(1));
+    let logical_width = i64::from(mode.logical_width.max(1));
+    let logical_height = i64::from(mode.logical_height.max(1));
+    let x = i64::from(x);
+    let y = i64::from(y);
+    let left = x * logical_width / columns;
+    let right = (((x + 1) * logical_width / columns) - 1).max(left);
+    let bottom = logical_height - (y + 1) * logical_height / rows;
+    let top = (logical_height - y * logical_height / rows - 1).max(bottom);
+    GraphicsWindow {
+        left: left.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        bottom: bottom.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        right: right.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        top: top.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+    }
+}
+
+fn graphics_regions_intersect(a: GraphicsWindow, b: GraphicsWindow) -> bool {
+    a.left <= b.right && a.right >= b.left && a.bottom <= b.top && a.top >= b.bottom
 }
 
 fn vdu_parameter_count(command: u8) -> usize {
@@ -808,6 +1083,15 @@ fn rasterize_primitive(
     primitive: &GraphicsPrimitive,
 ) {
     match primitive {
+        GraphicsPrimitive::ClearRectangle {
+            bounds,
+            logical_colour,
+        } => {
+            surface.fill_rect(
+                logical_rect_pixels(*bounds, snapshot),
+                graphics_colour(*logical_colour, snapshot.mode),
+            );
+        }
         GraphicsPrimitive::Point {
             at,
             clip,
@@ -856,6 +1140,31 @@ fn rasterize_primitive(
             }
         }
     }
+}
+
+pub(crate) fn logical_rect_pixels(
+    bounds: GraphicsWindow,
+    snapshot: &GraphicsSnapshot,
+) -> (u32, u32, u32, u32) {
+    let mode = snapshot.mode;
+    let width = i64::from(mode.pixel_width);
+    let height = i64::from(mode.pixel_height);
+    let logical_width = i64::from(mode.logical_width.max(1));
+    let logical_height = i64::from(mode.logical_height.max(1));
+    // GraphicsWindow bounds are inclusive; raster loops use exclusive ends.
+    // Convert both corners to pixel indices before extending the upper ends.
+    let x0 = i64::from(bounds.left).max(0);
+    let x1 = i64::from(bounds.right).min(logical_width - 1);
+    let y0 = i64::from(bounds.bottom).max(0);
+    let y1 = i64::from(bounds.top).min(logical_height - 1);
+    if x0 > x1 || y0 > y1 {
+        return (0, 0, 0, 0);
+    }
+    let left = x0 * width / logical_width;
+    let right = x1 * width / logical_width + 1;
+    let top = (logical_height - 1 - y1) * height / logical_height;
+    let bottom = (logical_height - 1 - y0) * height / logical_height + 1;
+    (left as u32, top as u32, right as u32, bottom as u32)
 }
 
 fn point_inside(point: Point, clip: GraphicsWindow, snapshot: &GraphicsSnapshot) -> bool {
@@ -1052,5 +1361,123 @@ fn default_foreground_colour(mode: ScreenMode) -> u8 {
         63
     } else {
         7
+    }
+}
+
+fn is_teletext_mode(number: u8) -> bool {
+    number == 7
+}
+
+fn default_palette(mode: ScreenMode) -> Vec<[u8; 4]> {
+    if mode.bits_per_pixel == 32 {
+        return Vec::new();
+    }
+    (0..mode.colours.min(256))
+        .map(|logical| graphics_colour(logical, mode))
+        .collect()
+}
+
+#[cfg(test)]
+mod output_surface_tests {
+    use super::{GraphicsService, GraphicsWindow, text_cell_bounds};
+
+    #[test]
+    fn adjacent_redraw_clears_cover_every_pixel_without_seams() {
+        for mode in [0, 20] {
+            let mut graphics = GraphicsService::default();
+            graphics.set_mode(mode).unwrap();
+            let snapshot = graphics.snapshot();
+            let w = snapshot.mode.logical_width;
+            let h = snapshot.mode.logical_height;
+            let pw = snapshot.mode.pixel_width as usize;
+            let ph = snapshot.mode.pixel_height as usize;
+            let mut covered = vec![false; pw * ph];
+            // Uneven split edges reproduce incremental resize damage regions.
+            for (left, right) in [(0, 538), (539, w - 1)] {
+                for (bottom, top) in [(0, 254), (255, h - 1)] {
+                    let (x0, y0, x1, y1) = super::logical_rect_pixels(
+                        GraphicsWindow {
+                            left,
+                            right,
+                            bottom,
+                            top,
+                        },
+                        snapshot,
+                    );
+                    for y in y0..y1 {
+                        for x in x0..x1 {
+                            covered[y as usize * pw + x as usize] = true;
+                        }
+                    }
+                }
+            }
+            assert!(
+                covered.iter().all(|pixel| *pixel),
+                "redraw gap in MODE {mode}"
+            );
+            assert_eq!(
+                super::logical_rect_pixels(
+                    GraphicsWindow {
+                        left: w,
+                        right: w + 10,
+                        bottom: 0,
+                        top: h
+                    },
+                    snapshot
+                ),
+                (0, 0, 0, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn wimp_text_clips_and_clears_are_cell_scoped_and_window_state_is_independent() {
+        let mut default = GraphicsService::default();
+        default.write_byte(b'A').unwrap();
+        default.write_byte(b'B').unwrap();
+        assert_eq!(&default.snapshot().text_cells[..2], b"AB");
+
+        let mut window = default.new_window_output();
+        assert_eq!(&window.snapshot().text_cells[..2], b"  ");
+        let second_cell = text_cell_bounds(1, 0, window.snapshot().mode);
+        window.write_byte(b'A').unwrap();
+        window.write_byte(b'B').unwrap();
+        window.clear_wimp_region(text_cell_bounds(0, 0, window.snapshot().mode), 7);
+        assert_eq!(&window.snapshot().text_cells[..2], b" B");
+
+        window.set_wimp_redraw_clip(Some(second_cell));
+        for byte in [31, 0, 0, b'X', b'Y'] {
+            window.write_byte(byte).unwrap();
+        }
+        assert_eq!(&window.snapshot().text_cells[..2], b" Y");
+        assert_eq!(&default.snapshot().text_cells[..2], b"AB");
+    }
+
+    #[test]
+    fn wimp_background_clear_preserves_explicit_classic_text_colour() {
+        let mut graphics = GraphicsService::default();
+        let mode = graphics.snapshot().mode;
+        graphics.clear_wimp_region(
+            GraphicsWindow {
+                left: 0,
+                bottom: 0,
+                right: mode.logical_width - 1,
+                top: mode.logical_height - 1,
+            },
+            7,
+        );
+        // Classic VDU text obeys the guest palette, not a desktop ink override.
+        graphics.write_byte(17).unwrap();
+        graphics.write_byte(0).unwrap();
+        graphics.write_byte(b'A').unwrap();
+        assert!(!graphics.snapshot().graphics_content_present);
+
+        let mut frame = vec![0; mode.pixel_width as usize * mode.pixel_height as usize * 4];
+        crate::renderer::render_desktop_content(graphics.snapshot(), &mut frame);
+        assert!(
+            frame
+                .chunks_exact(4)
+                .any(|pixel| { pixel[0] < 100 && pixel[1] < 100 && pixel[2] < 100 })
+        );
     }
 }

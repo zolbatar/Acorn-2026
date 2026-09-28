@@ -76,6 +76,21 @@ impl Runtime {
         .map(|_| ())
     }
 
+    /// Load a guest BASIC program through the same FileSwitch path and saved
+    /// execution preferences used by `BASIC` and `RUN`.
+    pub fn run_guest_file(&mut self, path: &str) -> Result<(), RuntimeError> {
+        self.dispatcher
+            .set_program_working_directory(&mut self.task, path)?;
+        let configuration = self.dispatcher.load_basic_configuration()?;
+        crate::basic64::run_guest_file_configured(
+            path,
+            &mut self.task,
+            &mut self.dispatcher,
+            &configuration,
+        )
+        .map(|_| ())
+    }
+
     pub fn new(console: HostConsole) -> Self {
         Self {
             task: Task::new(TASK_ID),
@@ -88,6 +103,19 @@ impl Runtime {
     }
 
     pub fn run(&mut self) -> Result<(), RuntimeError> {
+        if self.dispatcher.desktop_is_configured_for_startup()? {
+            // Use the public MOS command path so power-on desktop startup runs
+            // the same system component and display handoff as `DESKTOP`.
+            self.task.memory.write_bytes(LINE_BUFFER, b"DESKTOP\0")?;
+            let mut command = SwiContext::default();
+            command.registers[0] = LINE_BUFFER;
+            self.dispatcher
+                .dispatch(OS_CLI, &mut self.task, &mut command)?;
+            if self.dispatcher.desktop_requested() {
+                return Ok(());
+            }
+        }
+
         self.write_prompt()?;
         loop {
             match self.execute_console_line() {
@@ -104,6 +132,106 @@ impl Runtime {
             }
             self.write_prompt()?;
         }
+    }
+
+    /// An isolated desktop prompt: do not re-run the saved startup Language.
+    pub fn run_desktop_console(&mut self, basic: bool) -> Result<(), RuntimeError> {
+        let mut lines = std::collections::BTreeMap::<u32, String>::new();
+        loop {
+            self.write_console_text(if basic { ">" } else { "*" })?;
+            if !basic {
+                match self.execute_console_line() {
+                    Err(RuntimeError::EndOfInput) => return Ok(()),
+                    Err(error) => self.report_error(&error)?,
+                    Ok(()) => {}
+                }
+            } else {
+                let mut input = SwiContext::default();
+                input.registers[0] = LINE_BUFFER;
+                input.registers[1] = LINE_BUFFER_SIZE - 1;
+                input.registers[2] = 32;
+                input.registers[3] = 126;
+                match self
+                    .dispatcher
+                    .dispatch(OS_READ_LINE, &mut self.task, &mut input)
+                {
+                    Err(RuntimeError::EndOfInput) => return Ok(()),
+                    Err(error) => return Err(error),
+                    Ok(()) => {}
+                }
+                if input.carry {
+                    continue;
+                }
+                let bytes = self
+                    .task
+                    .memory
+                    .read_bytes(LINE_BUFFER, input.registers[1] as usize)?;
+                let line = String::from_utf8_lossy(&bytes).trim().to_owned();
+                if line.eq_ignore_ascii_case("QUIT") {
+                    return Ok(());
+                }
+                if line.eq_ignore_ascii_case("NEW") {
+                    lines.clear();
+                    continue;
+                }
+                if line.eq_ignore_ascii_case("LIST") {
+                    for source in lines.values() {
+                        self.write_console_text(&format!("{source}\r\n"))?;
+                    }
+                    continue;
+                }
+                let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+                if digits > 0 {
+                    let number = line[..digits]
+                        .parse::<u32>()
+                        .map_err(|_| RuntimeError::Program("line number is too large".into()))?;
+                    if line[digits..].trim().is_empty() {
+                        lines.remove(&number);
+                    } else {
+                        lines.insert(number, line);
+                    }
+                    continue;
+                }
+                if line.is_empty() {
+                    continue;
+                }
+                let result = if let Some(command) = line.strip_prefix('*') {
+                    self.task
+                        .memory
+                        .write_bytes(LINE_BUFFER, format!("{command}\0").as_bytes())?;
+                    let mut context = SwiContext::default();
+                    context.registers[0] = LINE_BUFFER;
+                    self.dispatcher
+                        .dispatch(OS_CLI, &mut self.task, &mut context)
+                } else {
+                    let source = if line.eq_ignore_ascii_case("RUN") {
+                        lines.values().cloned().collect::<Vec<_>>().join("\n")
+                    } else {
+                        line
+                    };
+                    self.run_application(&source)
+                };
+                if let Err(error) = result {
+                    if matches!(error, RuntimeError::EndOfInput) {
+                        return Ok(());
+                    }
+                    self.report_error(&error)?;
+                }
+            }
+            if self.dispatcher.quit_requested() {
+                return Ok(());
+            }
+        }
+    }
+
+    fn write_console_text(&mut self, text: &str) -> Result<(), RuntimeError> {
+        for byte in text.bytes() {
+            let mut context = SwiContext::default();
+            context.registers[0] = u32::from(byte);
+            self.dispatcher
+                .dispatch(OS_WRITE_C, &mut self.task, &mut context)?;
+        }
+        self.dispatcher.flush()
     }
 
     fn write_prompt(&mut self) -> Result<(), RuntimeError> {
@@ -166,10 +294,37 @@ mod tests {
 
     use super::*;
     use crate::{
-        configure::{BasicEngine, ConfigureStore},
+        configure::{BasicEngine, ConfigureStore, StartupLanguage},
+        filesystem::HostFileSystem,
         swi::{DisplayEvent, SwiDispatcher},
-        wimp::WimpServer,
+        wimp::{IconBarSide, WimpServer},
     };
+
+    #[test]
+    fn desktop_prompts_accept_commands_and_basic_without_startup_handoff() {
+        for (basic, input, expected) in [
+            (false, "STATUS WindowFurniture\rQUIT\r", "WindowFurniture"),
+            (true, "10 PRINT 12345\r20 END\rLIST\rRUN\rQUIT\r", "12345"),
+        ] {
+            let (tx, rx) = mpsc::channel();
+            for byte in input.bytes() {
+                tx.send(byte).unwrap();
+            }
+            drop(tx);
+            let (display, events) = mpsc::channel();
+            let mut runtime = Runtime::windowed(rx, display);
+            runtime.run_desktop_console(basic).unwrap();
+            let text: String = events
+                .try_iter()
+                .filter_map(|event| match event {
+                    DisplayEvent::WriteByte { byte, .. } => Some(char::from(byte)),
+                    _ => None,
+                })
+                .collect();
+            assert!(text.contains(expected), "{text}");
+            assert!(!text.contains("error"), "{text}");
+        }
+    }
 
     #[test]
     fn desktop_command_preserves_configuration_for_later_basic_tasks() {
@@ -190,7 +345,8 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&config_path);
         let configure = ConfigureStore::with_path(&config_path);
-        configure.set("BASICENGINE", "STRICTJIT").unwrap();
+        configure.set("BASICENGINE", "STRICT").unwrap();
+        configure.set("Language", "0").unwrap();
         let (finished_sender, finished_receiver) = mpsc::channel();
         let runtime_thread = thread::spawn(move || {
             let mut runtime =
@@ -259,5 +415,809 @@ mod tests {
             .expect("the MOS runtime should shut down cleanly");
         runtime_thread.join().unwrap();
         let _ = std::fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn language_three_starts_the_desktop_command_path_without_showing_a_mos_prompt() {
+        let (input_sender, input_receiver) = mpsc::channel();
+        drop(input_sender);
+        let (display_sender, display_receiver) = mpsc::channel();
+        let (updates, _update_receiver) = mpsc::channel();
+        let wimp = WimpServer::new(updates);
+        let runtime_wimp = wimp.clone();
+        let config_path = std::env::temp_dir().join(format!(
+            "acorn-2026-language-startup-{}.configure",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&config_path);
+        let configure = ConfigureStore::with_path(&config_path);
+        configure.set("Language", "3").unwrap();
+
+        let runtime_thread = thread::spawn(move || {
+            let mut runtime =
+                Runtime::windowed_with_desktop(input_receiver, display_sender, runtime_wimp);
+            runtime.dispatcher.set_configure_store_for_test(configure);
+            runtime.run()
+        });
+
+        let mut saw_prompt_output = false;
+        loop {
+            match display_receiver.recv_timeout(Duration::from_secs(2)) {
+                Ok(DisplayEvent::WriteByte { .. }) => saw_prompt_output = true,
+                Ok(DisplayEvent::DesktopStarted) => break,
+                Ok(_) => {}
+                Err(error) => panic!("configured Language 3 did not start the desktop: {error}"),
+            }
+        }
+        assert!(
+            !saw_prompt_output,
+            "desktop startup must skip the MOS prompt"
+        );
+        wimp.stop();
+        runtime_thread.join().unwrap().unwrap();
+        let _ = std::fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn stdio_keeps_the_mos_recovery_path_when_desktop_startup_is_saved() {
+        let config_path = std::env::temp_dir().join(format!(
+            "acorn-2026-language-stdio-{}.configure",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&config_path);
+        let configure = ConfigureStore::with_path(&config_path);
+        configure.set("Language", "3").unwrap();
+
+        let mut runtime = Runtime::stdio();
+        runtime.dispatcher.set_configure_store_for_test(configure);
+        assert_eq!(
+            runtime
+                .dispatcher
+                .load_basic_configuration()
+                .unwrap()
+                .startup_language,
+            StartupLanguage::Desktop
+        );
+        assert!(
+            !runtime
+                .dispatcher
+                .desktop_is_configured_for_startup()
+                .unwrap()
+        );
+        let _ = std::fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn basic64_desktop_browses_scrolls_and_launches_mounted_programs() {
+        let volume = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("demo-volume");
+        let configure_path = std::env::temp_dir().join(format!(
+            "acorn-2026-desktop-slice-{}.configure",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&configure_path);
+        let configure = ConfigureStore::with_path(&configure_path);
+
+        let (display_sender, display_receiver) = mpsc::channel();
+        let (updates, _update_receiver) = mpsc::channel();
+        let wimp = WimpServer::new(updates);
+        let desktop_wimp = wimp.clone();
+        let desktop_volume = volume.clone();
+        let desktop_configure = configure.clone();
+        let (_desktop_input_sender, desktop_input_receiver) = mpsc::channel();
+        let desktop_display = display_sender.clone();
+        let (desktop_result_sender, desktop_result_receiver) = mpsc::channel();
+        let desktop_worker = thread::spawn(move || {
+            let mut runtime =
+                Runtime::desktop_task(40, desktop_input_receiver, desktop_display, desktop_wimp);
+            runtime
+                .dispatcher
+                .set_configure_store_for_test(desktop_configure);
+            runtime
+                .dispatcher
+                .set_file_system_for_test(HostFileSystem::new(desktop_volume));
+            let result = runtime.run_guest_file("$.System.Desktop");
+            let summary = match &result {
+                Ok(()) => Ok(()),
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = desktop_result_sender.send(summary);
+            result
+        });
+        let mut filer_worker = None;
+        let mut wimp_example_worker = None;
+        let mut wimp_example_task_id = None;
+        let mut echo_worker = None;
+        let mut echo_task_id = None;
+
+        let scenario = (|| -> Result<(), String> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let volume_icon = loop {
+                if let Some(icon) = wimp
+                    .desktop_icons()
+                    .into_iter()
+                    .find(|icon| icon.side == IconBarSide::Devices)
+                {
+                    break icon;
+                }
+                if desktop_worker.is_finished() {
+                    return Err(format!(
+                        "Desktop BASIC task exited before creating the volume icon: {:?}",
+                        desktop_result_receiver.try_recv().ok()
+                    ));
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err("Desktop BASIC task did not create the volume icon".into());
+                }
+                thread::sleep(Duration::from_millis(5));
+            };
+            let x = (volume_icon.bounds.min_x + volume_icon.bounds.max_x) / 2;
+            let y = (volume_icon.bounds.min_y + volume_icon.bounds.max_y) / 2;
+            wimp.mouse_down(x, y, 4);
+
+            let request = loop {
+                if let Some(request) = wimp.take_pending_launches().into_iter().next() {
+                    break request;
+                }
+                if desktop_worker.is_finished() {
+                    return Err("Desktop BASIC task exited after the volume click".into());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err("selecting the volume did not launch the Filer".into());
+                }
+                thread::sleep(Duration::from_millis(5));
+            };
+            if request.guest_path != "$.System.Filer" {
+                return Err(format!("volume icon requested {}", request.guest_path));
+            }
+
+            let (filer_input_sender, filer_input_receiver) = mpsc::channel();
+            let filer_wimp = wimp.clone();
+            let filer_display = display_sender.clone();
+            let filer_configure = configure.clone();
+            let filer_volume = volume.clone();
+            let filer_task_id = request.task_id;
+            let filer_path = request.guest_path.clone();
+            let (filer_result_sender, filer_result_receiver) = mpsc::channel();
+            filer_worker = Some(thread::spawn(move || {
+                let mut runtime = Runtime::desktop_task(
+                    filer_task_id,
+                    filer_input_receiver,
+                    filer_display,
+                    filer_wimp,
+                );
+                runtime
+                    .dispatcher
+                    .set_configure_store_for_test(filer_configure);
+                runtime
+                    .dispatcher
+                    .set_file_system_for_test(HostFileSystem::new(filer_volume));
+                let result = runtime.run_guest_file(&filer_path);
+                let summary = match &result {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(error.to_string()),
+                };
+                let _ = filer_result_sender.send(summary);
+                result
+            }));
+            drop(filer_input_sender);
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let _filer_window = loop {
+                if let Some(window) = wimp
+                    .desktop_windows()
+                    .into_iter()
+                    .find(|window| window.owner_task_id == filer_task_id)
+                {
+                    break window;
+                }
+                if filer_worker
+                    .as_ref()
+                    .is_some_and(|worker| worker.is_finished())
+                {
+                    return Err(format!(
+                        "Filer BASIC task exited before opening its window: {:?}",
+                        filer_result_receiver.try_recv().ok()
+                    ));
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err("Filer BASIC task did not open its Wimp window".into());
+                }
+                thread::sleep(Duration::from_millis(5));
+            };
+            if wimp
+                .desktop_icons()
+                .iter()
+                .any(|icon| icon.owner_task_id == filer_task_id)
+            {
+                return Err("opening the Filer created an implicit iconbar icon".into());
+            }
+
+            let mut output = Vec::new();
+            let current_filer_window = || {
+                wimp.desktop_windows()
+                    .into_iter()
+                    .find(|window| window.owner_task_id == filer_task_id)
+            };
+            let visible_catalogue_icon = |label: &str| {
+                let window = current_filer_window()?;
+                let visible = crate::wimp::desktop_window_furniture(&window).work_area;
+                wimp.desktop_window_icons().into_iter().find(|icon| {
+                    icon.owner_task_id == filer_task_id
+                        && icon.label == label
+                        && icon.bounds.min_x >= visible.min_x
+                        && icon.bounds.max_x <= visible.max_x
+                        && icon.bounds.min_y >= visible.min_y
+                        && icon.bounds.max_y <= visible.max_y
+                })
+            };
+            let click_icon = |icon: &crate::wimp::DesktopWindowIcon| {
+                wimp.mouse_down(
+                    (icon.bounds.min_x + icon.bounds.max_x) / 2,
+                    (icon.bounds.min_y + icon.bounds.max_y) / 2,
+                    4,
+                );
+            };
+            let catalogue = HostFileSystem::new(&volume);
+            let catalogue_task = Task::new(41);
+            let entries = catalogue
+                .enumerate(&catalogue_task.file_system, "$", "*")
+                .map_err(|error| error.to_string())?;
+            let examples_index = entries
+                .iter()
+                .position(|entry| entry.is_directory && entry.guest_name == "Examples")
+                .ok_or_else(|| {
+                    "the mounted root catalogue has no Examples directory".to_string()
+                })?;
+            if examples_index >= 56 {
+                return Err("Examples is outside the Filer's first catalogue page".into());
+            }
+            let examples_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let examples_icon = loop {
+                if let Some(icon) = visible_catalogue_icon("Examples") {
+                    break icon;
+                }
+                if std::time::Instant::now() >= examples_deadline {
+                    let labels = wimp
+                        .desktop_window_icons()
+                        .into_iter()
+                        .filter(|icon| icon.owner_task_id == filer_task_id)
+                        .map(|icon| (icon.label, icon.bounds))
+                        .collect::<Vec<_>>();
+                    let windows = wimp
+                        .desktop_windows()
+                        .into_iter()
+                        .filter(|window| window.owner_task_id == filer_task_id)
+                        .map(|window| (window.work_area, window.scroll_y))
+                        .collect::<Vec<_>>();
+                    return Err(format!(
+                        "Filer did not show the Examples directory icon: labels={labels:?}, windows={windows:?}, task={:?}",
+                        filer_result_receiver.try_recv().ok()
+                    ));
+                }
+                thread::sleep(Duration::from_millis(5));
+            };
+            click_icon(&examples_icon);
+            click_icon(&examples_icon);
+
+            let path_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                // The Filer exposes catalogue entries in the work area; a
+                // guest-path icon is not part of its current desktop UI. Wait
+                // for an entry unique to Examples to prove navigation.
+                if visible_catalogue_icon("Alpha").is_some() {
+                    break;
+                }
+                if std::time::Instant::now() >= path_deadline {
+                    let labels = wimp
+                        .desktop_window_icons()
+                        .into_iter()
+                        .filter(|icon| icon.owner_task_id == filer_task_id)
+                        .map(|icon| icon.label)
+                        .collect::<Vec<_>>();
+                    let windows = wimp
+                        .desktop_windows()
+                        .into_iter()
+                        .filter(|window| window.owner_task_id == filer_task_id)
+                        .map(|window| (window.work_area, window.scroll_y))
+                        .collect::<Vec<_>>();
+                    return Err(format!(
+                        "double-clicking Examples did not show its Alpha child entry; Filer entries: {labels:?}; Filer window area/scroll: {windows:?}; task result: {:?}",
+                        filer_result_receiver.try_recv().ok()
+                    ));
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+
+            let close = wimp
+                .furniture_layout()
+                .into_iter()
+                .find(|(window, _)| window.owner_task_id == filer_task_id)
+                .and_then(|(_, furniture)| furniture.close_icon)
+                .ok_or_else(|| "Filer window has no close control".to_string())?;
+            wimp.mouse_down(
+                close.min_x + (close.max_x - close.min_x) / 2,
+                close.min_y + (close.max_y - close.min_y) / 2,
+                1,
+            );
+            wimp.mouse_button_up(1);
+            let parent_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let _parent_examples = loop {
+                if let Some(icon) = visible_catalogue_icon("Examples") {
+                    break icon;
+                }
+                if filer_worker
+                    .as_ref()
+                    .is_some_and(|worker| worker.is_finished())
+                {
+                    return Err(format!(
+                        "Adjust-close did not keep the Filer open at its parent: {:?}",
+                        filer_result_receiver.try_recv().ok()
+                    ));
+                }
+                if std::time::Instant::now() >= parent_deadline {
+                    return Err("Adjust-close did not open the parent directory".into());
+                }
+                thread::sleep(Duration::from_millis(5));
+            };
+            let filer_window = current_filer_window().unwrap();
+            let adjust_size = wimp
+                .furniture_layout()
+                .into_iter()
+                .find(|(window, _)| window.owner_task_id == filer_task_id)
+                .and_then(|(_, furniture)| furniture.adjust_size_icon)
+                .ok_or_else(|| "Filer window has no resize control".to_string())?;
+            let grab_x = adjust_size.min_x + (adjust_size.max_x - adjust_size.min_x) / 2;
+            let grab_y = adjust_size.min_y + (adjust_size.max_y - adjust_size.min_y) / 2;
+            let drag = wimp
+                .mouse_down(grab_x, grab_y, 4)
+                .ok_or_else(|| "Filer resize control did not start a drag".to_string())?;
+            let narrow_width = 300;
+            wimp.drag_to(
+                drag,
+                drag.start_x + narrow_width
+                    - (filer_window.work_area.max_x - filer_window.work_area.min_x),
+                drag.start_y,
+            );
+            wimp.finish_drag(drag);
+            let resize_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let Some(window) = current_filer_window() else {
+                    return Err("Filer closed during its resize request".into());
+                };
+                if window.work_area.max_x - window.work_area.min_x == narrow_width {
+                    let work = crate::wimp::desktop_window_furniture(&window).work_area;
+                    let icons = wimp
+                        .desktop_window_icons()
+                        .into_iter()
+                        .filter(|icon| icon.owner_task_id == filer_task_id)
+                        .collect::<Vec<_>>();
+                    if !icons.is_empty()
+                        && icons.iter().all(|icon| {
+                            icon.bounds.min_x >= work.min_x && icon.bounds.max_x <= work.max_x
+                        })
+                    {
+                        break;
+                    }
+                }
+                if std::time::Instant::now() >= resize_deadline {
+                    return Err("Filer did not accept its narrow resize".into());
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            let mut resize_scroll_steps = 0;
+            while visible_catalogue_icon("Examples").is_none() {
+                if resize_scroll_steps >= 12 {
+                    return Err("reflowed root listing did not scroll Examples into view".into());
+                }
+                let (_, furniture) = wimp
+                    .furniture_layout()
+                    .into_iter()
+                    .find(|(window, _)| window.owner_task_id == filer_task_id)
+                    .ok_or_else(|| "Filer window disappeared after resize".to_string())?;
+                let bar = furniture
+                    .vertical_scrollbar
+                    .ok_or_else(|| "Filer lost its vertical scrollbar after resize".to_string())?;
+                if bar.slider.min_y <= bar.track.min_y {
+                    return Err("reflowed root listing has no page-down area".into());
+                }
+                let scroll_x = (bar.track.min_x + bar.track.max_x) / 2;
+                let scroll_y = (bar.track.min_y + bar.slider.min_y) / 2;
+                let previous_scroll = current_filer_window().unwrap().scroll_y;
+                wimp.mouse_down(scroll_x, scroll_y, 4);
+                let scroll_deadline = std::time::Instant::now() + Duration::from_secs(2);
+                loop {
+                    let Some(window) = current_filer_window() else {
+                        return Err("Filer window disappeared while scrolling after resize".into());
+                    };
+                    if window.scroll_y != previous_scroll {
+                        break;
+                    }
+                    if std::time::Instant::now() >= scroll_deadline {
+                        return Err("reflowed root listing did not scroll".into());
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                resize_scroll_steps += 1;
+            }
+            let parent_examples = visible_catalogue_icon("Examples").unwrap();
+            click_icon(&parent_examples);
+            wimp.mouse_button_up(4);
+            click_icon(&parent_examples);
+            wimp.mouse_button_up(4);
+            let reopened_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while visible_catalogue_icon("Alpha").is_none() {
+                if std::time::Instant::now() >= reopened_deadline {
+                    return Err("Filer could not reopen Examples after Adjust-close".into());
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+
+            let example_entries = catalogue
+                .enumerate(&catalogue_task.file_system, "$.Examples", "*")
+                .map_err(|error| error.to_string())?;
+            let echo_index = example_entries
+                .iter()
+                .position(|entry| !entry.is_directory && entry.guest_name == "Echo")
+                .ok_or_else(|| "the Examples catalogue has no Echo program".to_string())?;
+            let wimp_index = example_entries
+                .iter()
+                .position(|entry| !entry.is_directory && entry.guest_name == "WimpAlpha")
+                .ok_or_else(|| "the Examples catalogue has no WimpAlpha program".to_string())?;
+
+            let mut scroll_steps = 0;
+            while visible_catalogue_icon("WimpAlpha").is_none() {
+                if scroll_steps >= 30 {
+                    return Err(format!(
+                        "scrolling did not reveal WimpAlpha (catalogue index {wimp_index})"
+                    ));
+                }
+                let (_, furniture) = wimp
+                    .furniture_layout()
+                    .into_iter()
+                    .find(|(window, _)| window.owner_task_id == filer_task_id)
+                    .ok_or_else(|| "Filer window disappeared before list scrolling".to_string())?;
+                let bar = furniture
+                    .vertical_scrollbar
+                    .ok_or_else(|| "Filer has no vertical scrollbar".to_string())?;
+                if bar.slider.min_y <= bar.track.min_y {
+                    return Err("Filer scrollbar has no page-down area".into());
+                }
+                let scroll_x = (bar.track.min_x + bar.track.max_x) / 2;
+                let scroll_y = (bar.track.min_y + bar.slider.min_y) / 2;
+                let previous_scroll = current_filer_window().unwrap().scroll_y;
+                wimp.mouse_down(scroll_x, scroll_y, 4);
+                let scroll_deadline = std::time::Instant::now() + Duration::from_secs(2);
+                loop {
+                    let Some(window) = current_filer_window() else {
+                        return Err(format!(
+                            "Filer window disappeared while scrolling: {:?}",
+                            filer_result_receiver.try_recv().ok()
+                        ));
+                    };
+                    if window.scroll_y != previous_scroll {
+                        break;
+                    }
+                    if std::time::Instant::now() >= scroll_deadline {
+                        return Err("scrolling the Filer did not move its catalogue view".into());
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                scroll_steps += 1;
+            }
+            if let Some(notice) = wimp.desktop_notice() {
+                return Err(format!("Filer scrolling raised a desktop notice: {notice}"));
+            }
+
+            let wimp_icon = visible_catalogue_icon("WimpAlpha").unwrap();
+            click_icon(&wimp_icon);
+            let selected_deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while visible_catalogue_icon("WimpAlpha").is_none_or(|icon| icon.flags & (1 << 21) == 0)
+            {
+                if std::time::Instant::now() >= selected_deadline {
+                    return Err("clicking WimpAlpha did not select its Filer icon".into());
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            click_icon(&visible_catalogue_icon("WimpAlpha").unwrap());
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let wimp_request = loop {
+                if let Some(request) = wimp.take_pending_launches().into_iter().next() {
+                    break request;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err("double-clicking WimpAlpha did not start a BASIC task".into());
+                }
+                thread::sleep(Duration::from_millis(5));
+            };
+            if wimp_request.guest_path != "$.Examples.WimpAlpha" {
+                return Err(format!(
+                    "Filer launched {} instead of WimpAlpha",
+                    wimp_request.guest_path
+                ));
+            }
+            let wimp_example_id = wimp_request.task_id;
+            wimp_example_task_id = Some(wimp_example_id);
+            let (wimp_input_sender, wimp_input_receiver) = mpsc::channel();
+            wimp.set_task_input(wimp_example_id, wimp_input_sender);
+            let child_wimp = wimp.clone();
+            let child_display = display_sender.clone();
+            let child_configure = configure.clone();
+            let child_volume = volume.clone();
+            let child_path = wimp_request.guest_path.clone();
+            wimp_example_worker = Some(thread::spawn(move || {
+                let mut runtime = Runtime::desktop_task(
+                    wimp_example_id,
+                    wimp_input_receiver,
+                    child_display,
+                    child_wimp.clone(),
+                );
+                runtime
+                    .dispatcher
+                    .set_configure_store_for_test(child_configure);
+                runtime
+                    .dispatcher
+                    .set_file_system_for_test(HostFileSystem::new(child_volume));
+                let result = runtime.run_guest_file(&child_path);
+                child_wimp.task_exited(wimp_example_id);
+                result
+            }));
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !wimp.desktop_windows().iter().any(|window| {
+                window.owner_task_id == wimp_example_id && window.title == "Alpha App"
+            }) {
+                if wimp_example_worker
+                    .as_ref()
+                    .is_some_and(|worker| worker.is_finished())
+                {
+                    return Err("WimpAlpha exited before opening its shared Wimp window".into());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err("WimpAlpha did not open a window in the desktop".into());
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            if wimp
+                .desktop_icons()
+                .iter()
+                .any(|icon| icon.owner_task_id == wimp_example_id)
+            {
+                return Err("WimpAlpha received an iconbar icon without creating one".into());
+            }
+            let close = wimp
+                .furniture_layout()
+                .into_iter()
+                .find(|(window, _)| window.owner_task_id == wimp_example_id)
+                .and_then(|(_, furniture)| furniture.close_icon)
+                .ok_or_else(|| "WimpAlpha window has no close control".to_string())?;
+            wimp.mouse_down(
+                (close.min_x + close.max_x) / 2,
+                (close.min_y + close.max_y) / 2,
+                4,
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while wimp
+                .desktop_icons()
+                .iter()
+                .any(|icon| icon.owner_task_id == wimp_example_id)
+            {
+                if std::time::Instant::now() >= deadline {
+                    return Err("closed WimpAlpha task kept an iconbar entry".into());
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            if wimp
+                .desktop_windows()
+                .iter()
+                .any(|window| window.owner_task_id == wimp_example_id)
+            {
+                return Err("closed WimpAlpha task kept its window".into());
+            }
+
+            let mut echo_scroll_steps = 0;
+            while visible_catalogue_icon("Echo").is_none() {
+                if echo_scroll_steps >= 30 {
+                    return Err(format!(
+                        "scrolling did not reveal Echo (catalogue index {echo_index})"
+                    ));
+                }
+                let (_, furniture) = wimp
+                    .furniture_layout()
+                    .into_iter()
+                    .find(|(window, _)| window.owner_task_id == filer_task_id)
+                    .ok_or_else(|| "Filer window disappeared before finding Echo".to_string())?;
+                let bar = furniture
+                    .vertical_scrollbar
+                    .ok_or_else(|| "Filer has no vertical scrollbar".to_string())?;
+                if bar.track.max_y <= bar.slider.max_y {
+                    return Err("Filer scrollbar has no page-up area".into());
+                }
+                let scroll_x = (bar.track.min_x + bar.track.max_x) / 2;
+                let scroll_y = (bar.track.max_y + bar.slider.max_y) / 2;
+                let previous_scroll = current_filer_window().unwrap().scroll_y;
+                wimp.mouse_down(scroll_x, scroll_y, 4);
+                let scroll_deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while current_filer_window().unwrap().scroll_y == previous_scroll {
+                    if std::time::Instant::now() >= scroll_deadline {
+                        return Err("Filer scrollbar did not page up".into());
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                echo_scroll_steps += 1;
+            }
+
+            let echo_icon = visible_catalogue_icon("Echo").unwrap();
+            click_icon(&echo_icon);
+            let selected_deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while visible_catalogue_icon("Echo").is_none_or(|icon| icon.flags & (1 << 21) == 0) {
+                if std::time::Instant::now() >= selected_deadline {
+                    return Err("clicking Echo did not select its Filer icon".into());
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            click_icon(&visible_catalogue_icon("Echo").unwrap());
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let echo_request = loop {
+                if let Some(request) = wimp.take_pending_launches().into_iter().next() {
+                    break request;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err("double-clicking Echo did not start a BASIC task".into());
+                }
+                thread::sleep(Duration::from_millis(5));
+            };
+            if echo_request.guest_path != "$.Examples.Echo" {
+                return Err(format!(
+                    "Filer launched {} instead of Echo (catalogue index {echo_index}; output: {}; entries: {:?})",
+                    echo_request.guest_path,
+                    String::from_utf8_lossy(&output),
+                    example_entries
+                        .iter()
+                        .enumerate()
+                        .map(|(index, entry)| (index, entry.guest_name.as_str()))
+                        .collect::<Vec<_>>()
+                ));
+            }
+
+            let (echo_input_sender, echo_input_receiver) = mpsc::channel();
+            wimp.set_task_input(echo_request.task_id, echo_input_sender);
+            let echo_wimp = wimp.clone();
+            let echo_display = display_sender.clone();
+            let echo_configure = configure.clone();
+            let echo_volume = volume.clone();
+            let task_id = echo_request.task_id;
+            echo_task_id = Some(task_id);
+            let echo_path = echo_request.guest_path.clone();
+            let (echo_result_sender, echo_result_receiver) = mpsc::channel();
+            echo_worker = Some(thread::spawn(move || {
+                let cleanup_wimp = echo_wimp.clone();
+                let mut runtime =
+                    Runtime::desktop_task(task_id, echo_input_receiver, echo_display, echo_wimp);
+                runtime
+                    .dispatcher
+                    .set_configure_store_for_test(echo_configure);
+                runtime
+                    .dispatcher
+                    .set_file_system_for_test(HostFileSystem::new(echo_volume));
+                let result = runtime.run_guest_file(&echo_path);
+                cleanup_wimp.task_exited(task_id);
+                let summary = match &result {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(error.to_string()),
+                };
+                let _ = echo_result_sender.send(summary);
+                result
+            }));
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !wimp.desktop_windows().iter().any(|window| {
+                window.owner_task_id == task_id && window.title == "BASIC Output: Echo"
+            }) {
+                if echo_worker
+                    .as_ref()
+                    .is_some_and(|worker| worker.is_finished())
+                {
+                    return Err(format!(
+                        "ordinary BASIC task exited before opening its output window: {:?}",
+                        echo_result_receiver.try_recv().ok()
+                    ));
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err("ordinary BASIC task did not open its output window".into());
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            for byte in b"Mirror" {
+                wimp.key_pressed(u32::from(*byte));
+            }
+            wimp.key_pressed(13);
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !String::from_utf8_lossy(&output).contains("Mirror") {
+                match display_receiver.recv_timeout(Duration::from_millis(20)) {
+                    Ok(DisplayEvent::WriteByte {
+                        task_id: id, byte, ..
+                    }) if id == task_id => {
+                        output.push(byte);
+                    }
+                    Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(error) => return Err(format!("display channel closed: {error}")),
+                }
+                if echo_worker
+                    .as_ref()
+                    .is_some_and(|worker| worker.is_finished())
+                {
+                    output.extend(display_receiver.try_iter().filter_map(|event| match event {
+                        DisplayEvent::WriteByte {
+                            task_id: id, byte, ..
+                        } if id == task_id => Some(byte),
+                        _ => None,
+                    }));
+                    if !String::from_utf8_lossy(&output).contains("Mirror") {
+                        return Err(format!(
+                            "ordinary BASIC task exited without echoing input: {:?}; output: {}",
+                            echo_result_receiver.try_recv().ok(),
+                            String::from_utf8_lossy(&output)
+                        ));
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err("input did not reach the ordinary BASIC task".into());
+                }
+            }
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while echo_worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+            {
+                if std::time::Instant::now() >= deadline {
+                    return Err(
+                        "ordinary BASIC task did not finish after writing its output".into(),
+                    );
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            if wimp
+                .desktop_icons()
+                .iter()
+                .any(|icon| icon.owner_task_id == task_id)
+            {
+                return Err("finished BASIC task kept an iconbar entry".into());
+            }
+            if wimp
+                .desktop_windows()
+                .iter()
+                .any(|window| window.owner_task_id == task_id)
+            {
+                return Err("finished BASIC task kept its output window".into());
+            }
+            Ok(())
+        })();
+
+        wimp.stop();
+        if let Some(task_id) = echo_task_id {
+            wimp.task_exited(task_id);
+        }
+        if let Some(task_id) = wimp_example_task_id {
+            wimp.task_exited(task_id);
+        }
+        let desktop_result = desktop_worker.join().unwrap();
+        let filer_result = filer_worker.map(|worker| worker.join().unwrap());
+        let wimp_example_result = wimp_example_worker.map(|worker| worker.join().unwrap());
+        let echo_result = echo_worker.map(|worker| worker.join().unwrap());
+        let _ = std::fs::remove_file(configure_path);
+        scenario.unwrap_or_else(|error| panic!("desktop/Filer flow failed: {error}"));
+        assert!(matches!(
+            desktop_result,
+            Err(RuntimeError::EndOfInput) | Ok(())
+        ));
+        assert!(matches!(
+            filer_result,
+            Some(Err(RuntimeError::EndOfInput)) | Some(Ok(()))
+        ));
+        assert!(matches!(wimp_example_result, Some(Ok(()))));
+        assert!(matches!(echo_result, Some(Ok(()))));
     }
 }

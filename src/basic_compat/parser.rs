@@ -620,7 +620,10 @@ fn parse_line(line: &TokenizedBasicLine, mode: LexMode) -> Result<Vec<Statement>
         let repeat_opens_body = matches!(statement, Statement::Repeat);
         statements.push(statement);
         if !parser.is_end() && !parser.peek_symbol(b':') && !repeat_opens_body {
-            return parser.error("expected ':' or end of line");
+            return parser.error(format!(
+                "expected ':' or end of line, found {:?}",
+                parser.peek()
+            ));
         }
     }
     Ok(statements)
@@ -1212,6 +1215,14 @@ impl Parser {
                 self.expect_symbol(b'=')?;
                 Ok(Statement::Assign(
                     LValue::Memory(MemoryWidth::Word, address),
+                    self.parse_expression(0)?,
+                ))
+            }
+            Token::Symbol(b'?') => {
+                let address = self.parse_expression(4)?;
+                self.expect_symbol(b'=')?;
+                Ok(Statement::Assign(
+                    LValue::Memory(MemoryWidth::Byte, address),
                     self.parse_expression(0)?,
                 ))
             }
@@ -1896,6 +1907,14 @@ mod tests {
 
         parse_source(include_str!("../../examples/wimp/two-windows/alpha.bas64"))
             .expect("BASIC64 identifiers such as definition% should remain intact");
+    }
+
+    #[test]
+    fn desktop_and_filer_basic64_components_parse() {
+        parse_source(include_str!("../../demo-volume/System/Desktop.bas64"))
+            .expect("the editable desktop bootstrap should parse");
+        parse_source(include_str!("../../demo-volume/System/Filer.bas64"))
+            .expect("the editable Filer policy should parse");
     }
 
     #[test]

@@ -1,0 +1,6 @@
+Welcome to Acorn-2026!
+
+This is a small plain text file on DemoDisk.
+Its RISC OS filetype is Text (&FFF).
+
+Open it from the Filer to try reading a text document.

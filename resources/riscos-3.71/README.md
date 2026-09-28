@@ -33,6 +33,21 @@ characters 32–255 from `os-source/vdufontl1`; each glyph is eight rows and bit
 `53a8ac732144f02835829c3d514767b2bcfd14cb` and is golden-tested alongside its
 source.
 
+## Reference screenshot texture crops
+
+The raw RGB tiles in `desktop/` were cropped from the RO 3.71 RPCEmu screenshot
+provided by the project owner. They preserve the desktop's mottled Acorn
+wallpaper, icon-bar stipple, and light window-work-area stipple while excluding
+its open window, pointer, and icons. Their formats are tightly packed RGB8
+pixels, row-major, without a header: `wallpaper-tile.rgb` is 267×247,
+`iconbar-tile.rgb` is 64×68, and `window-tile.rgb` is 22×12. The modern desktop
+uses the wallpaper and work-area crops only as faint material texture; the
+icon-bar crop remains a visual reference rather than the default appearance.
+
+These screenshot-derived crops are included solely for this project owner's
+requested visual comparison. They do not add a reuse or redistribution license
+for the original RISC OS artwork.
+
 The pinned upstream snapshot contains no license grant for these resources.
 They retain their original authorship and rights; this project does not assign
 them the Cargo package's MIT license or grant downstream reuse. Consult the

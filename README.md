@@ -2,13 +2,13 @@
 
 > **Build the computer Acorn might have built in 2026.**
 
-Acorn-2026 is a design and implementation project for a modern, tinkerable computer environment inspired by Acorn and RISC OS. It preserves useful ideas and stable interfaces while replacing historical implementation limits. It is not a full RISC OS simulator or desktop remake; the current Wimp window demo is a narrow visual and service-compatibility study using original 3.71 window furniture and system typography.
+Acorn-2026 is a design and implementation project for a modern, tinkerable computer environment inspired by Acorn and RISC OS. It preserves useful ideas and source-compatible interfaces while replacing historical implementation limits. It is not a full RISC OS simulator or desktop remake; its desktop keeps the Wimp interaction model and Filer conventions, with a modern visual style by default.
 
 This project was also inspired by [pmirvine/risc-os](https://github.com/pmirvine/risc-os).
 
 ## Project status
 
-The hosted Rust MOS prompt is available in one graphics-capable window: `HELP` displays help and returns to `*`, and `QUIT` exits. The initial display renders MOS/BASIC text and plotted points/lines together using the supplied BBC Micro bitmap font. The tokenised [`text-and-pixels` demo](examples/graphics) prints and plots on the same screen. `cargo run -- --desktop-demo` starts two editable BASIC guest tasks, each with a responsive Wimp-style window in the same host surface. The programs are loaded from [`examples/wimp/two-windows`](examples/wimp/two-windows) at launch. This is a documented first Wimp subset, not a complete RISC OS desktop or redraw implementation; see the design brief for contract and scheduling limits. UTF-8 `.bas64` and `.bas` source and decoded `.bbc` programs now use one parser output and compatibility execution engine; the optional Cranelift JIT consumes the same representation. `REM @BASIC64 MODE=HYBRID TARGET=AGON` selects the Agon graphics mode table at runtime. `BASICLOAD` accepts two observed tokenized saved-program record layouts and preserves their token bytes. `BASICRUN` supports the string echo fixture, a narrow shared-boundary legacy core, ClockSP5 program version 5.08, and the source-derived full Mandelbrot listing through its selected 32-bit extended mode and `ColourTrans` path. These fixtures exercise specific compatibility slices; they do not establish broad BBC BASIC V/VI compatibility or full Agon VDP emulation. See the [tokenized BASIC compatibility matrix](docs/tokenized-basic-compatibility.md) for evidence and gaps.
+The hosted Rust MOS prompt is available in one graphics-capable window: `HELP` displays help and returns to `*`, `DESKTOP` starts the BASIC64 desktop, and `QUIT` exits. The desktop shows the mounted HostFS volume and opens a BASIC64 Filer for browsing and launching programs. `cargo run -- --desktop-demo` remains a separate two-window Wimp test. The window manager and desktop services implement a documented first subset, not full RISC OS redraw or task scheduling; see the design brief for its boundaries. UTF-8 `.bas64` and `.bas` source and decoded `.bbc` programs use one parser output and compatibility execution engine; the optional Cranelift JIT consumes the same representation. `REM @BASIC64 MODE=HYBRID TARGET=AGON` selects the Agon graphics mode table at runtime. `BASICLOAD` accepts two observed tokenized saved-program record layouts and preserves their token bytes. `BASICRUN` supports the string echo fixture, a narrow shared-boundary legacy core, ClockSP5 program version 5.08, and the source-derived full Mandelbrot listing through its selected 32-bit extended mode and `ColourTrans` path. These fixtures exercise specific compatibility slices; they do not establish broad BBC BASIC V/VI compatibility or full Agon VDP emulation. See the [tokenized BASIC compatibility matrix](docs/tokenized-basic-compatibility.md) for evidence and gaps.
 
 ## Agon demo
 
@@ -44,7 +44,7 @@ Open the repository root (the folder containing `Cargo.toml`) in RustRover, then
 cargo run
 ```
 
-The app opens one window and displays the `*` prompt. Enter `HELP` to list the built-in commands. Enter `DESKTOP` to hand that window to the initially blank shared Wimp desktop; closing the window exits. `--desktop-demo` remains a separate launch path for the two sample windows. Enter `QUIT` to exit from the MOS prompt.
+The app opens one window and displays the `*` prompt. Enter `HELP` to list the built-in commands. Enter `DESKTOP` to start the BASIC64 desktop in that same host window. The icon bar shows the mounted volume; select it to open the Filer, then open `Examples` and double-click a BASIC program. Closing the host window exits. Enter `QUIT` to exit from the MOS prompt.
 
 ## Persist BASIC execution preferences
 
@@ -75,6 +75,49 @@ to use another file.
 Use **Command+V** on macOS to paste clipboard text into the window (Control+V on other hosts). Pasted line breaks act like pressing Enter, so multiple pasted command lines run in sequence. Printable ASCII is sent to the guest input path; tabs become spaces and unsupported characters are skipped.
 
 In the desktop, left-click is Select, middle-click is Menu, and right-click is Adjust. On a trackpad or two-button mouse, hold Option (Alt on other platforms) and left-click for Menu.
+
+## Explore and launch
+
+The editable desktop bootstrap and Filer policy are
+[`demo-volume/System/Desktop.bas64`](demo-volume/System/Desktop.bas64) and
+[`demo-volume/System/Filer.bas64`](demo-volume/System/Filer.bas64). They run as
+separate BASIC64 guest tasks through the shared runtime. `ACORN_DEMO_VOLUME`
+can select a different HostFS folder; the volume icon uses its mounted guest
+volume name.
+
+The Filer catalogues the selected guest directory from HostFS, displays up to
+56 entries at a time as selectable RISC OS icons with directory, BASIC, and
+file sprites, supports parent navigation and Wimp scrollbar movement, and
+opens directories or BASIC source/tokenized files on a double-click. Its work
+extent follows the current page, and entries beyond the current page use
+previous/next controls. The renderer still has no guest redraw rectangles; it
+keeps the display snapshot visible while the window is moved, resized, covered,
+or scrolled. The desktop uses a modern, high-density shell by default while
+keeping classic Wimp interaction and the existing guest call shapes. Acorn's
+original Homerton outline face supplies shell and text-only guest labels where
+its Latin repertoire fits. Wimp text screens keep their classic character grid
+on a modern light surface; the MOS/BBC compatibility display remains pixel
+based. Original RO 3.71 wallpaper and work-area textures are blended in at low
+contrast, and `Wimp_CreateIconEx` lets BASIC64 callers supply their own 2× RGBA
+icon art without changing `Wimp_CreateIcon`.
+Texture provenance and asset limits are recorded in
+[`resources/riscos-3.71/README.md`](resources/riscos-3.71/README.md). Each
+volume-icon activation starts an independent Filer task at the volume root;
+close each window to end that task. Unsupported file types and files that
+disappear after listing get a visible, dismissible message. Each launched
+program gets a task icon and a task-owned output window until it creates its
+own Wimp windows or exits. Clicking an application icon brings its open
+windows forward. A program's working directory is set to the directory
+containing its guest file; its file paths still use that task's HostFS context.
+Execution preferences and source directives use the same loader path as other
+BASIC runs. `WimpAlpha` and `WimpBeta` in
+[`demo-volume/Examples`](demo-volume/Examples) demonstrate shared Wimp windows.
+For a headless rendering of the default Desktop and Filer, run
+`cargo run -- --filer-snapshot /tmp/acorn-filer.ppm`.
+
+The Filer does not edit or mutate files. The current Wimp content adapter paints
+each task's BASIC display snapshot inside its window; guest redraw rectangles,
+file operations, task stop controls, and orderly desktop exit are later work.
 
 To keep using the terminal frontend, run `cargo run -- --stdio`.
 

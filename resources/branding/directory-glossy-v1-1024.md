@@ -1,0 +1,8 @@
+# Glossy cyan directory icon
+
+Asset: `directory-glossy-v1-1024.png`, 1024 × 1024 transparent PNG. Created with built-in image generation using the user's RISC OS directory screenshot and existing glossy icons. Exported to exact target size using sips. Standalone artwork, not installed in the renderer.
+
+## Generation prompt
+
+Use case: stylized-concept. Create one RISC OS-inspired directory icon on genuine transparent alpha, requested output 1024 x 1024. Input 1 screenshot is the authoritative folder silhouette reference: bright cyan blue upright front-facing rectangular folder, small raised tab near upper left with short angled shoulders, straight horizontal dark seam near top beneath tab, broad plain front face, straight sides and bottom, width about 1.2 times total height. Recreate this specific simple folder shape closely. Inputs 2 and 3 (cream hard disk and green acorn) are style references ONLY: match their smoothly shaded glossy molded surfaces, rich shadow gradients, bright upper-right specular highlights, polished bevels, clean high-resolution rendering. Folder stays saturated cyan blue, dark blue shaded edges and lower-left shading, subtle rounded bevels without changing rectangular silhouette, slight thickness but strictly straight-on view. No open folder, no papers, no slanted perspective, no badge, no acorn or disk details, no lettering. Single centered folder occupying about 80% canvas width, generous clear padding. No backdrop, no cast shadow, no black rectangle, no checkerboard baked into image. Keep the authentic RISC OS tab and horizontal seam readable at icon size. Deliver transparent RGBA PNG, 1024 by 1024.
+

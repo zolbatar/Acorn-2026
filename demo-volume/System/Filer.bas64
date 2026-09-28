@@ -1,0 +1,1052 @@
+REM BASIC64 Filer policy: sprite catalogue, selection, paging and activation.
+MODE 20
+DIM description% 31
+$description%="Acorn Filer"
+SYS "Wimp_Initialise",310,&4B534154,description%,0 TO version%,task%
+
+DIM definition% 87
+!(definition%+28)=&3F000002-2147483648
+!(definition%+56)=1
+title%=definition%+72
+$title%="HostFS:$"
+!definition%=22:!(definition%+4)=872:!(definition%+8)=562:!(definition%+12)=1128
+!(definition%+16)=0:!(definition%+20)=0
+!(definition%+40)=0:!(definition%+44)=-2048:!(definition%+48)=1600:!(definition%+52)=0
+!(definition%+60)=&A000:!(definition%+68)=0:!(definition%+84)=0
+SYS "Wimp_CreateWindow",,definition% TO window%
+
+DIM open% 31
+!open%=window%:!(open%+4)=22:!(open%+8)=872:!(open%+12)=562:!(open%+16)=1128
+!(open%+20)=0:!(open%+24)=0:!(open%+28)=-1
+SYS "Wimp_OpenWindow",,open%
+
+DIM event% 255
+DIM directory_buffer% 255
+DIM entry_buffer% 255
+DIM command% 255
+DIM window_state% 35
+DIM extent% 15
+DIM delete_icon% 7
+DIM selection% 15
+DIM icon_definition% 55
+DIM icon_handles% 255
+DIM icon_text% 16383
+DIM folder_image% 12543
+DIM document_image% 12543
+DIM sprval% 31
+DIM entry_items% 223
+DIM pointer_info% 19
+DIM filer_menus% 1087
+DIM menu_text% 2047
+DIM selected_map% 65535
+DIM sort_page% 15999
+menu_open%=0
+directory$="$"
+filerpage%=0
+shown%=0
+icon_count%=0
+selected_item%=-1
+selected_icon%=-1
+selected_count%=0
+all_selected%=0
+excluded_count%=0
+catalogue_count%=-1
+catalogue_directory$=""
+layout_mode%=0
+sort_mode%=0
+last_view_width%=0
+last_view_height%=0
+preserve_scroll%=0
+saved_scroll_y%=0
+menu_x%=0
+menu_y%=0
+context_item%=-1
+context_kind%=0
+DIM views% 8191
+DIM view_paths% 16383
+view_slot%=0:view_count%=1
+PROCsave_view
+PROCmake_filer_images
+PROCmenu_labels
+PROCshow
+
+REPEAT
+  SYS "Wimp_Poll",1,event% TO reason%
+  event_window%=-1
+  IF reason%=1 OR reason%=2 OR reason%=3 OR reason%=10 THEN event_window%=!event%
+  IF reason%=6 THEN event_window%=!(event%+12)
+  IF reason%=8 THEN event_window%=!event%
+  IF event_window%>=0 THEN PROCselect_view(event_window%)
+  IF reason%=1 THEN PROCredraw
+  IF reason%=2 OR reason%=10 THEN PROCopen_request
+  IF reason%=9 THEN
+    PROCsave_view
+    view_slot%=menu_view_slot%
+    PROCload_view
+    PROCmenuselection
+  ENDIF
+  IF reason%=3 THEN
+    IF !event%=window% THEN
+      !pointer_info%=0
+      SYS "Wimp_GetPointerInfo",,pointer_info%
+      close_buttons%=!(pointer_info%+8)
+      close_parent%=0
+      IF (close_buttons% AND 1)<>0 AND directory$<>"$" THEN close_parent%=1
+      IF close_parent%=1 THEN replace_source%=1:PROCparent
+      IF close_parent%=0 THEN SYS "Wimp_CloseWindow",,event%
+    ENDIF
+  ENDIF
+  IF reason%=6 AND !(event%+12)=window% THEN PROCclick
+  IF reason%=8 THEN PROCkey
+  PROCsave_view
+UNTIL FALSE
+
+DEF PROCopen_request
+requested_view_width%=!(event%+12)-!(event%+4)
+requested_view_height%=!(event%+16)-!(event%+8)
+SYS "Wimp_OpenWindow",,event%
+IF requested_view_width%<>last_view_width% OR requested_view_height%<>last_view_height% THEN
+  preserve_scroll%=1
+  PROCshow
+  preserve_scroll%=0
+ENDIF
+ENDPROC
+
+DEF PROCredraw
+SYS "Wimp_RedrawWindow",,event% TO more%
+IF more% THEN
+  REPEAT
+    SYS "Wimp_GetRectangle",,event% TO more%
+  UNTIL more%=0
+ENDIF
+ENDPROC
+
+DEF PROCshow
+IF shown_directory$<>directory$ THEN
+  PROCcount_catalogue
+  FOR reset_selection%=0 TO catalogue_count%-1
+    ?(selected_map%+reset_selection%)=0
+  NEXT
+  selected_count%=0:selected_item%=-1:all_selected%=0
+  shown_directory$=directory$
+ENDIF
+!window_state%=window%
+SYS "Wimp_GetWindowState",,window_state%
+view_width%=!(window_state%+12)-!(window_state%+4)
+view_height%=!(window_state%+16)-!(window_state%+8)
+saved_scroll_y%=!(window_state%+24)
+last_view_width%=view_width%
+last_view_height%=view_height%
+PROCclosemenu
+PROCdelete_icons
+shown%=0
+columns%=3:cell_width%=180:cell_height%=104:entry_flags%=&A11B
+IF layout_mode%=0 THEN
+  columns%=view_width% DIV cell_width%
+  IF columns%<1 THEN columns%=1:cell_width%=view_width%
+ENDIF
+IF layout_mode%=1 THEN
+  cell_width%=270:cell_height%=48:entry_flags%=&A113
+  columns%=view_width% DIV cell_width%
+  IF columns%<1 THEN columns%=1:cell_width%=view_width%
+ENDIF
+IF layout_mode%=2 THEN columns%=1:cell_width%=view_width%:cell_height%=64:entry_flags%=&A113
+PROCbuild_sort_page
+sorted_shown%=shown%
+REM Expand the work extent before creating icons for a larger directory.
+rows%=(sorted_shown%+columns%-1) DIV columns%
+extent_height%=8+rows%*cell_height%
+REM Keep a desktop-sized workspace so shrinking does not prevent growing back.
+IF extent_height%<1200 THEN extent_height%=1200
+IF extent_height%<view_height% THEN extent_height%=view_height%
+extent_width%=columns%*cell_width%
+IF extent_width%<view_width% THEN extent_width%=view_width%
+IF extent_width%<1600 THEN extent_width%=1600
+!extent%=0:!(extent%+4)=0-extent_height%:!(extent%+8)=extent_width%:!(extent%+12)=0
+SYS "Wimp_SetExtent",window%,extent%
+shown%=0
+FOR slot%=0 TO sorted_shown%-1
+  item%=!(sort_page%+slot%*20)
+  $directory_buffer%=directory$
+  SYS "Acorn_Desktop",1,directory_buffer%,item%,entry_buffer%,256 TO kind%,filetype%,entry_size%
+  IF kind%<>0 THEN
+    entry%=entry_buffer%
+    PROCreadname
+    display_name$=LEFT$(entry$,12)
+    IF layout_mode%<>0 THEN display_name$=LEFT$(entry$,20)
+    IF view_width%<180 THEN display_name$=LEFT$(entry$,12)
+    icon_art%=3:sprite_name$="file_xxx":entry_type$="File"
+    IF filetype%=&FFF THEN sprite_name$="file_fff":entry_type$="Text"
+    IF filetype%=&FFB THEN sprite_name$="file_ffb":icon_art%=2:entry_type$="BASIC"
+    IF filetype%=&064 THEN sprite_name$="file_064":icon_art%=2:entry_type$="BASIC64"
+    IF kind%=2 THEN sprite_name$="directory":icon_art%=1:entry_type$="Directory"
+    IF layout_mode%=2 THEN
+      display_name$+=CHR$(10)+entry_type$
+      IF kind%<>2 THEN display_name$+=" "+STR$(entry_size%)+" bytes"
+    ENDIF
+    column%=shown% MOD columns%
+    row%=shown% DIV columns%
+    left%=column%*cell_width%
+    rowtop%=8+row%*cell_height%
+    scratch%=entry_items%+shown%*4
+    !scratch%=item%
+    PROCmake_icon(display_name$,left%,0-rowtop%-cell_height%,left%+cell_width%,0-rowtop%,entry_flags%,sprite_name$,shown%,icon_art%)
+    shown%+=1
+  ENDIF
+NEXT
+!(window_state%+20)=0
+IF preserve_scroll%=0 THEN !(window_state%+24)=0 ELSE !(window_state%+24)=saved_scroll_y%
+SYS "Wimp_OpenWindow",,window_state%
+PROCrefresh_visible_selection
+ENDPROC
+
+DEF PROCdelete_icons
+FOR icon_index%=0 TO icon_count%-1
+  !delete_icon%=window%
+  scratch%=icon_handles%+icon_index%*4
+  !(delete_icon%+4)=!scratch%
+  SYS "Wimp_DeleteIcon",,delete_icon%
+NEXT
+icon_count%=0
+ENDPROC
+
+DEF PROCmenu_labels
+menu_label_filer%=menu_text%
+menu_label_display%=menu_text%+32
+menu_label_context%=menu_text%+64
+menu_label_selectall%=menu_text%+608
+menu_label_clear%=menu_text%+640
+menu_label_options%=menu_text%+672
+menu_label_newdir%=menu_text%+704
+menu_label_parent%=menu_text%+736
+menu_label_previous%=menu_text%+768
+menu_label_next%=menu_text%+800
+menu_label_open%=menu_text%+832
+menu_label_rename%=menu_text%+864
+menu_label_copy%=menu_text%+896
+menu_label_delete%=menu_text%+928
+menu_label_large%=menu_text%+960
+menu_label_small%=menu_text%+992
+menu_label_info%=menu_text%+1024
+menu_label_sortname%=menu_text%+1056
+menu_label_sorttype%=menu_text%+1088
+menu_label_sortsize%=menu_text%+1120
+menu_label_sortdate%=menu_text%+1152
+menu_label_confirm%=menu_text%+1184
+menu_label_overwrite%=menu_text%+1216
+menu_label_create%=menu_text%+1248
+menu_label_context_title%=menu_text%+1280
+menu_label_access%=menu_text%+1312
+menu_label_count%=menu_text%+1344
+menu_label_help%=menu_text%+1376
+menu_label_infoitem%=menu_text%+1408
+menu_label_find%=menu_text%+1440
+menu_label_settype%=menu_text%+1472
+menu_label_stamp%=menu_text%+1504
+menu_label_confirmall%=menu_text%+1536
+menu_label_verbose%=menu_text%+1568
+menu_label_force%=menu_text%+1600
+menu_label_newer%=menu_text%+1632
+menu_label_faster%=menu_text%+1664
+$menu_label_filer%="Filer"
+$menu_label_display%="Display"
+$menu_label_selectall%="Select all"
+$menu_label_clear%="Clear selection"
+$menu_label_options%="Options"
+$menu_label_newdir%="New directory"
+$menu_label_parent%="Open parent"
+$menu_label_previous%="Previous page"
+$menu_label_next%="Next page"
+$menu_label_open%="Open"
+$menu_label_rename%="Rename"
+$menu_label_copy%="Copy"
+$menu_label_delete%="Delete"
+$menu_label_large%="Large icons"
+$menu_label_small%="Small icons"
+$menu_label_info%="Full info"
+$menu_label_sortname%="Sort by name"
+$menu_label_sorttype%="Sort by type"
+$menu_label_sortsize%="Sort by size"
+$menu_label_sortdate%="Sort by date"
+$menu_label_confirm%="Confirm deletes"
+$menu_label_overwrite%="Confirm overwrites"
+$menu_label_create%="Create here"
+$menu_label_context_title%="Selection"
+$menu_label_access%="Access"
+$menu_label_count%="Count"
+$menu_label_help%="Help"
+$menu_label_infoitem%="Info"
+$menu_label_find%="Find"
+$menu_label_settype%="Set type"
+$menu_label_stamp%="Stamp"
+$menu_label_confirmall%="Confirm all"
+$menu_label_verbose%="Verbose"
+$menu_label_force%="Force"
+$menu_label_newer%="Newer"
+$menu_label_faster%="Faster"
+ENDPROC
+
+DEF PROCmenu_header(menu%,title$,item_count%,width%)
+$menu%=title$
+?(menu%+12)=7: ?(menu%+13)=2
+?(menu%+14)=7: ?(menu%+15)=0
+!(menu%+16)=width%: !(menu%+20)=28: !(menu%+24)=0
+ENDPROC
+
+DEF PROCmenu_row(menu%,row_number%,label%,label_bytes%,submenu%,row_flags%,shade%)
+menu_row%=menu%+28+row_number%*24
+!menu_row%=row_flags%
+!(menu_row%+4)=submenu%
+icon_flags%=&101
+IF shade%=1 THEN icon_flags%=icon_flags% OR &400000
+!(menu_row%+8)=icon_flags%
+!(menu_row%+12)=label%
+!(menu_row%+16)=0
+!(menu_row%+20)=label_bytes%
+ENDPROC
+
+DEF PROCbuildmenu
+root_menu%=filer_menus%
+display_menu%=filer_menus%+256
+context_menu%=filer_menus%+512
+options_menu%=filer_menus%+832
+newdir_menu%=filer_menus%+1024
+PROCmenu_header(root_menu%,"Filer",7,180)
+PROCmenu_header(display_menu%,"Display",7,180)
+PROCmenu_header(context_menu%,"Selection",10,260)
+PROCmenu_header(options_menu%,"Options",6,210)
+PROCmenu_header(newdir_menu%,"New directory",1,190)
+
+PROCmenu_row(root_menu%,0,menu_label_display%,8,display_menu%,0,0)
+context_shade%=0:context_flags%=0
+IF context_item%<0 AND selected_count%=0 THEN context_shade%=1
+PROCmenu_row(root_menu%,1,menu_label_context%,LEN(context$)+1,context_menu%,context_flags%,context_shade%)
+PROCmenu_row(root_menu%,2,menu_label_selectall%,11,-1,0,0)
+clear_shade%=0
+IF selected_count%=0 AND all_selected%=0 THEN clear_shade%=1
+PROCmenu_row(root_menu%,3,menu_label_clear%,16,-1,0,clear_shade%)
+PROCmenu_row(root_menu%,4,menu_label_options%,8,options_menu%,0,0)
+PROCmenu_row(root_menu%,5,menu_label_newdir%,14,newdir_menu%,0,0)
+parent_shade%=0
+IF directory$="$" THEN parent_shade%=1
+PROCmenu_row(root_menu%,6,menu_label_parent%,12,-1,128,parent_shade%)
+
+layout_tick_large%=0:layout_tick_small%=0:layout_tick_info%=0
+IF layout_mode%=0 THEN layout_tick_large%=1
+IF layout_mode%=1 THEN layout_tick_small%=1
+IF layout_mode%=2 THEN layout_tick_info%=1
+sort_tick_name%=0:sort_tick_type%=0:sort_tick_size%=0:sort_tick_date%=0
+IF sort_mode%=0 THEN sort_tick_name%=1
+IF sort_mode%=1 THEN sort_tick_type%=1
+IF sort_mode%=2 THEN sort_tick_size%=1
+IF sort_mode%=3 THEN sort_tick_date%=1
+PROCmenu_row(display_menu%,0,menu_label_large%,12,-1,layout_tick_large%,0)
+PROCmenu_row(display_menu%,1,menu_label_small%,12,-1,layout_tick_small%,0)
+PROCmenu_row(display_menu%,2,menu_label_info%,10,-1,layout_tick_info% OR 2,0)
+PROCmenu_row(display_menu%,3,menu_label_sortname%,13,-1,sort_tick_name%,0)
+PROCmenu_row(display_menu%,4,menu_label_sorttype%,13,-1,sort_tick_type%,0)
+PROCmenu_row(display_menu%,5,menu_label_sortsize%,13,-1,sort_tick_size%,0)
+PROCmenu_row(display_menu%,6,menu_label_sortdate%,13,-1,128+sort_tick_date%,0)
+
+PROCmenu_row(context_menu%,0,menu_label_copy%,5,-1,0,1)
+PROCmenu_row(context_menu%,1,menu_label_rename%,7,-1,0,1)
+PROCmenu_row(context_menu%,2,menu_label_delete%,7,-1,0,1)
+PROCmenu_row(context_menu%,3,menu_label_access%,7,-1,0,1)
+PROCmenu_row(context_menu%,4,menu_label_count%,6,-1,0,1)
+PROCmenu_row(context_menu%,5,menu_label_help%,5,-1,0,1)
+PROCmenu_row(context_menu%,6,menu_label_infoitem%,5,-1,0,1)
+PROCmenu_row(context_menu%,7,menu_label_find%,5,-1,0,1)
+PROCmenu_row(context_menu%,8,menu_label_settype%,9,-1,0,1)
+PROCmenu_row(context_menu%,9,menu_label_stamp%,6,-1,128,1)
+PROCmenu_row(options_menu%,0,menu_label_confirmall%,13,-1,0,1)
+PROCmenu_row(options_menu%,1,menu_label_confirm%,16,-1,0,1)
+PROCmenu_row(options_menu%,2,menu_label_overwrite%,19,-1,0,1)
+PROCmenu_row(options_menu%,3,menu_label_verbose%,8,-1,0,1)
+PROCmenu_row(options_menu%,4,menu_label_force%,6,-1,0,1)
+PROCmenu_row(options_menu%,5,menu_label_faster%,7,-1,128,1)
+PROCmenu_row(newdir_menu%,0,menu_label_create%,12,-1,128,1)
+ENDPROC
+
+DEF PROCopenmenu
+menu_view_slot%=view_slot%
+IF menu_open%=1 THEN PROCclosemenu
+clicked_item%=-1
+FOR slot%=0 TO shown%-1
+  scratch%=icon_handles%+slot%*4
+  IF clicked_icon%=!scratch% THEN
+    scratch%=entry_items%+slot%*4
+    clicked_item%=!scratch%
+  ENDIF
+NEXT
+context_item%=-1:context_kind%=0
+PROCcount_selection
+IF all_selected%=1 AND selected_count%>0 THEN context_kind%=9
+IF all_selected%=0 AND selected_count%>1 THEN context_kind%=9
+IF selected_count%=1 THEN context_item%=selected_item%
+IF selected_count%=0 AND clicked_item%>=0 THEN context_item%=clicked_item%
+IF context_item%>=0 THEN
+  $directory_buffer%=directory$
+  SYS "Acorn_Desktop",1,directory_buffer%,context_item%,entry_buffer%,256 TO context_entry_kind%,context_filetype%,context_size%
+  entry%=entry_buffer%:PROCreadname
+  context$=entry$
+  IF context_entry_kind%=2 THEN context$="Dir "+context$
+  IF context_entry_kind%=1 OR context_entry_kind%=3 OR context_entry_kind%=4 THEN context$="File "+context$
+  context$=LEFT$(context$,255)
+  $menu_label_context%=context$
+  IF selected_count%=0 THEN context_kind%=context_entry_kind%
+ENDIF
+IF context_kind%=9 THEN context$="Selection":$menu_label_context%=context$
+IF context_item%<0 AND context_kind%<>9 THEN context$="File "+CHR$(34)+CHR$(34):$menu_label_context%=context$:context_kind%=0
+menu_x%=!(event%):menu_y%=!(event%+4)
+PROCbuildmenu
+SYS "Wimp_CreateMenu",,filer_menus%,menu_x%,menu_y%
+menu_open%=1
+ENDPROC
+
+DEF PROCclosemenu
+IF menu_open%=1 THEN
+  SYS "Wimp_CreateMenu",,-1
+  menu_open%=0
+ENDIF
+ENDPROC
+
+DEF PROCmake_icon(label$,x0%,y0%,x1%,y1%,flags%,sprite_name$,slot%,art%)
+$sprval%=""
+IF sprite_name$<>"" THEN $sprval%="S"+sprite_name$
+!icon_definition%=window%
+!(icon_definition%+4)=x0%:!(icon_definition%+8)=y0%
+!(icon_definition%+12)=x1%:!(icon_definition%+16)=y1%
+!(icon_definition%+20)=flags%
+IF sprite_name$<>"" THEN
+  scratch%=icon_text%+slot%*256
+  !(icon_definition%+24)=scratch%
+  $scratch%=label$
+  !(icon_definition%+28)=sprval%
+  !(icon_definition%+32)=256
+ENDIF
+IF sprite_name$="" AND label$<>"" THEN
+  scratch%=icon_text%+slot%*256
+  !(icon_definition%+24)=scratch%
+  $scratch%=label$
+  !(icon_definition%+28)=sprval%
+  !(icon_definition%+32)=256
+ENDIF
+IF sprite_name$="" AND label$="" AND (flags% AND &100)<>0 THEN
+  scratch%=icon_text%+slot%*256
+  !(icon_definition%+24)=scratch%
+  !(icon_definition%+28)=0
+  !(icon_definition%+32)=256
+ENDIF
+IF sprite_name$<>"" THEN
+  image%=document_image%
+  IF art%=1 THEN image%=folder_image%
+  IF art%=2 OR art%=3 THEN PROCstyle_document(image%,art%)
+  !(icon_definition%+36)=1
+  !(icon_definition%+40)=image%
+  !(icon_definition%+44)=56
+  !(icon_definition%+48)=56
+  !(icon_definition%+52)=2
+  SYS "Wimp_CreateIconEx",,icon_definition% TO icon_handle%
+ENDIF
+IF sprite_name$="" THEN
+  SYS "Wimp_CreateIcon",,icon_definition% TO icon_handle%
+ENDIF
+scratch%=icon_handles%+icon_count%*4
+!scratch%=icon_handle%
+icon_count%+=1
+ENDPROC
+
+DEF PROCmake_filer_images
+PROCclear_icon_image(folder_image%)
+PROCclear_icon_image(document_image%)
+
+REM Fill only the folder silhouette so selection can invert the whole shape.
+FOR y%=22 TO 41
+  FOR x%=12 TO 44
+    PROCpixel(folder_image%,x%,y%,232,234,231,255)
+  NEXT
+NEXT
+
+FOR y%=17 TO 21
+  FOR x%=12 TO 22
+    PROCpixel(folder_image%,x%,y%,232,234,231,255)
+  NEXT
+NEXT
+REM Simple outline folder with a quiet, opaque interior.
+FOR y%=14 TO 44
+  FOR x%=9 TO 11
+    PROCpixel(folder_image%,x%,y%,30,30,30,255)
+  NEXT
+NEXT
+FOR y%=42 TO 44
+  FOR x%=9 TO 47
+    PROCpixel(folder_image%,x%,y%,30,30,30,255)
+  NEXT
+NEXT
+FOR y%=19 TO 44
+  FOR x%=45 TO 47
+    PROCpixel(folder_image%,x%,y%,30,30,30,255)
+  NEXT
+NEXT
+FOR y%=14 TO 16
+  FOR x%=9 TO 23
+    PROCpixel(folder_image%,x%,y%,30,30,30,255)
+  NEXT
+NEXT
+FOR step%=0 TO 5
+  FOR weight%=0 TO 2
+    PROCpixel(folder_image%,22+step%,14+step%+weight%,30,30,30,255)
+  NEXT
+NEXT
+FOR y%=19 TO 21
+  FOR x%=27 TO 47
+    PROCpixel(folder_image%,x%,y%,30,30,30,255)
+  NEXT
+NEXT
+
+REM Light paper interior stays within the page outline; transparent exterior
+REM lets the selected-state renderer invert the silhouette without a tile.
+FOR y%=11 TO 44
+  FOR x%=15 TO 42
+    PROCpixel(document_image%,x%,y%,240,241,238,255)
+  NEXT
+NEXT
+
+REM Document with the same dark outline and three readable text rules.
+FOR y%=8 TO 47
+  FOR x%=12 TO 45
+    edge%=0
+    IF x%<15 OR x%>42 OR y%<11 OR y%>44 THEN edge%=1
+    IF edge%=1 THEN PROCpixel(document_image%,x%,y%,30,30,30,255)
+  NEXT
+NEXT
+FOR row%=0 TO 2
+  FOR y%=17+row%*8 TO 19+row%*8
+    FOR x%=21 TO 36
+      PROCpixel(document_image%,x%,y%,30,30,30,255)
+    NEXT
+  NEXT
+NEXT
+ENDPROC
+
+DEF PROCstyle_document(image%,art%)
+REM Retain a small blue program marker; text documents keep neutral paper.
+FOR y%=38 TO 41
+  FOR x%=21 TO 36
+    PROCpixel(image%,x%,y%,240,241,238,255)
+    IF art%=2 THEN PROCpixel(image%,x%,y%,65,106,228,255)
+  NEXT
+NEXT
+ENDPROC
+
+DEF PROCclear_icon_image(image%)
+FOR pixel_y%=0 TO 55
+  FOR pixel_x%=0 TO 55
+    pixel_at%=image%+(pixel_y%*56+pixel_x%)*4
+    ?pixel_at%=0:?(pixel_at%+1)=0:?(pixel_at%+2)=0:?(pixel_at%+3)=0
+  NEXT
+NEXT
+ENDPROC
+
+DEF PROCpixel(image%,x%,y%,red%,green%,blue%,alpha%)
+pixel_at%=image%+(y%*56+x%)*4
+?pixel_at%=red%:?(pixel_at%+1)=green%:?(pixel_at%+2)=blue%:?(pixel_at%+3)=alpha%
+ENDPROC
+
+DEF PROCclick
+buttons%=!(event%+8)
+clicked_icon%=!(event%+16)
+IF (buttons% AND 2)<>0 THEN PROCopenmenu
+IF (buttons% AND 2)=0 THEN
+  IF clicked_icon%=-1 AND (buttons%=4 OR buttons%=1024) THEN PROCclear_selection
+  IF clicked_icon%>=0 THEN PROCentry_click
+ENDIF
+ENDPROC
+
+DEF PROCmenuselection
+PROCcount_selection
+!pointer_info%=0
+SYS "Wimp_GetPointerInfo",,pointer_info%
+menu_buttons%=!(pointer_info%+8)
+menu_root%=!event%
+menu_child%=!(event%+4)
+menu_open%=0
+menu_action%=0
+IF menu_root%=0 THEN
+  IF menu_child%=0 THEN layout_mode%=0:menu_action%=1
+  IF menu_child%=1 THEN layout_mode%=1:menu_action%=1
+  IF menu_child%=2 THEN layout_mode%=2:menu_action%=1
+  IF menu_child%=3 THEN sort_mode%=0:menu_action%=2
+  IF menu_child%=4 THEN sort_mode%=1:menu_action%=2
+  IF menu_child%=5 THEN sort_mode%=2:menu_action%=2
+  IF menu_child%=6 THEN sort_mode%=3:menu_action%=2
+ENDIF
+IF menu_root%=1 AND menu_child%=0 AND context_item%>=0 AND context_kind%<>9 AND context_kind%<>4 THEN
+  menu_action%=0
+ENDIF
+IF menu_root%=2 THEN PROCselectall:menu_action%=4
+IF menu_root%=3 THEN PROCclear_selection:menu_action%=4
+IF menu_root%=6 AND directory$<>"$" THEN replace_source%=menu_buttons% AND 1:PROCparent:menu_action%=3
+IF menu_action%=1 OR menu_action%=2 THEN
+  filerpage%=0
+  PROCshow
+ENDIF
+IF (menu_buttons% AND 1)<>0 THEN
+  PROCbuildmenu
+  SYS "Wimp_CreateMenu",,filer_menus%,menu_x%,menu_y%
+  menu_open%=1
+ENDIF
+ENDPROC
+
+DEF PROCkey
+pressed_code%=!(event%+24)
+IF pressed_code%=27 THEN PROCclosemenu
+IF pressed_code%=8 THEN replace_source%=0:PROCparent
+IF pressed_code%=91 THEN PROCprevious
+IF pressed_code%=93 THEN PROCadvance_page
+IF pressed_code%=13 THEN replace_source%=0:PROCclosemenu:PROCactivateselected
+ENDPROC
+
+DEF PROCactivateselected
+PROCcount_selection
+IF selected_item%>=0 THEN index%=selected_item%:PROCactivate
+ENDPROC
+
+DEF PROCentry_click
+slot_found%=-1
+FOR slot%=0 TO shown%-1
+  icon_index%=slot%
+  scratch%=icon_handles%+icon_index%*4
+  IF clicked_icon%=!scratch% THEN slot_found%=slot%
+NEXT
+IF slot_found%>=0 AND slot_found%<shown% THEN
+  scratch%=entry_items%+slot_found%*4
+  index%=!scratch%
+  activate%=0
+  PROCcount_selection
+  IF buttons%=4 OR buttons%=1 THEN activate%=1
+  IF activate%=1 THEN replace_source%=buttons% AND 1:PROCactivate
+  IF activate%=0 THEN
+    IF buttons%=1 OR buttons%=256 THEN PROCtoggle_selection(index%) ELSE PROCselect_one(index%)
+  ENDIF
+ENDIF
+ENDPROC
+
+DEF PROCparent
+last_separator%=0
+position%=2
+REPEAT
+  separator%=INSTR(directory$,".",position%)
+  IF separator%>0 THEN last_separator%=separator%
+  IF separator%>0 THEN position%=separator%+1
+UNTIL separator%=0
+IF last_separator%>0 THEN target_directory$=LEFT$(directory$,last_separator%-1):PROCvisit
+ENDPROC
+
+DEF PROCprevious
+IF filerpage%>0 THEN filerpage%=filerpage%-1
+PROCshow
+ENDPROC
+
+DEF PROCadvance_page
+IF shown%=56 THEN filerpage%+=1:PROCshow
+ENDPROC
+
+DEF PROCcount_catalogue
+IF catalogue_directory$<>directory$ OR catalogue_count%<0 THEN
+catalogue_directory$=directory$
+catalogue_count%=0
+$directory_buffer%=directory$
+scan_item%=0
+REPEAT
+  SYS "Acorn_Desktop",1,directory_buffer%,scan_item%,entry_buffer%,256 TO scan_kind%,scan_type%,scan_size%
+  IF scan_kind%<>0 THEN catalogue_count%+=1
+  scan_item%+=1
+UNTIL scan_kind%=0 OR scan_item%>=65535
+ENDIF
+ENDPROC
+
+DEF PROCcount_selection
+selected_count%=0:selected_item%=-1
+FOR count_index%=0 TO catalogue_count%-1
+  IF ?(selected_map%+count_index%)<>0 THEN
+    selected_count%+=1
+    IF selected_item%<0 THEN selected_item%=count_index%
+  ENDIF
+NEXT
+all_selected%=0
+IF selected_count%>0 AND selected_count%=catalogue_count% THEN all_selected%=1
+ENDPROC
+
+DEF PROCselectall
+PROCcount_catalogue
+FOR select_index%=0 TO catalogue_count%-1
+  ?(selected_map%+select_index%)=1
+NEXT
+PROCcount_selection
+PROCrefresh_visible_selection
+ENDPROC
+
+DEF PROCclear_selection
+FOR select_index%=0 TO catalogue_count%-1
+  ?(selected_map%+select_index%)=0
+NEXT
+PROCcount_selection
+PROCrefresh_visible_selection
+ENDPROC
+
+DEF PROCselect_one(item%)
+FOR select_index%=0 TO catalogue_count%-1
+  ?(selected_map%+select_index%)=0
+NEXT
+?(selected_map%+item%)=1
+PROCcount_selection
+PROCrefresh_visible_selection
+ENDPROC
+
+DEF PROCtoggle_selection(item%)
+?(selected_map%+item%)=1-?(selected_map%+item%)
+PROCcount_selection
+PROCrefresh_visible_selection
+ENDPROC
+
+DEF FNis_selected(item%)
+=?(selected_map%+item%)
+
+DEF PROCrefresh_visible_selection
+FOR select_slot%=0 TO shown%-1
+  item_slot%=entry_items%+select_slot%*4
+  selected_icon_slot%=icon_handles%+select_slot%*4
+  select_state%=FNis_selected(!item_slot%)
+  !selection%=window%:!(selection%+4)=!selected_icon_slot%
+  !(selection%+8)=0:!(selection%+12)=&200000
+  IF select_state%<>0 THEN !(selection%+8)=&200000
+  SYS "Wimp_SetIconState",,selection%
+NEXT
+ENDPROC
+
+DEF PROCreadname
+entry$=""
+position%=0
+REPEAT
+  character%=?(entry%+position%)
+  IF character%<>0 THEN entry$+=CHR$(character%)
+  position%+=1
+UNTIL character%=0 OR position%>=255
+ENDPROC
+
+DEF PROCactivate
+$directory_buffer%=directory$
+SYS "Acorn_Desktop",1,directory_buffer%,index%,entry_buffer%,256 TO kind%,filetype%
+activation_kind%=kind%
+IF activation_kind%=0 THEN PROCshow
+entry%=entry_buffer%
+PROCreadname
+IF activation_kind%=2 THEN
+  target_directory$=directory$+"."+entry$
+  PROCvisit
+ENDIF
+IF activation_kind%=1 OR activation_kind%=3 THEN
+  $command%="BASIC "+directory$+"."+entry$
+  SYS "Wimp_StartTask",command% TO child_task%
+ENDIF
+ENDPROC
+
+
+REM Bounded whole-catalogue sort helpers for Filer.bas64.
+REM ABI: caller has allocated at least 1120 bytes at SORT_PAGE% and has set
+REM DIRECTORY$, SORT_MODE% (0 name, 1 type, 2 size, 3 date), FILERPAGE%,
+REM CATALOGUE_COUNT%. PROCbuild_sort_page returns SHOWN% entries in
+REM SORT_PAGE%+slot*20: catalogue index, kind, filetype, size, Unix mtime.
+REM Catalogue indexes remain stable and are the only selection/hit-test IDs.
+REM Type/size put files before directories; date sorts all dated objects.
+REM Source enumeration is already case-insensitive name order, so name sort
+REM and all non-primary ties use the original index as the deterministic key.
+
+DEF PROCbuild_sort_page
+PROCcount_catalogue
+shown%=0
+IF sort_mode%=0 THEN PROCsort_name_page
+IF sort_mode%<>0 THEN PROCsort_other_page
+ENDPROC
+
+DEF PROCsort_name_page
+sort_start%=filerpage%*56
+FOR sort_slot%=0 TO 55
+  sort_fetch_item%=sort_start%+sort_slot%
+  IF sort_fetch_item%<catalogue_count% THEN
+    PROCsort_fetch
+    IF sort_candidate_kind%<>0 THEN
+      sort_dest%=sort_page%+shown%*20
+      !sort_dest%=sort_candidate_item%
+      !(sort_dest%+4)=sort_candidate_kind%
+      !(sort_dest%+8)=sort_candidate_type%
+      !(sort_dest%+12)=sort_candidate_size%
+      !(sort_dest%+16)=sort_candidate_date%
+      shown%+=1
+    ENDIF
+  ENDIF
+NEXT
+ENDPROC
+
+DEF PROCsort_other_page
+sort_cursor_item%=-1
+sort_more_pages%=1
+FOR sort_page_step%=0 TO filerpage%
+  IF sort_more_pages%=1 THEN
+    PROCsort_collect_page
+    IF sort_found%=0 THEN
+      sort_more_pages%=0
+      shown%=0
+    ENDIF
+    IF sort_found%>0 THEN
+      IF sort_page_step%<filerpage% THEN
+        IF sort_found%<56 THEN
+          sort_more_pages%=0
+          shown%=0
+        ENDIF
+        IF sort_more_pages%=1 THEN
+          sort_last_record%=sort_page%+(sort_found%-1)*20
+          sort_cursor_item%=!sort_last_record%
+        ENDIF
+      ENDIF
+      IF sort_page_step%=filerpage% THEN shown%=sort_found%
+    ENDIF
+  ENDIF
+NEXT
+ENDPROC
+
+DEF PROCsort_collect_page
+sort_found%=0
+sort_after_kind%=0
+sort_after_type%=0
+sort_after_size%=0
+sort_after_date%=0
+IF sort_cursor_item%>=0 THEN
+  sort_fetch_item%=sort_cursor_item%
+  PROCsort_fetch
+  sort_after_kind%=sort_candidate_kind%
+  sort_after_type%=sort_candidate_type%
+  sort_after_size%=sort_candidate_size%
+  sort_after_date%=sort_candidate_date%
+ENDIF
+
+FOR sort_scan_item%=0 TO catalogue_count%-1
+  sort_fetch_item%=sort_scan_item%
+  PROCsort_fetch
+  IF sort_candidate_kind%<>0 THEN
+    sort_eligible%=0
+    IF sort_cursor_item%<0 THEN sort_eligible%=1
+    IF sort_cursor_item%>=0 THEN
+      sort_other_item%=sort_cursor_item%
+      sort_other_kind%=sort_after_kind%
+      sort_other_type%=sort_after_type%
+      sort_other_size%=sort_after_size%
+      sort_other_date%=sort_after_date%
+      PROCsort_compare
+      IF sort_order%>0 THEN sort_eligible%=1
+    ENDIF
+    IF sort_eligible%=1 THEN PROCsort_insert_candidate
+  ENDIF
+NEXT
+ENDPROC
+
+DEF PROCsort_fetch
+$directory_buffer%=directory$
+SYS "Acorn_Desktop",1,directory_buffer%,sort_fetch_item%,entry_buffer%,256 TO sort_candidate_kind%,sort_candidate_type%,sort_candidate_size%
+sort_candidate_type%=sort_candidate_type% AND &FFF
+sort_candidate_item%=sort_fetch_item%
+sort_candidate_date%=0
+IF sort_candidate_kind%<>0 THEN
+  SYS "Acorn_Desktop",3,directory_buffer%,sort_fetch_item% TO sort_date_available%,sort_candidate_date%
+  IF sort_date_available%=0 THEN sort_candidate_date%=0
+ENDIF
+ENDPROC
+
+DEF PROCsort_insert_candidate
+sort_insert_at%=sort_found%
+FOR sort_probe%=0 TO sort_found%-1
+  sort_existing_record%=sort_page%+sort_probe%*20
+  sort_other_item%=!sort_existing_record%
+  sort_other_kind%=!(sort_existing_record%+4)
+  sort_other_type%=!(sort_existing_record%+8)
+  sort_other_size%=!(sort_existing_record%+12)
+  sort_other_date%=!(sort_existing_record%+16)
+  PROCsort_compare
+  IF sort_order%<0 AND sort_insert_at%=sort_found% THEN sort_insert_at%=sort_probe%
+NEXT
+IF sort_insert_at%<56 THEN
+  IF sort_found%<56 THEN sort_found%=sort_found%+1
+  FOR sort_shift%=sort_found%-1 TO sort_insert_at%+1 STEP -1
+    sort_to%=sort_page%+sort_shift%*20
+    sort_from%=sort_to%-20
+    !sort_to%=!sort_from%
+    !(sort_to%+4)=!(sort_from%+4)
+    !(sort_to%+8)=!(sort_from%+8)
+    !(sort_to%+12)=!(sort_from%+12)
+    !(sort_to%+16)=!(sort_from%+16)
+  NEXT
+  sort_dest%=sort_page%+sort_insert_at%*20
+  !sort_dest%=sort_candidate_item%
+  !(sort_dest%+4)=sort_candidate_kind%
+  !(sort_dest%+8)=sort_candidate_type%
+  !(sort_dest%+12)=sort_candidate_size%
+  !(sort_dest%+16)=sort_candidate_date%
+ENDIF
+ENDPROC
+
+DEF PROCsort_compare
+REM Return SORT_ORDER%: -1 before, 0 equal, +1 after.
+sort_order%=0
+IF sort_mode%=1 OR sort_mode%=2 THEN
+  sort_candidate_dir%=0
+  sort_other_dir%=0
+  IF sort_candidate_kind%=2 THEN sort_candidate_dir%=1
+  IF sort_other_kind%=2 THEN sort_other_dir%=1
+  IF sort_candidate_dir%<sort_other_dir% THEN sort_order%=-1
+  IF sort_candidate_dir%>sort_other_dir% THEN sort_order%=1
+ENDIF
+IF sort_order%=0 AND sort_mode%=1 AND sort_candidate_dir%=0 THEN
+  IF sort_candidate_type%<sort_other_type% THEN sort_order%=-1
+  IF sort_candidate_type%>sort_other_type% THEN sort_order%=1
+ENDIF
+IF sort_order%=0 AND sort_mode%=2 AND sort_candidate_dir%=0 THEN
+  IF sort_candidate_size%>sort_other_size% THEN sort_order%=-1
+  IF sort_candidate_size%<sort_other_size% THEN sort_order%=1
+ENDIF
+IF sort_order%=0 AND sort_mode%=3 THEN
+  IF sort_candidate_date%>sort_other_date% THEN sort_order%=-1
+  IF sort_candidate_date%<sort_other_date% THEN sort_order%=1
+ENDIF
+IF sort_order%=0 THEN
+  IF sort_candidate_item%<sort_other_item% THEN sort_order%=-1
+  IF sort_candidate_item%>sort_other_item% THEN sort_order%=1
+ENDIF
+ENDPROC
+
+REM Each directory owns its icons, selection, paging and scroll state.
+DEF PROCsave_view
+view_record%=views%+view_slot%*128
+!(view_record%+0)=window%
+!(view_record%+4)=filerpage%
+!(view_record%+8)=shown%
+!(view_record%+12)=icon_count%
+!(view_record%+16)=selected_item%
+!(view_record%+20)=selected_icon%
+!(view_record%+24)=selected_count%
+!(view_record%+28)=all_selected%
+!(view_record%+32)=excluded_count%
+!(view_record%+36)=catalogue_count%
+!(view_record%+40)=layout_mode%
+!(view_record%+44)=sort_mode%
+!(view_record%+48)=last_view_width%
+!(view_record%+52)=last_view_height%
+!(view_record%+56)=icon_handles%
+!(view_record%+60)=icon_text%
+!(view_record%+64)=entry_items%
+!(view_record%+68)=selected_map%
+view_path%=view_paths%+view_slot%*256
+$view_path%=directory$
+?(view_path%+LEN(directory$))=0
+ENDPROC
+
+DEF PROCload_view
+view_record%=views%+view_slot%*128
+window%=!(view_record%+0)
+filerpage%=!(view_record%+4)
+shown%=!(view_record%+8)
+icon_count%=!(view_record%+12)
+selected_item%=!(view_record%+16)
+selected_icon%=!(view_record%+20)
+selected_count%=!(view_record%+24)
+all_selected%=!(view_record%+28)
+excluded_count%=!(view_record%+32)
+catalogue_count%=!(view_record%+36)
+layout_mode%=!(view_record%+40)
+sort_mode%=!(view_record%+44)
+last_view_width%=!(view_record%+48)
+last_view_height%=!(view_record%+52)
+icon_handles%=!(view_record%+56)
+icon_text%=!(view_record%+60)
+entry_items%=!(view_record%+64)
+selected_map%=!(view_record%+68)
+view_path%=view_paths%+view_slot%*256
+entry%=view_path%:PROCreadname:directory$=entry$
+shown_directory$=directory$:catalogue_directory$=directory$
+ENDPROC
+
+DEF PROCselect_view(handle%)
+PROCsave_view
+FOR find_view%=0 TO view_count%-1
+  view_record%=views%+find_view%*128
+  IF !view_record%=handle% THEN view_slot%=find_view%
+NEXT
+PROCload_view
+ENDPROC
+
+DEF PROCvisit
+IF LEN(target_directory$)>255 THEN ENDPROC
+PROCclosemenu
+PROCsave_view
+source_window%=window%
+!window_state%=window%
+SYS "Wimp_GetWindowState",,window_state%
+source_left%=!(window_state%+4):source_top%=!(window_state%+16)
+source_width%=!(window_state%+12)-source_left%
+source_height%=source_top%-!(window_state%+8)
+target_slot%=-1
+FOR find_view%=0 TO view_count%-1
+  view_path%=view_paths%+find_view%*256
+  entry%=view_path%:PROCreadname
+  IF entry$=target_directory$ THEN target_slot%=find_view%
+NEXT
+new_view%=0
+IF target_slot%<0 AND view_count%<64 THEN
+  new_view%=1
+  view_slot%=view_count%:view_count%+=1
+  directory$=target_directory$
+  DIM icon_handles% 255
+  DIM icon_text% 16383
+  DIM entry_items% 223
+  DIM selected_map% 65535
+  DIM view_title% 511
+  $view_title%="HostFS:"+directory$
+  !(definition%+56)=257
+  !(definition%+72)=view_title%:!(definition%+76)=0:!(definition%+80)=512
+  SYS "Wimp_CreateWindow",,definition% TO window%
+  filerpage%=0:shown%=0:icon_count%=0
+  selected_count%=0:selected_item%=-1:all_selected%=0
+  catalogue_count%=-1:catalogue_directory$="":shown_directory$=""
+  last_view_width%=0:last_view_height%=0
+  target_slot%=view_slot%
+  IF replace_source%=0 THEN source_left%+=32:source_top%=source_top%-32
+  IF source_left%+source_width%>1500 THEN source_left%=22
+  IF source_top%-source_height%<150 THEN source_top%=1128
+  !open%=window%:!(open%+4)=source_left%:!(open%+8)=source_top%-source_height%
+  !(open%+12)=source_left%+source_width%:!(open%+16)=source_top%
+  !(open%+20)=0:!(open%+24)=0:!(open%+28)=-1
+  SYS "Wimp_OpenWindow",,open%
+  PROCshow
+  PROCsave_view
+ENDIF
+IF new_view%=0 THEN
+  IF target_slot%>=0 THEN
+    view_slot%=target_slot%:PROCload_view
+    !window_state%=window%
+    SYS "Wimp_GetWindowState",,window_state%
+    IF replace_source%<>0 THEN
+      target_height%=!(window_state%+16)-!(window_state%+8)
+      target_width%=!(window_state%+12)-!(window_state%+4)
+      !(window_state%+4)=source_left%:!(window_state%+12)=source_left%+target_width%
+      !(window_state%+16)=source_top%:!(window_state%+8)=source_top%-target_height%
+    ENDIF
+    !(window_state%+28)=-1
+    SYS "Wimp_OpenWindow",,window_state%
+  ENDIF
+ENDIF
+IF target_slot%>=0 AND replace_source%<>0 AND source_window%<>window% THEN
+  !delete_icon%=source_window%
+  SYS "Wimp_CloseWindow",,delete_icon%
+ENDIF
+replace_source%=0
+ENDPROC

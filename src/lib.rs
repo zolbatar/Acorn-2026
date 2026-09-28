@@ -1,6 +1,7 @@
 pub mod basic64;
 pub mod basic_compat;
 pub(crate) mod configure;
+mod desktop_scene;
 pub mod error;
 pub mod filesystem;
 pub mod font;
@@ -14,5 +15,6 @@ pub mod runtime;
 pub mod snapshot;
 pub mod swi;
 pub mod tokenized_basic;
+mod vello_backend;
 pub mod wimp;
 pub mod window;

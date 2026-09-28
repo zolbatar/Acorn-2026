@@ -19,6 +19,8 @@ pub const VOLUME_DESCRIPTOR: &str = ".acorn-volume";
 pub const METADATA_SUFFIX: &str = ".acornmeta";
 pub const FILETYPE_TEXT: u32 = 0xFFF;
 pub const FILETYPE_BASIC: u32 = 0xFFB;
+/// Acorn-2026 local user-range type for UTF-8 BASIC64 source.
+pub const FILETYPE_BASIC64: u32 = 0x064;
 
 const METADATA_MAGIC: &str = "Acorn-2026 file metadata v1";
 const VOLUME_MAGIC: &str = "Acorn-2026 folder volume v1";

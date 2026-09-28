@@ -2,16 +2,25 @@
 
 use crate::{
     font::bbc_micro_glyph,
-    graphics::{GraphicsPrimitive, GraphicsSnapshot, GraphicsWindow, Point, graphics_colour},
-    riscos_resources::{RiscOsSprite, RiscOsSpriteFile, SpriteSet, system_bitmap_font},
+    graphics::{
+        GraphicsPrimitive, GraphicsSnapshot, GraphicsWindow, Point, graphics_colour,
+        logical_rect_pixels,
+    },
+    riscos_font::NativeRasterFont,
+    riscos_resources::{FontName, RiscOsSprite, RiscOsSpriteFile, SpriteSet, builtin_sprite_set},
     wimp::{
-        DESKTOP_HEIGHT, DESKTOP_OS_UNITS_PER_PIXEL_X, DESKTOP_OS_UNITS_PER_PIXEL_Y,
-        DESKTOP_PIXEL_HEIGHT, DESKTOP_PIXEL_WIDTH, DesktopRect, DesktopWindow,
-        VerticalScrollbarLayout, WindowFurnitureLayout, WorkArea,
+        DESKTOP_HEIGHT, DESKTOP_ICONBAR_HEIGHT, DESKTOP_OS_UNITS_PER_PIXEL_X,
+        DESKTOP_OS_UNITS_PER_PIXEL_Y, DESKTOP_PIXEL_HEIGHT, DESKTOP_PIXEL_WIDTH, DesktopIcon,
+        DesktopIconImage, DesktopMenu, DesktopRect, DesktopWindow, DesktopWindowIcon, FRAME_BORDER,
+        ICONBAR_SYSTEM_AREA_OS, MENU_SEPARATOR_HEIGHT, VerticalScrollbarLayout,
+        WindowFurnitureLayout, WorkArea,
     },
 };
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{collections::HashMap, sync::OnceLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 pub const SCREEN_WIDTH: u32 = 640;
 pub const SCREEN_HEIGHT: u32 = 256;
@@ -35,6 +44,22 @@ pub fn render(snapshot: &GraphicsSnapshot, frame: &mut [u8]) {
 
         for primitive in &snapshot.primitives {
             match primitive {
+                GraphicsPrimitive::ClearRectangle {
+                    bounds,
+                    logical_colour,
+                } => {
+                    let (left, top, right, bottom) = logical_rect_pixels(*bounds, snapshot);
+                    fill_rect(
+                        frame,
+                        width,
+                        height,
+                        left as i32,
+                        top as i32,
+                        right as i32,
+                        bottom as i32,
+                        colour(*logical_colour, snapshot),
+                    );
+                }
                 GraphicsPrimitive::Line {
                     from,
                     to,
@@ -81,74 +106,23 @@ pub fn render(snapshot: &GraphicsSnapshot, frame: &mut [u8]) {
     draw_cursor(snapshot, frame, width, height);
 }
 
-/// Render an application snapshot in the desktop text profile. Graphics and
-/// pixel colours are unchanged; only the glyph source differs from the BBC
-/// compatibility framebuffer above.
+/// Render guest content without altering its classic text or graphics profile.
 pub fn render_desktop_content(snapshot: &GraphicsSnapshot, frame: &mut [u8]) {
-    let width = snapshot.mode.pixel_width;
-    let height = snapshot.mode.pixel_height;
-    let expected_size = width as usize * height as usize * BYTES_PER_PIXEL;
-    if frame.len() < expected_size {
-        return;
-    }
-
-    if let Some(surface) = &snapshot.raster_surface {
-        surface.copy_to(&mut frame[..expected_size]);
-    } else {
-        for pixel in frame[..expected_size].chunks_exact_mut(BYTES_PER_PIXEL) {
-            pixel.copy_from_slice(&[0, 0, 0, 0xFF]);
-        }
-        for primitive in &snapshot.primitives {
-            match primitive {
-                GraphicsPrimitive::Line {
-                    from,
-                    to,
-                    logical_colour,
-                    clip,
-                    ..
-                } => {
-                    if let Some((from, to)) = clip_line(*from, *to, *clip, snapshot) {
-                        draw_line(
-                            frame,
-                            width,
-                            height,
-                            screen_point(from, snapshot),
-                            screen_point(to, snapshot),
-                            colour(*logical_colour, snapshot),
-                        );
-                    }
-                }
-                GraphicsPrimitive::Point {
-                    at,
-                    logical_colour,
-                    clip,
-                    ..
-                } => {
-                    if inside(*at, *clip, snapshot) {
-                        let (x, y) = screen_point(*at, snapshot);
-                        set_pixel(
-                            frame,
-                            width,
-                            height,
-                            x,
-                            y,
-                            colour(*logical_colour, snapshot),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    draw_desktop_text(snapshot, frame, width, height);
+    // Guest VDU output has identical bitmap glyphs, palette and MODE semantics
+    // in a Wimp window and fullscreen. Only the host furniture uses UI fonts.
+    render(snapshot, frame);
 }
 
-/// Render the hosted two-task Wimp desktop. Application contents use the
-/// first-slice task-output adapter documented in the design brief; the window
-/// manager still owns all frame, stacking and input routing.
+/// Render the hosted Wimp desktop. Each guest Wimp window has its own
+/// compatibility content snapshot; only host-created BASIC output windows
+/// display the task-default destination.
 pub fn render_desktop(
     windows: &[DesktopWindow],
-    scenes: &HashMap<u64, GraphicsSnapshot>,
+    scenes: &HashMap<(u64, Option<u32>), GraphicsSnapshot>,
+    icons: &[DesktopIcon],
+    window_icons: &[DesktopWindowIcon],
+    menus: &[DesktopMenu],
+    notice: Option<&str>,
     frame: &mut [u8],
 ) {
     let width = DESKTOP_PIXEL_WIDTH;
@@ -157,27 +131,565 @@ pub fn render_desktop(
     if frame.len() < bytes {
         return;
     }
-    for (index, pixel) in frame[..bytes].chunks_exact_mut(BYTES_PER_PIXEL).enumerate() {
-        // RISC OS 3's neutral desktop grey, with a restrained two-tone
-        // texture instead of a modern saturated wallpaper.
-        let shade = if (index % width as usize + index / width as usize) % 8 == 0 {
-            194
-        } else {
-            190
-        };
-        pixel.copy_from_slice(&[shade, shade, shade, 255]);
-    }
+    draw_desktop_background(frame);
 
     // `windows` is front-to-back; paint from the back towards the front.
     for window in windows.iter().rev() {
-        draw_guest_window(window, scenes.get(&window.owner_task_id), frame);
+        draw_guest_window(
+            window,
+            scenes
+                .get(&(window.owner_task_id, Some(window.handle)))
+                .or_else(|| {
+                    window
+                        .is_console_output
+                        .then(|| scenes.get(&(window.owner_task_id, None)))
+                        .flatten()
+                }),
+            window_icons,
+            frame,
+        );
+    }
+    let frontmost_task = windows.first().map(|window| window.owner_task_id);
+    draw_icon_bar(icons, frontmost_task, frame);
+    if let Some(notice) = notice {
+        draw_desktop_notice(notice, frame);
+    }
+    // Menu snapshots run from root to deepest child; children paint on top.
+    for menu in menus {
+        draw_menu(frame, menu);
     }
 }
 
-fn draw_guest_window(window: &DesktopWindow, scene: Option<&GraphicsSnapshot>, frame: &mut [u8]) {
+fn menu_colour(index: u8) -> [u8; 4] {
+    const PALETTE: [[u8; 3]; 16] = [
+        [255, 255, 255],
+        [221, 221, 221],
+        [187, 187, 187],
+        [153, 153, 153],
+        [119, 119, 119],
+        [85, 85, 85],
+        [51, 51, 51],
+        [0, 0, 0],
+        [0, 68, 153],
+        [238, 238, 0],
+        [0, 204, 0],
+        [221, 0, 0],
+        [238, 238, 187],
+        [85, 136, 0],
+        [255, 187, 0],
+        [0, 187, 255],
+    ];
+    let [r, g, b] = PALETTE[(index & 15) as usize];
+    [r, g, b, 255]
+}
+
+fn draw_menu(frame: &mut [u8], menu: &DesktopMenu) {
+    let bounds = to_pixel_rect(menu.bounds);
+    let ink = menu_colour(menu.work_foreground);
+    let paper = menu_colour(menu.work_background);
+    let fill = |frame: &mut [u8], rect: PixelRect, color| {
+        fill_rect(
+            frame,
+            DESKTOP_PIXEL_WIDTH,
+            DESKTOP_PIXEL_HEIGHT,
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+            color,
+        );
+    };
+    fill(frame, bounds, paper);
+    if let Some(title) = menu.title_bounds {
+        let title = to_pixel_rect(title);
+        fill(frame, title, menu_colour(menu.title_background));
+        let width = native_ui_font(20).measure_text_px(&menu.title).round() as i32;
+        draw_outline_text(
+            frame,
+            (title.left + title.right - width) / 2,
+            (title.top + title.bottom) / 2 + 7,
+            &menu.title,
+            title,
+            20,
+            menu_colour(menu.title_foreground),
+            false,
+        );
+        fill(
+            frame,
+            PixelRect {
+                top: title.bottom - FRAME_BORDER,
+                ..title
+            },
+            [0, 0, 0, 255],
+        );
+    }
+    for item in &menu.rows {
+        let row = to_pixel_rect(item.bounds);
+        let band = PixelRect {
+            left: row.left + 24,
+            right: row.right - 24,
+            ..row
+        };
+        let selected = item.selected && !item.shaded;
+        if selected {
+            fill(frame, band, ink);
+        }
+        let text_ink = if item.shaded {
+            [136, 136, 136, 255]
+        } else if selected {
+            paper
+        } else {
+            ink
+        };
+        let text_width = native_ui_font(20).measure_text_px(&item.label).round() as i32;
+        let text_x = if menu.reverse {
+            band.right - text_width - 5
+        } else {
+            band.left + 5
+        };
+        draw_outline_text(
+            frame,
+            text_x,
+            (row.top + row.bottom) / 2 + 7,
+            &item.label,
+            band,
+            20,
+            text_ink,
+            false,
+        );
+        let center_y = (row.top + row.bottom) / 2;
+        let ornament_ink = if item.shaded {
+            [170, 170, 170, 255]
+        } else {
+            ink
+        };
+        if item.tick {
+            let x = if menu.reverse {
+                row.right - 21
+            } else {
+                row.left + 5
+            };
+            draw_control_line(
+                frame,
+                DESKTOP_PIXEL_WIDTH,
+                DESKTOP_PIXEL_HEIGHT,
+                (x, center_y),
+                (x + 5, center_y + 5),
+                ornament_ink,
+            );
+            draw_control_line(
+                frame,
+                DESKTOP_PIXEL_WIDTH,
+                DESKTOP_PIXEL_HEIGHT,
+                (x + 5, center_y + 5),
+                (x + 15, center_y - 7),
+                ornament_ink,
+            );
+        }
+        if item.has_submenu {
+            let x = if menu.reverse {
+                row.left + 16
+            } else {
+                row.right - 17
+            };
+            for offset in 0i32..9 {
+                let px = if menu.reverse { x - offset } else { x + offset };
+                fill(
+                    frame,
+                    PixelRect {
+                        left: px,
+                        right: px + 1,
+                        top: center_y - (8 - offset),
+                        bottom: center_y + (8 - offset) + 1,
+                    },
+                    ornament_ink,
+                );
+            }
+        }
+        if item.separator_after {
+            let mut x = row.left + FRAME_BORDER;
+            while x < row.right - FRAME_BORDER {
+                fill(
+                    frame,
+                    PixelRect {
+                        left: x,
+                        right: (x + 6).min(row.right - FRAME_BORDER),
+                        top: row.bottom + MENU_SEPARATOR_HEIGHT / 2 - FRAME_BORDER / 2,
+                        bottom: row.bottom + MENU_SEPARATOR_HEIGHT / 2 + FRAME_BORDER / 2,
+                    },
+                    ink,
+                );
+                x += 12;
+            }
+        }
+    }
+    draw_frame_outline(frame, bounds);
+}
+
+fn draw_icon_bar(icons: &[DesktopIcon], frontmost_task: Option<u64>, frame: &mut [u8]) {
+    let top = DESKTOP_PIXEL_HEIGHT as i32 - DESKTOP_ICONBAR_HEIGHT / DESKTOP_OS_UNITS_PER_PIXEL_Y;
+    fill_rect(
+        frame,
+        DESKTOP_PIXEL_WIDTH,
+        DESKTOP_PIXEL_HEIGHT,
+        0,
+        top,
+        DESKTOP_PIXEL_WIDTH as i32,
+        DESKTOP_PIXEL_HEIGHT as i32,
+        [224, 224, 224, 255],
+    );
+    fill_rect(
+        frame,
+        DESKTOP_PIXEL_WIDTH,
+        DESKTOP_PIXEL_HEIGHT,
+        0,
+        top,
+        DESKTOP_PIXEL_WIDTH as i32,
+        top + FRAME_BORDER,
+        [59, 59, 59, 255],
+    );
+    for icon in icons {
+        let bounds = to_pixel_rect(icon.bounds);
+        let artwork_clip = PixelRect {
+            left: bounds.left,
+            top: top + 4,
+            right: bounds.right,
+            bottom: top + 68,
+        };
+        if let Some(image) = &icon.high_resolution_image {
+            let x = bounds.left + (bounds.right - bounds.left - image.width as i32) / 2;
+            let y = top + 6 + (64 - image.height as i32) / 2;
+            draw_rgba_icon_image(frame, image, x, y, artwork_clip, false);
+        } else if icon.sprite_name.as_deref() == Some("application") {
+            draw_modern_task_icon(frame, bounds, top);
+        } else if let Some(sprite) = icon
+            .sprite_name
+            .as_deref()
+            .and_then(|name| desktop_system_sprites().get(name))
+        {
+            let sprite_width = sprite.width as i32 * 2;
+            let sprite_height = sprite.height as i32 * 2;
+            let sprite_x = bounds.left + ((bounds.right - bounds.left - sprite_width) / 2).max(0);
+            let sprite_y = top + 6 + ((64 - sprite_height) / 2).max(0);
+            draw_sprite_at_scaled(frame, sprite, sprite_x, sprite_y, 2);
+        }
+        draw_outline_text(
+            frame,
+            (bounds.left + bounds.right) / 2,
+            top + 88,
+            &icon.label,
+            PixelRect {
+                left: bounds.left + 8,
+                top: top + 68,
+                right: bounds.right - 8,
+                bottom: DESKTOP_PIXEL_HEIGHT as i32 - 6,
+            },
+            22,
+            [0, 0, 0, 255],
+            true,
+        );
+        if frontmost_task.is_some() && icon.activate_task_id == frontmost_task {
+            let center = (bounds.left + bounds.right) / 2;
+            fill_rect(
+                frame,
+                DESKTOP_PIXEL_WIDTH,
+                DESKTOP_PIXEL_HEIGHT,
+                center - 20,
+                DESKTOP_PIXEL_HEIGHT as i32 - 5,
+                center + 20,
+                DESKTOP_PIXEL_HEIGHT as i32 - 2,
+                [37, 103, 202, 255],
+            );
+        }
+    }
+
+    let control_top = top + (DESKTOP_ICONBAR_HEIGHT / DESKTOP_OS_UNITS_PER_PIXEL_Y - 48) / 2;
+    draw_system_control(
+        frame,
+        DESKTOP_PIXEL_WIDTH as i32 - ICONBAR_SYSTEM_AREA_OS,
+        control_top,
+        SystemControl::Acorn,
+    );
+}
+
+fn draw_modern_task_icon(frame: &mut [u8], bounds: PixelRect, bar_top: i32) {
+    let size = 48;
+    let left = bounds.left + (bounds.right - bounds.left - size) / 2;
+    let top = bar_top + 6 + (64 - size) / 2;
+    let tile = PixelRect {
+        left,
+        top,
+        right: left + size,
+        bottom: top + size,
+    };
+    fill_rect(
+        frame,
+        DESKTOP_PIXEL_WIDTH,
+        DESKTOP_PIXEL_HEIGHT,
+        tile.left,
+        tile.top,
+        tile.right,
+        tile.bottom,
+        [245, 245, 245, 255],
+    );
+    draw_rect_outline(frame, tile, [20, 20, 20, 255]);
+    fill_rect(
+        frame,
+        DESKTOP_PIXEL_WIDTH,
+        DESKTOP_PIXEL_HEIGHT,
+        tile.left + 8,
+        tile.top + 9,
+        tile.left + 11,
+        tile.bottom - 8,
+        [39, 102, 197, 255],
+    );
+    for (line, right) in [
+        (17, tile.right - 8),
+        (25, tile.right - 12),
+        (33, tile.right - 8),
+    ] {
+        fill_rect(
+            frame,
+            DESKTOP_PIXEL_WIDTH,
+            DESKTOP_PIXEL_HEIGHT,
+            tile.left + 18,
+            tile.top + line,
+            right,
+            tile.top + line + 2,
+            [70, 70, 70, 255],
+        );
+    }
+    fill_rect(
+        frame,
+        DESKTOP_PIXEL_WIDTH,
+        DESKTOP_PIXEL_HEIGHT,
+        tile.right - 13,
+        tile.top + 7,
+        tile.right - 7,
+        tile.top + 13,
+        [218, 176, 34, 255],
+    );
+}
+
+#[derive(Clone, Copy)]
+enum SystemControl {
+    Acorn,
+}
+
+fn draw_system_control(frame: &mut [u8], x: i32, y: i32, control: SystemControl) {
+    let bounds = PixelRect {
+        left: x,
+        top: y,
+        right: x + 48,
+        bottom: y + 48,
+    };
+    match control {
+        SystemControl::Acorn => draw_acorn(frame, bounds),
+    }
+}
+
+fn draw_acorn(frame: &mut [u8], bounds: PixelRect) {
+    let center = (bounds.left + bounds.right) / 2;
+    let ink = [48, 49, 46, 255];
+    let green = [45, 126, 66, 255];
+    let ochre = [210, 164, 51, 255];
+    // The pointed ochre nut sits above its green cap, with the short stem
+    // pointing down into the icon bar.
+    draw_acorn_profile(
+        frame,
+        center,
+        bounds.top + 4,
+        &[
+            2, 5, 7, 9, 11, 12, 13, 14, 15, 16, 16, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17,
+        ],
+        ochre,
+        ink,
+        true,
+        false,
+    );
+    draw_acorn_profile(
+        frame,
+        center,
+        bounds.top + 25,
+        &[19, 19, 19, 18, 17, 16, 14, 12, 9],
+        green,
+        ink,
+        true,
+        true,
+    );
+
+    let stem_top = bounds.top + 32;
+    let stem_bottom = bounds.top + 43;
+    fill_rect(
+        frame,
+        DESKTOP_PIXEL_WIDTH,
+        DESKTOP_PIXEL_HEIGHT,
+        center - 2,
+        stem_top,
+        center + 2,
+        stem_bottom,
+        green,
+    );
+    draw_acorn_stroke(
+        frame,
+        (center - 4, stem_top),
+        (center - 4, stem_bottom - 1),
+        ink,
+    );
+    draw_acorn_stroke(
+        frame,
+        (center + 3, stem_top),
+        (center + 3, stem_bottom - 1),
+        ink,
+    );
+    draw_acorn_stroke(
+        frame,
+        (center - 4, stem_bottom - 1),
+        (center + 3, stem_bottom - 1),
+        ink,
+    );
+}
+
+fn draw_acorn_profile(
+    frame: &mut [u8],
+    center_x: i32,
+    top: i32,
+    half_widths: &[i32],
+    fill: [u8; 4],
+    ink: [u8; 4],
+    outline_top: bool,
+    outline_bottom: bool,
+) {
+    let first = half_widths[0];
+    let last = *half_widths.last().expect("acorn profile has rows");
+    for (row, half_width) in half_widths.iter().copied().enumerate() {
+        let y = top + row as i32;
+        fill_rect(
+            frame,
+            DESKTOP_PIXEL_WIDTH,
+            DESKTOP_PIXEL_HEIGHT,
+            center_x - half_width,
+            y,
+            center_x + half_width + 1,
+            y + 1,
+            fill,
+        );
+    }
+
+    for row in 0..half_widths.len().saturating_sub(1) {
+        let y = top + row as i32;
+        let next_y = y + 1;
+        let half_width = half_widths[row];
+        let next_half_width = half_widths[row + 1];
+        draw_acorn_stroke(
+            frame,
+            (center_x - half_width, y),
+            (center_x - next_half_width, next_y),
+            ink,
+        );
+        draw_acorn_stroke(
+            frame,
+            (center_x + half_width, y),
+            (center_x + next_half_width, next_y),
+            ink,
+        );
+    }
+    if outline_top {
+        draw_acorn_stroke(frame, (center_x - first, top), (center_x + first, top), ink);
+    }
+    if outline_bottom {
+        let bottom = top + half_widths.len() as i32 - 1;
+        draw_acorn_stroke(
+            frame,
+            (center_x - last, bottom),
+            (center_x + last, bottom),
+            ink,
+        );
+    }
+}
+
+fn draw_acorn_stroke(frame: &mut [u8], from: (i32, i32), to: (i32, i32), color: [u8; 4]) {
+    for offset_y in 0..2 {
+        for offset_x in 0..2 {
+            draw_line(
+                frame,
+                DESKTOP_PIXEL_WIDTH,
+                DESKTOP_PIXEL_HEIGHT,
+                (from.0 + offset_x, from.1 + offset_y),
+                (to.0 + offset_x, to.1 + offset_y),
+                color,
+            );
+        }
+    }
+}
+
+fn draw_desktop_background(frame: &mut [u8]) {
+    let bytes = DESKTOP_PIXEL_WIDTH as usize * DESKTOP_PIXEL_HEIGHT as usize * BYTES_PER_PIXEL;
+    for pixel in frame[..bytes].chunks_exact_mut(BYTES_PER_PIXEL) {
+        pixel.copy_from_slice(&[185, 185, 187, 255]);
+    }
+}
+
+fn draw_desktop_notice(text: &str, frame: &mut [u8]) {
+    let left = 240;
+    let top = 484;
+    let bounds = PixelRect {
+        left,
+        top,
+        right: DESKTOP_PIXEL_WIDTH as i32 - left,
+        bottom: top + 216,
+    };
+    fill_rect(
+        frame,
+        DESKTOP_PIXEL_WIDTH,
+        DESKTOP_PIXEL_HEIGHT,
+        bounds.left,
+        bounds.top,
+        bounds.right,
+        bounds.bottom,
+        [238, 238, 238, 255],
+    );
+    draw_frame_outline(frame, bounds);
+    draw_outline_text(
+        frame,
+        bounds.left + 44,
+        bounds.top + 62,
+        "System message",
+        PixelRect {
+            left: bounds.left + 36,
+            top: bounds.top + 16,
+            right: bounds.right - 32,
+            bottom: bounds.top + 76,
+        },
+        32,
+        [20, 20, 20, 255],
+        false,
+    );
+    draw_outline_text(
+        frame,
+        bounds.left + 44,
+        bounds.top + 140,
+        text,
+        PixelRect {
+            left: bounds.left + 36,
+            top: bounds.top + 92,
+            right: bounds.right - 32,
+            bottom: bounds.bottom - 20,
+        },
+        28,
+        [20, 20, 20, 255],
+        false,
+    );
+}
+
+fn draw_guest_window(
+    window: &DesktopWindow,
+    scene: Option<&GraphicsSnapshot>,
+    icons: &[DesktopWindowIcon],
+    frame: &mut [u8],
+) {
     let width = DESKTOP_PIXEL_WIDTH;
     let height = DESKTOP_PIXEL_HEIGHT;
-    let sprites = desktop_sprites();
     let current = WindowFurnitureLayout::new(
         window.work_area,
         window.work_extent,
@@ -204,9 +716,16 @@ fn draw_guest_window(window: &DesktopWindow, scene: Option<&GraphicsSnapshot>, f
         outer.top,
         outer.right,
         outer.bottom,
-        [150, 150, 150, 255],
+        [228, 228, 229, 255],
     );
-    draw_bevel(frame, outer);
+    draw_frame_outline(frame, outer);
+    let work_background = if window.title.starts_with("HostFS:")
+        || window.title.to_ascii_lowercase().contains("filer")
+    {
+        [239, 239, 239, 255]
+    } else {
+        [255, 255, 255, 255]
+    };
     fill_rect(
         frame,
         width,
@@ -215,11 +734,10 @@ fn draw_guest_window(window: &DesktopWindow, scene: Option<&GraphicsSnapshot>, f
         work.top,
         work.right,
         work.bottom,
-        [211, 211, 211, 255],
+        work_background,
     );
-    draw_work_texture(frame, work);
 
-    if let Some(snapshot) = scene {
+    if let Some(snapshot) = scene.filter(|snapshot| snapshot_has_drawable_content(snapshot)) {
         draw_task_scene(
             snapshot,
             frame,
@@ -231,14 +749,31 @@ fn draw_guest_window(window: &DesktopWindow, scene: Option<&GraphicsSnapshot>, f
         );
     }
 
+    for icon in icons
+        .iter()
+        .filter(|icon| icon.window_handle == window.handle)
+    {
+        draw_window_icon(frame, work, icon);
+    }
+
     if window.has_title {
-        draw_title_bar(frame, current, window, sprites);
+        draw_title_bar(frame, current, window);
     }
     if let Some(scrollbar) = current.vertical_scrollbar {
-        draw_vertical_scrollbar(frame, scrollbar, sprites);
+        draw_vertical_scrollbar(frame, scrollbar);
     }
     if let Some(icon) = current.adjust_size_icon {
-        draw_sprite_in_cell(frame, icon, sprites.get("sicon22"));
+        fill_rect(
+            frame,
+            width,
+            height,
+            outer.left,
+            work.bottom,
+            outer.right,
+            work.bottom + FRAME_BORDER,
+            [59, 59, 59, 255],
+        );
+        draw_size_grip(frame, icon);
     }
 
     if let Some(preview) = window.preview_area {
@@ -325,6 +860,16 @@ impl PixelRect {
     fn is_empty(self) -> bool {
         self.right <= self.left || self.bottom <= self.top
     }
+
+    fn intersection(self, other: Self) -> Option<Self> {
+        let rect = Self {
+            left: self.left.max(other.left),
+            top: self.top.max(other.top),
+            right: self.right.min(other.right),
+            bottom: self.bottom.min(other.bottom),
+        };
+        (!rect.is_empty()).then_some(rect)
+    }
 }
 
 fn to_pixel_rect(rect: DesktopRect) -> PixelRect {
@@ -342,314 +887,826 @@ fn div_ceil(value: i32, divisor: i32) -> i32 {
     value.div_euclid(divisor) + i32::from(value.rem_euclid(divisor) != 0)
 }
 
-fn desktop_sprites() -> &'static RiscOsSpriteFile {
+fn desktop_system_sprites() -> &'static RiscOsSpriteFile {
     static SPRITES: OnceLock<RiscOsSpriteFile> = OnceLock::new();
     SPRITES.get_or_init(|| {
-        RiscOsSpriteFile::builtin(SpriteSet::Tools3d)
-            .expect("pinned RISC OS 3.71 Wimp sprites parse and verify")
+        builtin_sprite_set(SpriteSet::Sprites22)
+            .expect("pinned RISC OS 3.71 system sprites parse and verify")
     })
 }
 
-fn draw_bevel(frame: &mut [u8], rect: PixelRect) {
-    let width = DESKTOP_PIXEL_WIDTH;
-    let height = DESKTOP_PIXEL_HEIGHT;
+pub(crate) fn desktop_system_sprite(name: &str) -> Option<&'static RiscOsSprite> {
+    let name = if name == "file_064" { "file_ffb" } else { name };
+    desktop_system_sprites().get(name)
+}
+
+// Two backing samples equal one logical pixel at the desktop’s 2× density.
+fn draw_control_line(
+    frame: &mut [u8],
+    width: u32,
+    height: u32,
+    from: (i32, i32),
+    to: (i32, i32),
+    color: [u8; 4],
+) {
+    draw_line(frame, width, height, from, to, color);
     draw_line(
         frame,
         width,
         height,
-        (rect.left, rect.top),
-        (rect.right - 1, rect.top),
-        [250, 250, 250, 255],
-    );
-    draw_line(
-        frame,
-        width,
-        height,
-        (rect.left, rect.top),
-        (rect.left, rect.bottom - 1),
-        [250, 250, 250, 255],
-    );
-    draw_line(
-        frame,
-        width,
-        height,
-        (rect.left, rect.bottom - 1),
-        (rect.right - 1, rect.bottom - 1),
-        [82, 82, 82, 255],
-    );
-    draw_line(
-        frame,
-        width,
-        height,
-        (rect.right - 1, rect.top),
-        (rect.right - 1, rect.bottom - 1),
-        [82, 82, 82, 255],
+        (from.0 + 1, from.1),
+        (to.0 + 1, to.1),
+        color,
     );
 }
 
-fn draw_work_texture(frame: &mut [u8], rect: PixelRect) {
-    for y in rect.top.max(0)..rect.bottom.min(DESKTOP_PIXEL_HEIGHT as i32) {
-        for x in rect.left.max(0)..rect.right.min(DESKTOP_PIXEL_WIDTH as i32) {
-            if (x + y) % 4 == 0 {
-                set_pixel(
+fn draw_symbol_outline(frame: &mut [u8], rect: PixelRect, color: [u8; 4]) {
+    for inset in 0..FRAME_BORDER {
+        draw_rect_outline(
+            frame,
+            PixelRect {
+                left: rect.left + inset,
+                top: rect.top + inset,
+                right: rect.right - inset,
+                bottom: rect.bottom - inset,
+            },
+            color,
+        );
+    }
+}
+
+fn draw_frame_outline(frame: &mut [u8], rect: PixelRect) {
+    for inset in 0..FRAME_BORDER {
+        draw_rect_outline(
+            frame,
+            PixelRect {
+                left: rect.left + inset,
+                top: rect.top + inset,
+                right: rect.right - inset,
+                bottom: rect.bottom - inset,
+            },
+            [59, 59, 59, 255],
+        );
+    }
+}
+
+fn draw_rect_outline(frame: &mut [u8], rect: PixelRect, color: [u8; 4]) {
+    if rect.is_empty() {
+        return;
+    }
+    draw_line(
+        frame,
+        DESKTOP_PIXEL_WIDTH,
+        DESKTOP_PIXEL_HEIGHT,
+        (rect.left, rect.top),
+        (rect.right - 1, rect.top),
+        color,
+    );
+    draw_line(
+        frame,
+        DESKTOP_PIXEL_WIDTH,
+        DESKTOP_PIXEL_HEIGHT,
+        (rect.left, rect.top),
+        (rect.left, rect.bottom - 1),
+        color,
+    );
+    draw_line(
+        frame,
+        DESKTOP_PIXEL_WIDTH,
+        DESKTOP_PIXEL_HEIGHT,
+        (rect.left, rect.bottom - 1),
+        (rect.right - 1, rect.bottom - 1),
+        color,
+    );
+    draw_line(
+        frame,
+        DESKTOP_PIXEL_WIDTH,
+        DESKTOP_PIXEL_HEIGHT,
+        (rect.right - 1, rect.top),
+        (rect.right - 1, rect.bottom - 1),
+        color,
+    );
+}
+
+fn blend_pixel(frame: &mut [u8], x: i32, y: i32, color: [u8; 4]) {
+    if x < 0 || y < 0 || x >= DESKTOP_PIXEL_WIDTH as i32 || y >= DESKTOP_PIXEL_HEIGHT as i32 {
+        return;
+    }
+    let index = (y as usize * DESKTOP_PIXEL_WIDTH as usize + x as usize) * BYTES_PER_PIXEL;
+    let alpha = u32::from(color[3]);
+    let inverse = 255 - alpha;
+    for (channel, source) in color[..3].iter().enumerate() {
+        frame[index + channel] = ((u32::from(*source) * alpha
+            + u32::from(frame[index + channel]) * inverse
+            + 127)
+            / 255) as u8;
+    }
+    frame[index + 3] = 255;
+}
+
+fn snapshot_has_drawable_content(snapshot: &GraphicsSnapshot) -> bool {
+    snapshot.raster_surface.is_some()
+        || !snapshot.primitives.is_empty()
+        || snapshot
+            .text_cells
+            .iter()
+            .any(|character| *character != b' ')
+}
+
+// The hosted menu uses the standard Wimp greyscale colour fields. Existing
+// icons with no explicit colour word retain their modern desktop palette.
+pub(crate) fn window_icon_colours(flags: u32) -> ([u8; 4], [u8; 4]) {
+    let foreground = (flags >> 24) & 15;
+    let background = (flags >> 28) & 15;
+    let explicit_grey =
+        flags & (1 << 6) == 0 && flags >> 24 != 0 && foreground < 8 && background < 8;
+    let grey = |index: u32| {
+        let value = [255, 221, 187, 153, 119, 85, 51, 0][index as usize];
+        [value, value, value, 255]
+    };
+    let (mut ink, mut paper) = if explicit_grey {
+        (grey(foreground), grey(background))
+    } else {
+        ([20, 20, 20, 255], [248, 248, 248, 255])
+    };
+    let shaded = flags & (1 << 22) != 0;
+    if flags & (1 << 21) != 0 && !shaded {
+        if explicit_grey {
+            std::mem::swap(&mut ink, &mut paper);
+        } else {
+            ink = [255, 255, 255, 255];
+            paper = [65, 106, 228, 255];
+        }
+    }
+    if shaded {
+        for channel in 0..3 {
+            ink[channel] = ((u16::from(ink[channel]) + u16::from(paper[channel]) * 2) / 3) as u8;
+        }
+    }
+    (ink, paper)
+}
+
+fn draw_window_icon(frame: &mut [u8], work: PixelRect, icon: &DesktopWindowIcon) {
+    let bounds = to_pixel_rect(icon.bounds);
+    let Some(visible) = bounds.intersection(work) else {
+        return;
+    };
+    let selected = icon.flags & (1 << 21) != 0 && icon.flags & (1 << 22) == 0;
+    let (ink, paper) = window_icon_colours(icon.flags);
+    let filled = icon.flags & (1 << 5) != 0;
+    let pictorial = icon.high_resolution_image.is_some() || icon.sprite_name.is_some();
+    if filled || (selected && !pictorial) {
+        fill_rect(
+            frame,
+            DESKTOP_PIXEL_WIDTH,
+            DESKTOP_PIXEL_HEIGHT,
+            visible.left,
+            visible.top,
+            visible.right,
+            visible.bottom,
+            paper,
+        );
+    }
+    if icon.flags & (1 << 2) != 0 && visible == bounds {
+        draw_rect_outline(frame, bounds, [24, 24, 24, 255]);
+    }
+
+    let sprite = icon
+        .sprite_name
+        .as_deref()
+        .and_then(|name| desktop_system_sprites().get(name));
+    let horizontal = pictorial && icon.flags & (1 << 3) == 0;
+    let compact_size = (bounds.bottom - bounds.top - 8).clamp(1, 28);
+    let label_height = if icon.label.is_empty() { 0 } else { 36 };
+    if let Some(image) = &icon.high_resolution_image {
+        if horizontal {
+            draw_rgba_icon_fit(
+                frame,
+                image,
+                bounds.left + 8,
+                (bounds.top + bounds.bottom - compact_size) / 2,
+                compact_size,
+                visible,
+                selected,
+            );
+        } else {
+            let area_bottom = bounds.bottom - label_height;
+            let x = bounds.left + (bounds.right - bounds.left - image.width as i32) / 2;
+            let y = bounds.top + (area_bottom - bounds.top - image.height as i32) / 2;
+            draw_rgba_icon_image(frame, image, x, y, visible, selected);
+        }
+    } else if let Some(sprite) = sprite {
+        let area_bottom = bounds.bottom - label_height;
+        let sprite_width = sprite.width as i32 * 2;
+        let sprite_height = sprite.height as i32 * 2;
+        let x = bounds.left + ((bounds.right - bounds.left - sprite_width) / 2).max(0);
+        let y = bounds.top + ((area_bottom - bounds.top - sprite_height) / 2).max(0);
+        if selected {
+            draw_sprite_clipped_scaled(frame, sprite, x, y, visible, true, 2);
+        } else {
+            draw_sprite_clipped_scaled(frame, sprite, x, y, visible, false, 2);
+        }
+    }
+    if !icon.label.is_empty() {
+        let font = native_ui_font(20);
+        let text_width = font.measure_text_px(&icon.label).round() as i32;
+        let centered = icon.flags & (1 << 3) != 0;
+        let x = if icon.flags & (1 << 9) != 0 {
+            bounds.right - 10 - text_width
+        } else if centered {
+            bounds.left + (bounds.right - bounds.left - text_width) / 2
+        } else if horizontal {
+            bounds.left + compact_size + 16
+        } else {
+            bounds.left + 10
+        };
+        let text_only = icon.high_resolution_image.is_none() && sprite.is_none();
+        let baseline = if (text_only || horizontal) && icon.flags & (1 << 4) != 0 {
+            (bounds.top + bounds.bottom) / 2 + 7
+        } else {
+            bounds.bottom - 6
+        };
+        let label_top = baseline - 22;
+        if selected && pictorial {
+            if let Some(label) = visible.intersection(PixelRect {
+                left: x - 3,
+                top: label_top,
+                right: x + text_width + 3,
+                bottom: baseline + 5,
+            }) {
+                fill_rect(
                     frame,
                     DESKTOP_PIXEL_WIDTH,
                     DESKTOP_PIXEL_HEIGHT,
-                    x,
-                    y,
-                    [207, 207, 207, 255],
+                    label.left,
+                    label.top,
+                    label.right,
+                    label.bottom,
+                    [0, 0, 0, 255],
+                );
+            }
+        }
+        draw_outline_text(
+            frame,
+            x,
+            baseline,
+            &icon.label,
+            visible
+                .intersection(PixelRect {
+                    left: bounds.left + 1,
+                    top: label_top,
+                    right: bounds.right - 1,
+                    bottom: bounds.bottom,
+                })
+                .unwrap_or(PixelRect {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                }),
+            20,
+            ink,
+            false,
+        );
+    }
+}
+
+fn draw_title_bar(frame: &mut [u8], layout: WindowFurnitureLayout, window: &DesktopWindow) {
+    let header = DesktopRect {
+        min_x: layout.outer.min_x,
+        min_y: layout.work_area.max_y,
+        max_x: layout.outer.max_x,
+        max_y: layout.outer.max_y,
+    };
+    let band = to_pixel_rect(header);
+    if band.is_empty() {
+        return;
+    }
+    let active = window.focused;
+    let title_color = if active {
+        [239, 220, 103, 255]
+    } else {
+        [213, 213, 215, 255]
+    };
+    fill_rect(
+        frame,
+        DESKTOP_PIXEL_WIDTH,
+        DESKTOP_PIXEL_HEIGHT,
+        band.left,
+        band.top,
+        band.right,
+        band.bottom,
+        title_color,
+    );
+    draw_frame_outline(frame, band);
+
+    if let Some(icon) = layout.back_icon {
+        draw_title_control(frame, icon, TitleControl::Back, active);
+    }
+    if let Some(icon) = layout.close_icon {
+        draw_title_control(frame, icon, TitleControl::Close, active);
+    }
+    if let Some(icon) = layout.toggle_size_icon {
+        draw_title_control(frame, icon, TitleControl::Toggle(window.maximized), active);
+    }
+    if !window.title.is_empty() {
+        if let Some(title) = layout.title_bar {
+            let rect = to_pixel_rect(title);
+            let baseline = band.top + (band.bottom - band.top + 24) / 2;
+            // A one-sample emboldening keeps the original Homerton face while
+            // giving window titles the reference's stronger visual hierarchy.
+            for offset in 0..=1 {
+                draw_outline_text(
+                    frame,
+                    rect.left + 14 + offset,
+                    baseline,
+                    &window.title,
+                    rect,
+                    24,
+                    [24, 24, 24, 255],
+                    false,
                 );
             }
         }
     }
 }
 
-fn draw_title_bar(
-    frame: &mut [u8],
-    layout: WindowFurnitureLayout,
-    window: &DesktopWindow,
-    sprites: &RiscOsSpriteFile,
-) {
-    let header = DesktopRect {
-        min_x: layout.outer.min_x,
-        min_y: layout.work_area.max_y,
-        max_x: layout.outer.max_x,
-        max_y: layout.outer.max_y - 2,
+#[derive(Clone, Copy)]
+enum TitleControl {
+    Back,
+    Close,
+    Toggle(bool),
+}
+
+fn draw_title_control(frame: &mut [u8], cell: DesktopRect, control: TitleControl, _active: bool) {
+    let rect = to_pixel_rect(cell);
+    // The title band owns the perimeter; each control owns only its divider.
+    let divider = match control {
+        TitleControl::Toggle(_) => rect.left,
+        _ => rect.right - FRAME_BORDER,
     };
-    let band = to_pixel_rect(header);
-    if band.is_empty() {
-        return;
-    }
-    let inner_top = band.top + 1;
-    let inner_bottom = band.bottom - 1;
-    let inner_left = band.left + 1;
-    let inner_right = band.right - 1;
-    let middle_width = inner_right - inner_left - 4;
-    let top_height = ((inner_bottom - inner_top) / 2).max(1);
-    let bottom_height = inner_bottom - inner_top - top_height;
-    // The native title sprites use transparent pixels for their light-grey
-    // weave. Seed the strip with the Wimp's light-grey neutral so transparency
-    // does not expose the dark outer window frame below it.
     fill_rect(
         frame,
         DESKTOP_PIXEL_WIDTH,
         DESKTOP_PIXEL_HEIGHT,
-        inner_left,
-        inner_top,
-        inner_right,
-        inner_bottom,
-        [221, 221, 221, 255],
+        divider,
+        rect.top,
+        divider + FRAME_BORDER,
+        rect.bottom,
+        [59, 59, 59, 255],
     );
-    tile_sprite_region(
-        frame,
-        sprites.get("tbarmidt22"),
-        PixelRect {
-            left: inner_left + 2,
-            top: inner_top,
-            right: inner_left + 2 + middle_width,
-            bottom: inner_top + top_height,
-        },
-    );
-    tile_sprite_region(
-        frame,
-        sprites.get("tbarmidb22"),
-        PixelRect {
-            left: inner_left + 2,
-            top: inner_top + top_height,
-            right: inner_left + 2 + middle_width,
-            bottom: inner_top + top_height + bottom_height,
-        },
-    );
-    draw_sprite_at(frame, sprites.get("tbarlcap22"), inner_left, inner_top);
-    draw_sprite_at(frame, sprites.get("tbarrcap22"), inner_right - 2, inner_top);
-
-    if let Some(icon) = layout.back_icon {
-        draw_sprite_in_cell(frame, icon, sprites.get("bicon22"));
-    }
-    if let Some(icon) = layout.close_icon {
-        draw_sprite_in_cell(frame, icon, sprites.get("cicon22"));
-    }
-    if let Some(icon) = layout.toggle_size_icon {
-        let name = if window.maximized {
-            "ticon122"
-        } else {
-            "ticon22"
-        };
-        draw_sprite_in_cell(frame, icon, sprites.get(name));
-    }
-    if !window.title.is_empty() {
-        if let Some(title) = layout.title_bar {
-            let rect = to_pixel_rect(title);
-            let text_x = rect.left + 3;
-            let text_y = band.top + ((band.bottom - band.top - 16) / 2).max(0);
-            draw_system_bitmap_text(frame, text_x, text_y, &window.title, rect, window.focused);
+    let ink = [20, 20, 20, 255];
+    let center_x = (rect.left + rect.right) / 2;
+    let center_y = (rect.top + rect.bottom) / 2;
+    match control {
+        TitleControl::Close => {
+            draw_control_line(
+                frame,
+                DESKTOP_PIXEL_WIDTH,
+                DESKTOP_PIXEL_HEIGHT,
+                (center_x - 8, center_y - 8),
+                (center_x + 8, center_y + 8),
+                ink,
+            );
+            draw_control_line(
+                frame,
+                DESKTOP_PIXEL_WIDTH,
+                DESKTOP_PIXEL_HEIGHT,
+                (center_x + 8, center_y - 8),
+                (center_x - 8, center_y + 8),
+                ink,
+            );
+        }
+        TitleControl::Back => {
+            draw_symbol_outline(
+                frame,
+                PixelRect {
+                    left: center_x - 11,
+                    top: center_y - 9,
+                    right: center_x + 5,
+                    bottom: center_y + 7,
+                },
+                ink,
+            );
+            draw_symbol_outline(
+                frame,
+                PixelRect {
+                    left: center_x - 5,
+                    top: center_y - 3,
+                    right: center_x + 11,
+                    bottom: center_y + 13,
+                },
+                ink,
+            );
+        }
+        TitleControl::Toggle(maximized) => {
+            let side = 18;
+            let square = PixelRect {
+                left: center_x - side / 2,
+                top: center_y - side / 2,
+                right: center_x + side / 2 + 1,
+                bottom: center_y + side / 2 + 1,
+            };
+            draw_symbol_outline(frame, square, ink);
+            if maximized {
+                draw_control_line(
+                    frame,
+                    DESKTOP_PIXEL_WIDTH,
+                    DESKTOP_PIXEL_HEIGHT,
+                    (square.left + 6, square.top + 6),
+                    (square.right - 6, square.top + 6),
+                    ink,
+                );
+            }
         }
     }
 }
 
-fn draw_system_bitmap_text(
+fn draw_outline_text(
     frame: &mut [u8],
     x: i32,
-    y: i32,
+    baseline_y: i32,
     text: &str,
     clip: PixelRect,
-    focused: bool,
+    pixel_size: u16,
+    color: [u8; 4],
+    centered: bool,
 ) {
-    let font = system_bitmap_font();
-    let color = if focused {
-        [32, 32, 32, 255]
-    } else {
-        [72, 72, 72, 255]
-    };
-    let mut cursor_x = x;
+    let font = native_ui_font(pixel_size);
+    let measured_width = font.measure_text_px(text).round() as i32;
+    let mut pen_x = if centered { x - measured_width / 2 } else { x };
     for character in text.chars() {
-        let Ok(codepoint) = u8::try_from(u32::from(character)) else {
-            continue;
-        };
-        let Some(glyph) = font.glyph(codepoint) else {
-            cursor_x += 8;
-            continue;
-        };
-        for (row, bits) in glyph.iter().enumerate() {
-            for column in 0..8 {
-                if bits & (0x80 >> column) == 0 {
+        let glyph = font
+            .rasterize_glyph(character)
+            .or_else(|| font.rasterize_glyph('?'));
+        if let Some(glyph) = glyph {
+            let left = pen_x + glyph.bearing_x;
+            let top = baseline_y - glyph.bearing_y;
+            for row in 0..glyph.height as i32 {
+                let py = top + row;
+                if py < clip.top || py >= clip.bottom {
                     continue;
                 }
-                for dy in 0..2 {
-                    let px = cursor_x + column as i32;
-                    let py = y + row as i32 * 2 + dy;
-                    if px >= clip.left && px < clip.right && py >= clip.top && py < clip.bottom {
-                        set_pixel(
+                for column in 0..glyph.width as i32 {
+                    let px = left + column;
+                    if px < clip.left || px >= clip.right {
+                        continue;
+                    }
+                    let coverage =
+                        glyph.coverage[(row as usize * glyph.width as usize) + column as usize];
+                    if coverage > 0 {
+                        blend_glyph_pixel(
                             frame,
                             DESKTOP_PIXEL_WIDTH,
                             DESKTOP_PIXEL_HEIGHT,
                             px,
                             py,
                             color,
+                            coverage,
                         );
                     }
                 }
             }
         }
-        cursor_x += (font.advance_osu(codepoint) / DESKTOP_OS_UNITS_PER_PIXEL_X).max(1);
+        pen_x += font.advance_px(character).round() as i32;
     }
 }
 
-fn draw_vertical_scrollbar(
+fn native_ui_font(pixel_size: u16) -> Arc<NativeRasterFont> {
+    static FONTS: OnceLock<Mutex<HashMap<u16, Arc<NativeRasterFont>>>> = OnceLock::new();
+    let mut fonts = FONTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(fonts.entry(pixel_size).or_insert_with(|| {
+        Arc::new(
+            NativeRasterFont::builtin(FontName::Homerton, pixel_size)
+                .expect("pinned Homerton outline font parses and verifies"),
+        )
+    }))
+}
+
+fn blend_glyph_pixel(
     frame: &mut [u8],
-    layout: VerticalScrollbarLayout,
-    sprites: &RiscOsSpriteFile,
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    color: [u8; 4],
+    coverage: u8,
 ) {
+    if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
+        return;
+    }
+    let index = (y as usize * width as usize + x as usize) * BYTES_PER_PIXEL;
+    let alpha = u32::from(coverage) * u32::from(color[3]) / 255;
+    let inverse = 255 - alpha;
+    for (channel, source) in color[..3].iter().enumerate() {
+        frame[index + channel] = ((u32::from(*source) * alpha
+            + u32::from(frame[index + channel]) * inverse
+            + 127)
+            / 255) as u8;
+    }
+    frame[index + 3] = 255;
+}
+
+fn draw_vertical_scrollbar(frame: &mut [u8], layout: VerticalScrollbarLayout) {
     let bounds = to_pixel_rect(layout.bounds);
-    let well_left = bounds.left + ((bounds.right - bounds.left - 20) / 2).max(0);
-    tile_sprite_region(
+    fill_rect(
         frame,
-        sprites.get("vwellt22"),
-        PixelRect {
-            left: well_left,
-            top: bounds.top,
-            right: well_left + 20,
-            bottom: bounds.bottom,
-        },
+        DESKTOP_PIXEL_WIDTH,
+        DESKTOP_PIXEL_HEIGHT,
+        bounds.left,
+        bounds.top,
+        bounds.right,
+        bounds.bottom,
+        [224, 224, 224, 255],
     );
-    if let Some(sprite) = sprites.get("vwelltcap22") {
-        draw_sprite_at(
+    for arrow in [layout.up_arrow, layout.down_arrow] {
+        let arrow = to_pixel_rect(arrow);
+        fill_rect(
             frame,
-            Some(sprite),
-            bounds.left + (bounds.right - bounds.left - sprite.width as i32) / 2,
-            bounds.top,
+            DESKTOP_PIXEL_WIDTH,
+            DESKTOP_PIXEL_HEIGHT,
+            arrow.left,
+            arrow.top,
+            arrow.right,
+            arrow.bottom,
+            [232, 232, 232, 255],
+        );
+        fill_rect(
+            frame,
+            DESKTOP_PIXEL_WIDTH,
+            DESKTOP_PIXEL_HEIGHT,
+            arrow.left,
+            if arrow.top == bounds.top {
+                arrow.bottom - FRAME_BORDER
+            } else {
+                arrow.top
+            },
+            arrow.right,
+            if arrow.top == bounds.top {
+                arrow.bottom
+            } else {
+                arrow.top + FRAME_BORDER
+            },
+            [59, 59, 59, 255],
         );
     }
-    if let Some(sprite) = sprites.get("vwellbcap22") {
-        draw_sprite_at(
-            frame,
-            Some(sprite),
-            bounds.left + (bounds.right - bounds.left - sprite.width as i32) / 2,
-            bounds.bottom - sprite.height as i32,
-        );
-    }
-    draw_sprite_in_cell(frame, layout.up_arrow, sprites.get("uicon22"));
-    draw_sprite_in_cell(frame, layout.down_arrow, sprites.get("dicon22"));
-
+    fill_rect(
+        frame,
+        DESKTOP_PIXEL_WIDTH,
+        DESKTOP_PIXEL_HEIGHT,
+        bounds.left,
+        bounds.top,
+        bounds.left + FRAME_BORDER,
+        bounds.bottom,
+        [59, 59, 59, 255],
+    );
     let slider = to_pixel_rect(layout.slider);
-    let x = slider.left + ((slider.right - slider.left - 20) / 2).max(0);
-    let mut y = slider.top;
-    if let Some(sprite) = sprites.get("vbart22") {
-        draw_sprite_at(frame, Some(sprite), x, y);
-        y += sprite.height as i32;
-    }
-    if let Some(sprite) = sprites.get("vbarb22") {
-        let bottom_y = slider.bottom - sprite.height as i32;
-        if let Some(mid) = sprites.get("vbarmid22") {
-            tile_sprite_region(
-                frame,
-                Some(mid),
-                PixelRect {
-                    left: x,
-                    top: y,
-                    right: x + 20,
-                    bottom: bottom_y,
-                },
-            );
-        }
-        draw_sprite_at(frame, Some(sprite), x, bottom_y);
-    }
+    let handle = PixelRect {
+        left: slider.left + 6,
+        top: slider.top + 6,
+        right: slider.right - 6,
+        bottom: slider.bottom - 6,
+    };
+    fill_rect(
+        frame,
+        DESKTOP_PIXEL_WIDTH,
+        DESKTOP_PIXEL_HEIGHT,
+        handle.left,
+        handle.top,
+        handle.right,
+        handle.bottom,
+        [139, 139, 139, 255],
+    );
+    draw_scroll_arrow(frame, layout.up_arrow, true);
+    draw_scroll_arrow(frame, layout.down_arrow, false);
 }
 
-fn draw_sprite_in_cell(frame: &mut [u8], cell: DesktopRect, sprite: Option<&RiscOsSprite>) {
-    let Some(sprite) = sprite else {
-        return;
-    };
+fn draw_scroll_arrow(frame: &mut [u8], cell: DesktopRect, up: bool) {
     let rect = to_pixel_rect(cell);
-    let x = rect.left + ((rect.right - rect.left - sprite.width as i32) / 2).max(0);
-    let y = rect.top + ((rect.bottom - rect.top - sprite.height as i32) / 2).max(0);
-    draw_sprite_at(frame, Some(sprite), x, y);
+    let center_x = (rect.left + rect.right) / 2;
+    let center_y = (rect.top + rect.bottom) / 2;
+    let ink = [20, 20, 20, 255];
+    let (top, bottom) = if up {
+        (center_y - 4, center_y + 4)
+    } else {
+        (center_y + 4, center_y - 4)
+    };
+    draw_control_line(
+        frame,
+        DESKTOP_PIXEL_WIDTH,
+        DESKTOP_PIXEL_HEIGHT,
+        (center_x - 8, bottom),
+        (center_x, top),
+        ink,
+    );
+    draw_control_line(
+        frame,
+        DESKTOP_PIXEL_WIDTH,
+        DESKTOP_PIXEL_HEIGHT,
+        (center_x, top),
+        (center_x + 8, bottom),
+        ink,
+    );
 }
 
-fn draw_sprite_at(frame: &mut [u8], sprite: Option<&RiscOsSprite>, x: i32, y: i32) {
-    let Some(sprite) = sprite else {
-        return;
-    };
+fn draw_size_grip(frame: &mut [u8], cell: DesktopRect) {
+    let rect = to_pixel_rect(cell);
+    fill_rect(
+        frame,
+        DESKTOP_PIXEL_WIDTH,
+        DESKTOP_PIXEL_HEIGHT,
+        rect.left,
+        rect.top,
+        rect.left + FRAME_BORDER,
+        rect.bottom,
+        [59, 59, 59, 255],
+    );
+    let ink = [59, 59, 59, 255];
+    for offset in [10, 18, 26] {
+        draw_control_line(
+            frame,
+            DESKTOP_PIXEL_WIDTH,
+            DESKTOP_PIXEL_HEIGHT,
+            (rect.right - offset, rect.bottom - 4),
+            (rect.right - 4, rect.bottom - offset),
+            ink,
+        );
+    }
+}
+
+fn draw_sprite_at_scaled(frame: &mut [u8], sprite: &RiscOsSprite, x: i32, y: i32, scale: i32) {
+    let scale = scale.max(1);
     for row in 0..sprite.height as i32 {
         for column in 0..sprite.width as i32 {
             let Some(color) = sprite.pixel(column as u32, row as u32) else {
                 continue;
             };
             if color[3] != 0 {
-                set_pixel(
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        set_pixel(
+                            frame,
+                            DESKTOP_PIXEL_WIDTH,
+                            DESKTOP_PIXEL_HEIGHT,
+                            x + column * scale + dx,
+                            y + row * scale + dy,
+                            color,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn draw_sprite_clipped_scaled(
+    frame: &mut [u8],
+    sprite: &RiscOsSprite,
+    x: i32,
+    y: i32,
+    clip: PixelRect,
+    inverted: bool,
+    scale: i32,
+) {
+    let scale = scale.max(1);
+    for row in 0..sprite.height as i32 {
+        for column in 0..sprite.width as i32 {
+            let Some(color) = sprite.pixel(column as u32, row as u32) else {
+                continue;
+            };
+            if color[3] != 0 {
+                let color = if inverted {
+                    selected_sprite_colour(color)
+                } else {
+                    color
+                };
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        let px = x + column * scale + dx;
+                        let py = y + row * scale + dy;
+                        if px >= clip.left && px < clip.right && py >= clip.top && py < clip.bottom
+                        {
+                            set_pixel(
+                                frame,
+                                DESKTOP_PIXEL_WIDTH,
+                                DESKTOP_PIXEL_HEIGHT,
+                                px,
+                                py,
+                                color,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Neutral artwork reverses ink and paper. Coloured artwork retains its hue
+// with a dark selected face, as in the desktop's classic palette sprites.
+// Alpha is preserved so selecting an icon never paints its transparent margin.
+pub(crate) fn selected_sprite_colour(mut color: [u8; 4]) -> [u8; 4] {
+    let low = *color[..3].iter().min().unwrap();
+    let high = *color[..3].iter().max().unwrap();
+    if high - low < 24 {
+        for component in &mut color[..3] {
+            *component = 255 - *component;
+        }
+    } else {
+        for component in &mut color[..3] {
+            *component /= 2;
+        }
+    }
+    color
+}
+
+fn draw_rgba_icon_fit(
+    frame: &mut [u8],
+    image: &DesktopIconImage,
+    x: i32,
+    y: i32,
+    size: i32,
+    clip: PixelRect,
+    selected: bool,
+) {
+    // Average premultiplied samples when shrinking the Filer artwork so thin
+    // outlines survive Small icons without colour halos at transparent edges.
+    for row in 0..size {
+        for column in 0..size {
+            let px = x + column;
+            let py = y + row;
+            if px < clip.left || px >= clip.right || py < clip.top || py >= clip.bottom {
+                continue;
+            }
+            let sx0 = column as u32 * image.width / size as u32;
+            let sx1 = ((column + 1) as u32 * image.width / size as u32)
+                .max(sx0 + 1)
+                .min(image.width);
+            let sy0 = row as u32 * image.height / size as u32;
+            let sy1 = ((row + 1) as u32 * image.height / size as u32)
+                .max(sy0 + 1)
+                .min(image.height);
+            let mut channels = [0u64; 3];
+            let mut alpha = 0u64;
+            let count = u64::from((sx1 - sx0) * (sy1 - sy0));
+            for sy in sy0..sy1 {
+                for sx in sx0..sx1 {
+                    let mut color = image.rgba[(sy * image.width + sx) as usize];
+                    if selected {
+                        color = selected_sprite_colour(color);
+                    }
+                    alpha += u64::from(color[3]);
+                    for c in 0..3 {
+                        channels[c] += u64::from(color[c]) * u64::from(color[3]);
+                    }
+                }
+            }
+            if alpha > 0 && count > 0 {
+                blend_pixel(
                     frame,
-                    DESKTOP_PIXEL_WIDTH,
-                    DESKTOP_PIXEL_HEIGHT,
-                    x + column,
-                    y + row,
-                    color,
+                    px,
+                    py,
+                    [
+                        (channels[0] / alpha) as u8,
+                        (channels[1] / alpha) as u8,
+                        (channels[2] / alpha) as u8,
+                        (alpha / count) as u8,
+                    ],
                 );
             }
         }
     }
 }
 
-fn tile_sprite_region(frame: &mut [u8], sprite: Option<&RiscOsSprite>, region: PixelRect) {
-    let Some(sprite) = sprite else {
-        return;
-    };
-    if region.is_empty() || sprite.width == 0 || sprite.height == 0 {
-        return;
-    }
-    for y in region.top.max(0)..region.bottom.min(DESKTOP_PIXEL_HEIGHT as i32) {
-        for x in region.left.max(0)..region.right.min(DESKTOP_PIXEL_WIDTH as i32) {
-            let sx = (x - region.left).rem_euclid(sprite.width as i32) as u32;
-            let sy = (y - region.top).rem_euclid(sprite.height as i32) as u32;
-            if let Some(color) = sprite.pixel(sx, sy).filter(|pixel| pixel[3] != 0) {
-                set_pixel(
-                    frame,
-                    DESKTOP_PIXEL_WIDTH,
-                    DESKTOP_PIXEL_HEIGHT,
-                    x,
-                    y,
-                    color,
-                );
+fn draw_rgba_icon_image(
+    frame: &mut [u8],
+    image: &DesktopIconImage,
+    x: i32,
+    y: i32,
+    clip: PixelRect,
+    selected: bool,
+) {
+    for row in 0..image.height as i32 {
+        for column in 0..image.width as i32 {
+            let px = x + column;
+            let py = y + row;
+            if px < clip.left || px >= clip.right || py < clip.top || py >= clip.bottom {
+                continue;
             }
+            let Some(mut color) = image
+                .rgba
+                .get((row as u32 * image.width + column as u32) as usize)
+                .copied()
+            else {
+                continue;
+            };
+            if selected {
+                color = selected_sprite_colour(color);
+            }
+            blend_pixel(frame, px, py, color);
         }
     }
 }
@@ -752,55 +1809,6 @@ fn draw_text(snapshot: &GraphicsSnapshot, frame: &mut [u8], width: u32, height: 
                         (left + x) as i32,
                         (top + y) as i32,
                         text_colour,
-                    );
-                }
-            }
-        }
-    }
-}
-
-fn draw_desktop_text(snapshot: &GraphicsSnapshot, frame: &mut [u8], width: u32, height: u32) {
-    let columns = u32::from(snapshot.mode.text_columns);
-    let rows = u32::from(snapshot.mode.text_rows);
-    if columns == 0 || rows == 0 {
-        return;
-    }
-    let font = system_bitmap_font();
-    let text_color = colour(u32::from(snapshot.text_colour), snapshot);
-    for (index, character) in snapshot.text_cells.iter().copied().enumerate() {
-        if character == b' ' {
-            continue;
-        }
-        let Some(glyph) = font.glyph(character) else {
-            continue;
-        };
-        let column = index as u32 % columns;
-        let row = index as u32 / columns;
-        if row >= rows {
-            break;
-        }
-        let left = column * width / columns;
-        let right = (column + 1) * width / columns;
-        let top = row * height / rows;
-        let bottom = (row + 1) * height / rows;
-        let cell_width = right - left;
-        let cell_height = bottom - top;
-        if cell_width == 0 || cell_height == 0 {
-            continue;
-        }
-        for y in 0..cell_height {
-            let glyph_y = (y * 8 / cell_height) as usize;
-            let bits = glyph[glyph_y];
-            for x in 0..cell_width {
-                let glyph_x = (x * 8 / cell_width) as u8;
-                if bits & (0x80 >> glyph_x) != 0 {
-                    set_pixel(
-                        frame,
-                        width,
-                        height,
-                        (left + x) as i32,
-                        (top + y) as i32,
-                        text_color,
                     );
                 }
             }
@@ -1202,4 +2210,68 @@ fn set_pixel(frame: &mut [u8], width: u32, height: u32, x: i32, y: i32, rgba: [u
 
 fn colour(logical_colour: u32, snapshot: &GraphicsSnapshot) -> [u8; 4] {
     graphics_colour(logical_colour, snapshot.mode)
+}
+
+#[cfg(test)]
+mod icon_colour_tests {
+    use super::window_icon_colours;
+
+    #[test]
+    fn selected_filer_icon_keeps_transparent_margins_and_highlights_only_label() {
+        use super::*;
+        let background = [238, 238, 238, 255];
+        let mut frame = background.repeat((DESKTOP_PIXEL_WIDTH * DESKTOP_PIXEL_HEIGHT) as usize);
+        let icon = DesktopWindowIcon {
+            handle: 1,
+            owner_task_id: 1,
+            window_handle: 1,
+            label: "Images".into(),
+            sprite_name: Some("directory".into()),
+            high_resolution_image: Some(Arc::new(DesktopIconImage {
+                width: 2,
+                height: 1,
+                rgba: vec![[30, 30, 30, 255], [248, 248, 248, 255]],
+            })),
+            bounds: DesktopRect {
+                min_x: 0,
+                min_y: DESKTOP_PIXEL_HEIGHT as i32 - 100,
+                max_x: 180,
+                max_y: DESKTOP_PIXEL_HEIGHT as i32,
+            },
+            flags: (1 << 21) | (1 << 3),
+        };
+        draw_window_icon(
+            &mut frame,
+            PixelRect {
+                left: 0,
+                top: 0,
+                right: 180,
+                bottom: 100,
+            },
+            &icon,
+        );
+        let pixel = |x: usize, y: usize| &frame[(y * DESKTOP_PIXEL_WIDTH as usize + x) * 4..][..4];
+        assert_eq!(pixel(4, 4), background);
+        assert_eq!(pixel(4, 90), background);
+        assert_eq!(pixel(90, 96), [0, 0, 0, 255]);
+        assert_eq!(pixel(89, 31), [225, 225, 225, 255]);
+        assert_eq!(pixel(90, 31), [7, 7, 7, 255]);
+    }
+
+    #[test]
+    fn explicit_menu_colours_invert_and_shade_without_hiding_text() {
+        let flags = 7 << 24;
+        assert_eq!(
+            window_icon_colours(flags),
+            ([0, 0, 0, 255], [255, 255, 255, 255])
+        );
+        assert_eq!(
+            window_icon_colours(flags | (1 << 21)),
+            ([255, 255, 255, 255], [0, 0, 0, 255])
+        );
+        let (ink, paper) = window_icon_colours(flags | (1 << 22));
+        assert!(ink[0] > 0 && ink[0] < paper[0]);
+        assert_eq!(paper, [255, 255, 255, 255]);
+        assert_eq!(window_icon_colours(1 << 21).1, [65, 106, 228, 255]);
+    }
 }

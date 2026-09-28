@@ -18,6 +18,22 @@ static CONFIGURE_LOCK: Mutex<()> = Mutex::new(());
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum StartupLanguage {
+    #[default]
+    Mos,
+    Desktop,
+}
+
+impl StartupLanguage {
+    fn module_number(self) -> &'static str {
+        match self {
+            Self::Mos => "0",
+            Self::Desktop => "3",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum BasicLanguageMode {
     Classic,
     Basic64,
@@ -79,6 +95,9 @@ impl BasicEngine {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BasicConfiguration {
+    /// RISC OS `Language` module number: 0 selects the MOS prompt, 3 the desktop.
+    pub(crate) startup_language: StartupLanguage,
+    pub(crate) bevelled_furniture: bool,
     /// `None` means use a source `REM @BASIC64` field, then the runtime default.
     pub(crate) language: Option<BasicLanguageMode>,
     pub(crate) profile: Option<String>,
@@ -88,7 +107,23 @@ pub(crate) struct BasicConfiguration {
 
 impl BasicConfiguration {
     pub(crate) fn set(&mut self, option: &str, value: &str) -> Result<&'static str, String> {
-        if option.eq_ignore_ascii_case("BASICMODE") {
+        if option.eq_ignore_ascii_case("WINDOWFURNITURE") {
+            self.bevelled_furniture = if value.eq_ignore_ascii_case("BEVELLED") {
+                true
+            } else if value.eq_ignore_ascii_case("FLAT") {
+                false
+            } else {
+                return Err("WindowFurniture must be Flat or Bevelled".into());
+            };
+            Ok("WindowFurniture")
+        } else if option.eq_ignore_ascii_case("LANGUAGE") {
+            self.startup_language = match value {
+                "0" => StartupLanguage::Mos,
+                "3" => StartupLanguage::Desktop,
+                _ => return Err("Language must be 0 (MOS prompt) or 3 (desktop)".into()),
+            };
+            Ok("Language")
+        } else if option.eq_ignore_ascii_case("BASICMODE") {
             self.language = if value.eq_ignore_ascii_case("AUTO") {
                 None
             } else {
@@ -122,13 +157,25 @@ impl BasicConfiguration {
             Ok("BASICEngine")
         } else {
             Err(format!(
-                "unknown *CONFIGURE option '{option}'; use *CONFIGURE to list BASIC settings"
+                "unknown *CONFIGURE option '{option}'; use *CONFIGURE to list supported settings"
             ))
         }
     }
 
     pub(crate) fn status_value(&self, option: &str) -> Option<(&'static str, String)> {
-        if option.eq_ignore_ascii_case("BASICMODE") {
+        if option.eq_ignore_ascii_case("WINDOWFURNITURE") {
+            Some((
+                "WindowFurniture",
+                if self.bevelled_furniture {
+                    "BEVELLED"
+                } else {
+                    "FLAT"
+                }
+                .into(),
+            ))
+        } else if option.eq_ignore_ascii_case("LANGUAGE") {
+            Some(("Language", self.startup_language.module_number().into()))
+        } else if option.eq_ignore_ascii_case("BASICMODE") {
             Some((
                 "BASICMode",
                 self.language
@@ -157,8 +204,10 @@ impl BasicConfiguration {
         }
     }
 
-    pub(crate) fn status_entries(&self) -> [(&'static str, String); 4] {
+    pub(crate) fn status_entries(&self) -> [(&'static str, String); 6] {
         [
+            self.status_value("LANGUAGE").expect("known option"),
+            self.status_value("WINDOWFURNITURE").expect("known option"),
             self.status_value("BASICMODE").expect("known option"),
             self.status_value("BASICPROFILE").expect("known option"),
             self.status_value("BASICTARGET").expect("known option"),
@@ -352,7 +401,7 @@ fn validate_profile(profile: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BasicConfiguration, BasicEngine, ConfigureStore};
+    use super::{BasicConfiguration, BasicEngine, ConfigureStore, StartupLanguage};
     use std::{
         fs,
         path::PathBuf,
@@ -370,6 +419,25 @@ mod tests {
     }
 
     #[test]
+    fn furniture_setting_roundtrips_and_old_configs_remain_flat() {
+        let mut config = BasicConfiguration::parse("Language=0\n").unwrap();
+        assert!(!config.bevelled_furniture);
+        config.set("WindowFurniture", "bevelled").unwrap();
+        assert!(
+            BasicConfiguration::parse(&config.serialized())
+                .unwrap()
+                .bevelled_furniture
+        );
+        assert_eq!(
+            config.status_value("WindowFurniture").unwrap().1,
+            "BEVELLED"
+        );
+        assert!(config.set("WindowFurniture", "unknown").is_err());
+        config.set("WindowFurniture", "Flat").unwrap();
+        assert!(!config.bevelled_furniture);
+    }
+
+    #[test]
     fn configure_store_persists_supported_options_and_defaults() {
         let path = temporary_path();
         let store = ConfigureStore::with_path(&path);
@@ -381,6 +449,7 @@ mod tests {
         store.set("BASICMode", "Classic").unwrap();
         store.set("BASICProfile", "BBCV-1.05").unwrap();
         store.set("BASICTarget", "Agon").unwrap();
+        store.set("Language", "3").unwrap();
 
         let reloaded = store.load().unwrap();
         assert_eq!(reloaded, store.load().unwrap());
@@ -391,6 +460,8 @@ mod tests {
             "BBCV-1.05"
         );
         assert_eq!(reloaded.status_value("BASICTarget").unwrap().1, "AGON");
+        assert_eq!(reloaded.status_value("Language").unwrap().1, "3");
+        assert_eq!(reloaded.startup_language, StartupLanguage::Desktop);
 
         store.reset().unwrap();
         assert_eq!(store.load().unwrap(), BasicConfiguration::default());
@@ -412,8 +483,30 @@ mod tests {
         }
         assert!(store.set("BASICMode", "Strict").is_err());
         assert!(store.set("BASICProfile", "bad profile").is_err());
+        for value in ["MOS", "Desktop", "1", "4", "03"] {
+            assert!(store.set("Language", value).is_err(), "accepted {value}");
+        }
         assert!(store.set("SomethingElse", "value").is_err());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn legacy_configuration_defaults_to_mos_and_language_only_accepts_standard_modules() {
+        let legacy = BasicConfiguration::parse("BASICEngine=INTERPRETER\n").unwrap();
+        assert_eq!(legacy.startup_language, StartupLanguage::Mos);
+        assert_eq!(legacy.status_value("Language").unwrap().1, "0");
+
+        for (value, expected) in [("0", StartupLanguage::Mos), ("3", StartupLanguage::Desktop)] {
+            let mut configuration = BasicConfiguration::default();
+            configuration.set("Language", value).unwrap();
+            assert_eq!(configuration.startup_language, expected);
+            assert_eq!(
+                BasicConfiguration::parse(&configuration.serialized())
+                    .unwrap()
+                    .startup_language,
+                expected
+            );
+        }
     }
 
     #[test]
