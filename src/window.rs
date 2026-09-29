@@ -19,15 +19,13 @@ use winit::{
 
 use crate::{
     desktop_scene::{DesktopSceneBuilder, Viewport},
+    display::{DesktopMetrics, DisplayColour},
     graphics::{GraphicsService, GraphicsSnapshot},
     renderer,
     runtime::Runtime,
     swi::DisplayEvent,
     vello_backend::VelloSurface,
-    wimp::{
-        DESKTOP_OS_UNITS_PER_PIXEL_X, DESKTOP_OS_UNITS_PER_PIXEL_Y, DESKTOP_PIXEL_HEIGHT,
-        DESKTOP_PIXEL_WIDTH, WimpServer, WindowDrag,
-    },
+    wimp::{WimpServer, WindowDrag},
 };
 
 const INITIAL_SCALE: f64 = 1.5;
@@ -176,6 +174,8 @@ struct WindowApp {
     display_sender: mpsc::Sender<DisplayEvent>,
     guest_threads: Vec<JoinHandle<()>>,
     pointer: Option<(i32, i32)>,
+    pointer_physical: Option<(f64, f64)>,
+    host_dpi_transition: HostDpiTransition,
     drag: Option<WindowDrag>,
 }
 
@@ -197,6 +197,8 @@ impl WindowApp {
             display_sender,
             guest_threads: Vec::new(),
             pointer: None,
+            pointer_physical: None,
+            host_dpi_transition: HostDpiTransition::default(),
             drag: None,
         }
     }
@@ -207,7 +209,7 @@ impl WindowApp {
         display_sender: mpsc::Sender<DisplayEvent>,
     ) -> Self {
         let mut app = Self::new(input, display_sender);
-        app.frame_size = (DESKTOP_PIXEL_WIDTH, DESKTOP_PIXEL_HEIGHT);
+        app.frame_size = wimp.desktop_metrics().pixel_size();
         app.desktop = Some(wimp.clone());
         app.wimp_service = Some(wimp);
         app
@@ -233,7 +235,10 @@ impl WindowApp {
         };
         // Resize while this is still the MOS display; resize_buffer intentionally
         // ignores requests after desktop composition becomes active.
-        self.resize_buffer((DESKTOP_PIXEL_WIDTH, DESKTOP_PIXEL_HEIGHT));
+        self.resize_buffer(wimp.desktop_metrics().pixel_size());
+        if let Some(window) = &self.window {
+            window.set_min_inner_size(Some(LogicalSize::new(640.0, 320.0)));
+        }
         self.task_graphics.clear();
         self.pointer = None;
         self.drag = None;
@@ -369,6 +374,16 @@ impl WindowApp {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
+    }
+
+    fn report_host_content_size(&mut self, physical_width: u32, physical_height: u32, scale: f64) {
+        let Some(wimp) = &self.wimp_service else {
+            return;
+        };
+        let (logical_width, logical_height) =
+            self.host_dpi_transition
+                .resized(physical_width, physical_height, scale);
+        wimp.set_host_window_size(logical_width, logical_height);
     }
 
     fn apply_display_event(&mut self, event: DisplayEvent, event_loop: &ActiveEventLoop) {
@@ -521,6 +536,7 @@ impl WindowApp {
     }
 
     fn update_pointer(&mut self, physical_x: f64, physical_y: f64) {
+        self.pointer_physical = Some((physical_x, physical_y));
         let Some(wimp) = &self.desktop else {
             return;
         };
@@ -528,7 +544,8 @@ impl WindowApp {
             return;
         };
         let size = window.inner_size();
-        let viewport = Viewport::new(size.width, size.height);
+        let metrics = wimp.desktop_metrics();
+        let viewport = desktop_viewport(size.width, size.height, metrics);
         let point = match viewport.desktop_point(physical_x, physical_y) {
             Some(point) => point,
             None if self.drag.is_some() => viewport.clamped_desktop_point(physical_x, physical_y),
@@ -541,8 +558,6 @@ impl WindowApp {
             }
         };
         let (desktop_x, desktop_y) = point;
-        let desktop_x = desktop_x * DESKTOP_OS_UNITS_PER_PIXEL_X + DESKTOP_OS_UNITS_PER_PIXEL_X / 2;
-        let desktop_y = desktop_y * DESKTOP_OS_UNITS_PER_PIXEL_Y + DESKTOP_OS_UNITS_PER_PIXEL_Y / 2;
         self.pointer = Some((desktop_x, desktop_y));
         if wimp.mouse_move(desktop_x, desktop_y) {
             self.request_redraw();
@@ -551,6 +566,13 @@ impl WindowApp {
             wimp.drag_to(drag, desktop_x, desktop_y);
             self.request_redraw();
         }
+    }
+
+    fn remap_pointer_for_current_metrics(&mut self) {
+        let Some((physical_x, physical_y)) = self.pointer_physical else {
+            return;
+        };
+        self.update_pointer(physical_x, physical_y);
     }
 
     fn handle_mouse_button(&mut self, button: MouseButton, state: ElementState) {
@@ -585,6 +607,48 @@ fn mouse_button_mask(button: MouseButton, modifiers: ModifiersState, desktop_act
     }
 }
 
+fn logical_content_size(physical_width: u32, physical_height: u32, scale: f64) -> (u32, u32) {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let logical = |physical: u32| {
+        (f64::from(physical) / scale)
+            .round()
+            .clamp(1.0, f64::from(u32::MAX)) as u32
+    };
+    (logical(physical_width), logical(physical_height))
+}
+
+#[derive(Default)]
+struct HostDpiTransition {
+    logical_size: Option<(u32, u32)>,
+    pending_scale_factor: Option<f64>,
+}
+
+impl HostDpiTransition {
+    fn scale_factor_changed(&mut self, scale_factor: f64) {
+        self.pending_scale_factor = Some(scale_factor);
+    }
+
+    fn resized(
+        &mut self,
+        physical_width: u32,
+        physical_height: u32,
+        scale_factor: f64,
+    ) -> (u32, u32) {
+        let scale_factor = self.pending_scale_factor.take().unwrap_or(scale_factor);
+        let logical_size = logical_content_size(physical_width, physical_height, scale_factor);
+        self.logical_size = Some(logical_size);
+        logical_size
+    }
+}
+
+fn desktop_viewport(width: u32, height: u32, metrics: DesktopMetrics) -> Viewport {
+    Viewport::for_desktop(width, height, metrics.os_width(), metrics.os_height())
+}
+
 impl ApplicationHandler<WindowUserEvent> for WindowApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -595,16 +659,21 @@ impl ApplicationHandler<WindowUserEvent> for WindowApp {
         let scale = INITIAL_SCALE
             .min(960.0 / f64::from(frame_size.0))
             .min(720.0 / f64::from(frame_size.1));
+        let minimum_size = if self.desktop.is_some() {
+            LogicalSize::new(640.0, 320.0)
+        } else {
+            LogicalSize::new(
+                f64::from(renderer::SCREEN_WIDTH),
+                f64::from(renderer::SCREEN_HEIGHT),
+            )
+        };
         let attributes = Window::default_attributes()
             .with_title("Acorn-2026")
             .with_inner_size(LogicalSize::new(
                 f64::from(frame_size.0) * scale,
                 f64::from(frame_size.1) * scale,
             ))
-            .with_min_inner_size(LogicalSize::new(
-                f64::from(renderer::SCREEN_WIDTH),
-                f64::from(renderer::SCREEN_HEIGHT),
-            ));
+            .with_min_inner_size(minimum_size);
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {
@@ -625,6 +694,8 @@ impl ApplicationHandler<WindowUserEvent> for WindowApp {
 
         self.gpu = Some(gpu);
         self.window = Some(window.clone());
+        let size = window.inner_size();
+        self.report_host_content_size(size.width, size.height, window.scale_factor());
         window.request_redraw();
     }
 
@@ -654,8 +725,22 @@ impl ApplicationHandler<WindowUserEvent> for WindowApp {
                     if let Some(gpu) = &mut self.gpu {
                         gpu.resize(size.width, size.height);
                     }
+                    self.report_host_content_size(
+                        size.width,
+                        size.height,
+                        self.window
+                            .as_ref()
+                            .map_or(1.0, |window| window.scale_factor()),
+                    );
+                    self.remap_pointer_for_current_metrics();
                     self.request_redraw();
                 }
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                // Winit sends ScaleFactorChanged before the resized physical
+                // dimensions are committed. Keep the current logical Wimp size
+                // until the following Resized event supplies the new backing size.
+                self.host_dpi_transition.scale_factor_changed(scale_factor);
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
@@ -671,6 +756,7 @@ impl ApplicationHandler<WindowUserEvent> for WindowApp {
             WindowEvent::CursorLeft { .. } => {
                 if self.drag.is_none() {
                     self.pointer = None;
+                    self.pointer_physical = None;
                     if let Some(wimp) = &self.desktop {
                         if wimp.mouse_move(-1, -1) {
                             self.request_redraw();
@@ -687,6 +773,7 @@ impl ApplicationHandler<WindowUserEvent> for WindowApp {
                 };
                 let size = window.inner_size();
                 let scene = if let Some(wimp) = &self.desktop {
+                    let metrics = wimp.desktop_metrics();
                     let windows = wimp.desktop_windows();
                     let mut scenes = self
                         .task_graphics
@@ -713,7 +800,7 @@ impl ApplicationHandler<WindowUserEvent> for WindowApp {
                         &wimp.desktop_window_icons(),
                         &wimp.desktop_menus(),
                         wimp.desktop_notice().as_deref(),
-                        Viewport::new(size.width, size.height),
+                        desktop_viewport(size.width, size.height, metrics),
                     )
                 } else {
                     self.desktop_scene.build_classic(
@@ -723,7 +810,12 @@ impl ApplicationHandler<WindowUserEvent> for WindowApp {
                     )
                 };
                 if let Some(gpu) = &mut self.gpu {
-                    if let Err(error) = gpu.render(&scene) {
+                    let colour = self
+                        .desktop
+                        .as_ref()
+                        .map(|wimp| wimp.display_settings().colour)
+                        .unwrap_or(DisplayColour::Rgb888);
+                    if let Err(error) = gpu.render(&scene, colour) {
                         eprintln!("Acorn-2026 could not present its Vello scene: {error}");
                         event_loop.exit();
                     }
@@ -739,6 +831,7 @@ impl ApplicationHandler<WindowUserEvent> for WindowApp {
             WindowUserEvent::DesktopChanged => {
                 self.start_pending_tasks();
                 self.prune_finished_task_graphics();
+                self.remap_pointer_for_current_metrics();
                 self.request_redraw();
             }
         }
@@ -783,7 +876,13 @@ impl ApplicationHandler<WindowUserEvent> for WindowApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{memory::Task, swi::SwiContext, wimp::WIMP_INITIALISE};
+    use crate::{
+        configure::ConfigureStore,
+        display::{DesktopResolution, DisplaySettings},
+        memory::Task,
+        swi::SwiContext,
+        wimp::WIMP_INITIALISE,
+    };
 
     #[test]
     fn desktop_mouse_mapping_supports_option_menu_and_preserves_button_roles() {
@@ -816,7 +915,7 @@ mod tests {
         assert!(app.should_exit_on_runtime_exit());
         app.activate_desktop();
 
-        assert_eq!(app.frame_size, (DESKTOP_PIXEL_WIDTH, DESKTOP_PIXEL_HEIGHT));
+        assert_eq!(app.frame_size, wimp.desktop_metrics().pixel_size());
         assert!(!app.should_exit_on_runtime_exit());
         assert!(
             app.desktop
@@ -858,5 +957,71 @@ mod tests {
 
         assert!(!app.task_graphics.contains_key(&77));
         assert!(!app.window_graphics.contains_key(&(77, 9)));
+    }
+
+    #[test]
+    fn host_physical_size_maps_to_logical_size_across_dpi_scales() {
+        assert_eq!(logical_content_size(800, 600, 1.0), (800, 600));
+        assert_eq!(logical_content_size(1600, 1200, 2.0), (800, 600));
+        assert_eq!(logical_content_size(1920, 1440, 2.0), (960, 720));
+        assert_eq!(logical_content_size(1001, 751, 2.0), (501, 376));
+        assert_eq!(logical_content_size(800, 600, 0.0), (800, 600));
+    }
+
+    #[test]
+    fn dpi_transition_keeps_desktop_geometry_until_resized_reports_new_backing_size() {
+        let mut transition = HostDpiTransition::default();
+        assert_eq!(transition.resized(800, 600, 1.0), (800, 600));
+
+        transition.scale_factor_changed(2.0);
+        assert_eq!(transition.logical_size, Some((800, 600)));
+        assert_eq!(transition.pending_scale_factor, Some(2.0));
+
+        // ScaleFactorChanged arrives while inner_size can still be 800×600;
+        // using that stale size with the new 2× factor would report 400×300.
+        // The following Resized event carries the committed 1600×1200 backing.
+        assert_eq!(transition.resized(1600, 1200, 1.0), (800, 600));
+        assert_eq!(transition.logical_size, Some((800, 600)));
+        assert_eq!(transition.pending_scale_factor, None);
+
+        transition.scale_factor_changed(1.5);
+        assert_eq!(transition.resized(1200, 900, 1.0), (800, 600));
+        assert_eq!(transition.logical_size, Some((800, 600)));
+    }
+
+    #[test]
+    fn window_metrics_follow_host_resizes_and_fixed_metrics_keep_their_extent() {
+        let path = std::env::temp_dir().join(format!(
+            "acorn-window-display-settings-{}.cfg",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let (updates, _receiver) = mpsc::channel();
+        let wimp = WimpServer::new(updates);
+        wimp.set_configure_store(ConfigureStore::with_path(&path), DisplaySettings::default());
+
+        let first = wimp.set_host_window_size(960, 720);
+        assert_eq!(first.pixel_size(), (960, 720));
+        assert_eq!(first.host_pixel_size(), (960, 720));
+        let second = wimp.set_host_window_size(1024, 768);
+        assert_eq!(second.pixel_size(), (1024, 768));
+        assert_eq!(second.host_pixel_size(), (1024, 768));
+
+        wimp.apply_display_settings(DisplaySettings {
+            resolution: DesktopResolution::R640x480,
+            colour: DisplayColour::Rgb888,
+        })
+        .unwrap();
+        let fixed = wimp.set_host_window_size(1200, 800);
+        assert_eq!(fixed.pixel_size(), (640, 480));
+        assert_eq!(fixed.host_pixel_size(), (1200, 800));
+        assert_eq!((fixed.os_width(), fixed.os_height()), (1280, 960));
+
+        wimp.apply_display_settings(DisplaySettings::default())
+            .unwrap();
+        let returned_to_window = wimp.desktop_metrics();
+        assert_eq!(returned_to_window.pixel_size(), (1200, 800));
+        assert_eq!(returned_to_window.host_pixel_size(), (1200, 800));
+        let _ = std::fs::remove_file(path);
     }
 }

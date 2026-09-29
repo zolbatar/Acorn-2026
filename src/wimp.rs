@@ -19,6 +19,8 @@ use crate::{
     swi::SwiContext,
 };
 
+pub use crate::display::{DesktopMetrics, DesktopResolution, DisplayColour, DisplaySettings};
+
 pub const WIMP_INITIALISE: u32 = 0x400C0;
 pub const WIMP_CREATE_WINDOW: u32 = 0x400C1;
 pub const WIMP_REDRAW_WINDOW: u32 = 0x400C8;
@@ -453,6 +455,7 @@ pub struct WindowDrag {
     pub original: WorkArea,
     pub original_scroll: (i32, i32),
     pub slider_grab_offset: i32,
+    metrics_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -471,6 +474,7 @@ struct RedrawRectangle {
 #[derive(Debug)]
 struct RedrawLoop {
     window_handle: u32,
+    display_generation: u64,
     rectangles: VecDeque<RedrawRectangle>,
     clears_background: bool,
     current_work: Option<WorkArea>,
@@ -621,6 +625,7 @@ struct WimpWindow {
     toggle_request_pending: bool,
     restore_behind: i32,
     console_window: bool,
+    needs_display_reflow: bool,
 }
 
 #[derive(Debug, Default)]
@@ -642,6 +647,9 @@ struct WimpState {
     last_click: Option<RecentClick>,
     pointer: PointerState,
     active_menu: Option<ActiveMenu>,
+    display_settings: DisplaySettings,
+    desktop_metrics: DesktopMetrics,
+    display_generation: u64,
     system_menu_owner: Option<u32>,
     stopped: bool,
 }
@@ -670,11 +678,25 @@ impl WimpServer {
         })
     }
 
-    pub(crate) fn set_configure_store(&self, configure: ConfigureStore) {
+    pub(crate) fn set_configure_store(
+        &self,
+        configure: ConfigureStore,
+        display_settings: DisplaySettings,
+    ) {
         *self
             .configure
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(configure);
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.display_settings = display_settings;
+        let host_size = state.desktop_metrics.host_pixel_size();
+        state.desktop_metrics = DesktopMetrics::for_display(display_settings, host_size);
+        state.display_generation = state.display_generation.wrapping_add(1);
+        reflow_windows_after_metrics_change(&mut state);
+        drop(state);
+        let _ = self.desktop_updates.send(());
     }
 
     pub(crate) fn configure_store(&self) -> Option<ConfigureStore> {
@@ -682,6 +704,78 @@ impl WimpServer {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    pub fn desktop_metrics(&self) -> DesktopMetrics {
+        self.state
+            .lock()
+            .map(|state| state.desktop_metrics)
+            .unwrap_or_default()
+    }
+
+    pub fn display_settings(&self) -> DisplaySettings {
+        self.state
+            .lock()
+            .map(|state| state.display_settings)
+            .unwrap_or_default()
+    }
+
+    /// Record the host content size in logical pixels. A fixed resolution
+    /// keeps the desktop metrics while the host viewport changes.
+    pub fn set_host_window_size(&self, logical_width: u32, logical_height: u32) -> DesktopMetrics {
+        let Ok(mut state) = self.state.lock() else {
+            return DesktopMetrics::default();
+        };
+        let host_size = (logical_width, logical_height);
+        if state.desktop_metrics.host_pixel_size() == host_size {
+            return state.desktop_metrics;
+        }
+        let previous_metrics = state.desktop_metrics;
+        state.desktop_metrics = DesktopMetrics::for_display(state.display_settings, host_size);
+        if state.desktop_metrics.pixel_size() != previous_metrics.pixel_size() {
+            state.display_generation = state.display_generation.wrapping_add(1);
+            reflow_windows_after_metrics_change(&mut state);
+            state.active_menu = None;
+            state.pointer.x = state.pointer.x.clamp(0, state.desktop_metrics.os_width());
+            state.pointer.y = state.pointer.y.clamp(0, state.desktop_metrics.os_height());
+        }
+        let metrics = state.desktop_metrics;
+        drop(state);
+        self.changed.notify_all();
+        let _ = self.desktop_updates.send(());
+        metrics
+    }
+
+    /// Persist and then atomically activate both display settings.
+    pub fn apply_display_settings(&self, settings: DisplaySettings) -> Result<(), String> {
+        let configure = self
+            .configure_store()
+            .unwrap_or_else(ConfigureStore::default);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "hosted Wimp state is unavailable".to_string())?;
+        let next_metrics =
+            DesktopMetrics::for_display(settings, state.desktop_metrics.host_pixel_size());
+        // Persist first. A failed write leaves every live field unchanged.
+        configure.set_display_settings(settings)?;
+        let settings_changed = state.display_settings != settings;
+        let metrics_changed = state.desktop_metrics.pixel_size() != next_metrics.pixel_size();
+        state.display_settings = settings;
+        state.desktop_metrics = next_metrics;
+        if metrics_changed {
+            state.display_generation = state.display_generation.wrapping_add(1);
+            state.active_menu = None;
+            state.pointer.x = state.pointer.x.clamp(0, next_metrics.os_width());
+            state.pointer.y = state.pointer.y.clamp(0, next_metrics.os_height());
+            reflow_windows_after_metrics_change(&mut state);
+        }
+        drop(state);
+        if settings_changed {
+            self.changed.notify_all();
+            let _ = self.desktop_updates.send(());
+        }
+        Ok(())
     }
 
     pub fn dispatch(
@@ -771,7 +865,7 @@ impl WimpServer {
         let Ok(state) = self.state.lock() else {
             return Vec::new();
         };
-        layout_icon_bar(&state.icons, &state.windows)
+        layout_icon_bar(&state.icons, &state.windows, state.desktop_metrics)
     }
 
     pub fn desktop_window_icons(&self) -> Vec<DesktopWindowIcon> {
@@ -809,7 +903,7 @@ impl WimpServer {
         state
             .active_menu
             .as_ref()
-            .map(active_menu_panels)
+            .map(|menu| active_menu_panels(menu, state.desktop_metrics))
             .unwrap_or_default()
     }
 
@@ -822,6 +916,7 @@ impl WimpServer {
         state.pointer.x = x;
         state.pointer.y = y;
         let pointer_buttons = state.pointer.buttons;
+        let metrics = state.desktop_metrics;
         let Some(active) = state.active_menu.as_mut() else {
             return false;
         };
@@ -830,8 +925,8 @@ impl WimpServer {
         {
             let dx = x - drag.start_x;
             let dy = y - drag.start_y;
-            active.root_x = clamp_menu_x(&active.root, drag.root_x + dx);
-            active.root_top = clamp_menu_top(&active.root, drag.root_top + dy);
+            active.root_x = clamp_menu_x(&active.root, drag.root_x + dx, metrics);
+            active.root_top = clamp_menu_top(&active.root, drag.root_top + dy, metrics);
             active.hover = None;
             true
         } else {
@@ -840,7 +935,7 @@ impl WimpServer {
             let before_hover = active
                 .hover
                 .map(|candidate| (candidate.level, candidate.row));
-            update_menu_hover(active, x, y, Instant::now());
+            update_menu_hover(active, x, y, Instant::now(), metrics);
             before_selected != active.selected_path
                 || before_open != active.open_path
                 || before_hover
@@ -869,6 +964,7 @@ impl WimpServer {
             return false;
         };
         let (pointer_x, pointer_y) = (state.pointer.x, state.pointer.y);
+        let metrics = state.desktop_metrics;
         let Some(active) = state.active_menu.as_mut() else {
             return false;
         };
@@ -876,7 +972,7 @@ impl WimpServer {
             return false;
         };
         if now.saturating_duration_since(candidate.since) < active.hover_delay
-            || !menu_candidate_is_still_hovered(active, candidate, pointer_x, pointer_y)
+            || !menu_candidate_is_still_hovered(active, candidate, pointer_x, pointer_y, metrics)
         {
             return false;
         }
@@ -1029,7 +1125,8 @@ impl WimpServer {
                 ..WimpTask::default()
             },
         );
-        insert_console_window(&mut state, task_handle, guest_task_id, label)?;
+        let metrics = state.desktop_metrics;
+        insert_console_window(&mut state, task_handle, guest_task_id, label, metrics)?;
         drop(state);
         self.changed.notify_all();
         let _ = self.desktop_updates.send(());
@@ -1044,10 +1141,14 @@ impl WimpServer {
         handle: Option<u32>,
         mode: crate::graphics::ScreenMode,
     ) {
-        let Ok(mut state) = self.lock_state() else { return };
+        let Ok(mut state) = self.lock_state() else {
+            return;
+        };
         let mut changed = false;
+        let metrics = state.desktop_metrics;
         for window in state.windows.values_mut().filter(|window| {
-            window.console_window && window.owner_task_id == task_id
+            window.console_window
+                && window.owner_task_id == task_id
                 && handle.is_none_or(|handle| handle == window.handle)
         }) {
             // Match the renderer's integer guest-pixel scale, including modes
@@ -1056,13 +1157,20 @@ impl WimpServer {
                 * (mode.logical_width / mode.pixel_width.max(1) as i32).max(1);
             let height = mode.pixel_height as i32
                 * (mode.logical_height / mode.pixel_height.max(1) as i32).max(1);
-            let extent = WorkArea { min_x: 0, min_y: -height, max_x: width, max_y: 0 };
-            if window.work_extent == extent { continue; }
+            let extent = WorkArea {
+                min_x: 0,
+                min_y: -height,
+                max_x: width,
+                max_y: 0,
+            };
+            if window.work_extent == extent {
+                continue;
+            }
             window.work_extent = extent;
             window.work_area.max_x = (window.work_area.min_x + width)
-                .min(DESKTOP_WIDTH - VERTICAL_SCROLLBAR_WIDTH - FRAME_BORDER);
-            window.work_area.min_y = (window.work_area.max_y - height)
-                .max(DESKTOP_ICONBAR_HEIGHT + FRAME_BORDER);
+                .min(metrics.os_width() - VERTICAL_SCROLLBAR_WIDTH - FRAME_BORDER);
+            window.work_area.min_y =
+                (window.work_area.max_y - height).max(iconbar_height(metrics) + FRAME_BORDER);
             window.scroll_x = 0;
             window.scroll_y = 0;
             window.last_user_area = window.work_area;
@@ -1073,7 +1181,9 @@ impl WimpServer {
             changed = true;
         }
         drop(state);
-        if changed { let _ = self.desktop_updates.send(()); }
+        if changed {
+            let _ = self.desktop_updates.send(());
+        }
     }
 
     pub fn furniture_layout(&self) -> Vec<(DesktopWindow, WindowFurnitureLayout)> {
@@ -1105,13 +1215,14 @@ impl WimpServer {
     /// bottom-left origin; host display pixels are converted at the boundary.
     pub fn mouse_down(&self, x: i32, y: i32, buttons: u32) -> Option<WindowDrag> {
         let mut state = self.state.lock().ok()?;
+        let metrics = state.desktop_metrics;
         state.notice = None;
         state.pointer.x = x;
         state.pointer.y = y;
         state.pointer.buttons |= buttons;
         if state.active_menu.is_some() {
-            if active_menu_contains(&state.active_menu, x, y) {
-                menu_mouse_down(&mut state, x, y, buttons);
+            if active_menu_contains(&state.active_menu, x, y, metrics) {
+                menu_mouse_down(&mut state, x, y, buttons, metrics);
                 drop(state);
                 self.changed.notify_all();
                 let _ = self.desktop_updates.send(());
@@ -1121,8 +1232,8 @@ impl WimpServer {
             // through as though the menu had not intercepted it.
             state.active_menu = None;
         }
-        if (0..DESKTOP_ICONBAR_HEIGHT).contains(&y) {
-            if x >= DESKTOP_WIDTH - ICONBAR_SYSTEM_AREA_OS && buttons & 2 != 0 {
+        if (0..iconbar_height(metrics)).contains(&y) {
+            if x >= metrics.os_width() - ICONBAR_SYSTEM_AREA_OS && buttons & 2 != 0 {
                 if let Some(owner) = state.system_menu_owner {
                     enqueue_for_owner(
                         &mut state,
@@ -1136,14 +1247,14 @@ impl WimpServer {
                 return None;
             }
 
-            let icons = layout_icon_bar(&state.icons, &state.windows);
+            let icons = layout_icon_bar(&state.icons, &state.windows, metrics);
             if let Some(icon) = icons
                 .iter()
                 .find(|icon| icon.bounds.contains(x, y))
                 .cloned()
                 && buttons & (1 | 2 | 4) != 0
             {
-                let iconbar_parent = match icon.side {
+                let iconbar_parent: i32 = match icon.side {
                     IconBarSide::Devices => -2,
                     IconBarSide::Applications => -1,
                 };
@@ -1243,6 +1354,7 @@ impl WimpServer {
                                 // thumb's top edge while dragging. This makes
                                 // a press/release without movement a no-op.
                                 slider_grab_offset: y - bar.slider.max_y,
+                                metrics_generation: state.display_generation,
                             };
                             drop(state);
                             self.changed.notify_all();
@@ -1262,6 +1374,7 @@ impl WimpServer {
                         original: window.work_area,
                         original_scroll: (window.scroll_x, window.scroll_y),
                         slider_grab_offset: 0,
+                        metrics_generation: state.display_generation,
                     };
                     drop(state);
                     self.changed.notify_all();
@@ -1279,6 +1392,7 @@ impl WimpServer {
                             original: window.work_area,
                             original_scroll: (window.scroll_x, window.scroll_y),
                             slider_grab_offset: 0,
+                            metrics_generation: state.display_generation,
                         };
                         drop(state);
                         self.changed.notify_all();
@@ -1293,6 +1407,7 @@ impl WimpServer {
                             original: window.work_area,
                             original_scroll: (window.scroll_x, window.scroll_y),
                             slider_grab_offset: 0,
+                            metrics_generation: state.display_generation,
                         };
                         drop(state);
                         self.changed.notify_all();
@@ -1377,6 +1492,7 @@ impl WimpServer {
                 original: window.work_area,
                 original_scroll: (window.scroll_x, window.scroll_y),
                 slider_grab_offset: 0,
+                metrics_generation: state.display_generation,
             })
         } else if layout.work_area.contains(x, y) {
             let button_type = ((window.work_area_flags >> 12) & 0xF) as u32;
@@ -1411,6 +1527,10 @@ impl WimpServer {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
+        if drag.metrics_generation != state.display_generation {
+            return;
+        }
+        let metrics = state.desktop_metrics;
         let Some(window) = state.windows.get_mut(&drag.handle) else {
             return;
         };
@@ -1429,10 +1549,12 @@ impl WimpServer {
             window.resizable,
         );
         let max_width = (window.work_extent.max_x - drag.original_scroll.0)
-            .min(DESKTOP_WIDTH - drag.original.min_x - window_outer_extra_x(window))
+            .min(metrics.os_width() - drag.original.min_x - window_outer_extra_x(window))
             .max(1);
         let max_height = (drag.original_scroll.1 - window.work_extent.min_y)
-            .min(drag.original.max_y - DESKTOP_ICONBAR_HEIGHT - window_outer_bottom_extra_y(window))
+            .min(
+                drag.original.max_y - iconbar_height(metrics) - window_outer_bottom_extra_y(window),
+            )
             .max(1);
         let mut scroll = drag.original_scroll;
         let area = match drag.kind {
@@ -1441,11 +1563,11 @@ impl WimpServer {
                 let height = drag.original.max_y - drag.original.min_y;
                 let min_x = drag.original.min_x.saturating_add(dx).clamp(
                     FRAME_BORDER,
-                    DESKTOP_WIDTH - width - window_outer_extra_x(window),
+                    metrics.os_width() - width - window_outer_extra_x(window),
                 );
                 let min_y = drag.original.min_y.saturating_add(dy).clamp(
-                    window_outer_bottom_extra_y(window),
-                    DESKTOP_HEIGHT - height - window_outer_top_extra_y(window),
+                    iconbar_height(metrics) + window_outer_bottom_extra_y(window),
+                    metrics.os_height() - height - window_outer_top_extra_y(window),
                 );
                 WorkArea {
                     min_x,
@@ -1498,7 +1620,7 @@ impl WimpServer {
             }
         };
         let valid = validate_visible_area(window.work_extent, area, scroll.0, scroll.1)
-            .and_then(|()| validate_screen_area(window, area))
+            .and_then(|()| validate_screen_area(window, area, metrics))
             .is_ok();
         window.preview_area = valid.then_some(area);
         window.preview_scroll = valid.then_some(scroll);
@@ -1510,6 +1632,9 @@ impl WimpServer {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
+        if drag.metrics_generation != state.display_generation {
+            return;
+        }
         let behind = window_behind(&state, drag.handle);
         let Some(window) = state.windows.get_mut(&drag.handle) else {
             return;
@@ -1807,6 +1932,8 @@ impl WimpServer {
         };
         let initial_scroll_x = read_word(&block, 16) as i32;
         let initial_scroll_y = read_word(&block, 20) as i32;
+        let mut state = self.lock_state()?;
+        let metrics = state.desktop_metrics;
         if initial_area
             != (WorkArea {
                 min_x: 0,
@@ -1827,10 +1954,10 @@ impl WimpServer {
                 has_title || has_toggle_size_icon,
                 has_vertical_scrollbar,
                 resizable,
+                metrics,
             )?;
         }
 
-        let mut state = self.lock_state()?;
         let owner_task_handle = *state
             .guest_to_task
             .get(&task.id)
@@ -1870,6 +1997,7 @@ impl WimpServer {
                 toggle_request_pending: false,
                 restore_behind: -1,
                 console_window: false,
+                needs_display_reflow: false,
             },
         );
         context.registers[0] = handle;
@@ -1882,31 +2010,39 @@ impl WimpServer {
         let address = context.registers[1];
         let block = task.memory.read_bytes(address, OPEN_BLOCK_SIZE)?;
         let handle = read_word(&block, 0);
-        let area = WorkArea {
+        let mut area = WorkArea {
             min_x: read_word(&block, 4) as i32,
             min_y: read_word(&block, 8) as i32,
             max_x: read_word(&block, 12) as i32,
             max_y: read_word(&block, 16) as i32,
         };
         validate_geometry(area)?;
-        let scroll_x = read_word(&block, 20) as i32;
-        let scroll_y = read_word(&block, 24) as i32;
+        let mut scroll_x = read_word(&block, 20) as i32;
+        let mut scroll_y = read_word(&block, 24) as i32;
         let behind = read_word(&block, 28) as i32;
         let mut state = self.lock_state()?;
+        let metrics = state.desktop_metrics;
         let caller = *state
             .guest_to_task
             .get(&task.id)
             .ok_or_else(|| program_error("Wimp_OpenWindow called before Wimp_Initialise"))?;
-        let window = state
-            .windows
-            .get(&handle)
-            .ok_or_else(|| program_error("Wimp_OpenWindow received an unknown window handle"))?;
+        let window =
+            state.windows.get(&handle).cloned().ok_or_else(|| {
+                program_error("Wimp_OpenWindow received an unknown window handle")
+            })?;
         if window.owner_task_handle != caller {
             return Err(program_error("window handle belongs to another Wimp task"));
         }
+        if window.needs_display_reflow {
+            area = clamp_work_area_to_metrics(&window, area, metrics);
+            scroll_x = scroll_x.clamp(window.work_extent.min_x, window.work_extent.max_x - 1);
+            scroll_y = scroll_y.clamp(window.work_extent.min_y + 1, window.work_extent.max_y);
+        }
         validate_visible_area(window.work_extent, area, scroll_x, scroll_y)?;
-        validate_min_dimensions(area, window.min_width, window.min_height)?;
-        validate_screen_area(window, area)?;
+        if !window.needs_display_reflow {
+            validate_min_dimensions(area, window.min_width, window.min_height)?;
+        }
+        validate_screen_area(&window, area, metrics)?;
         if behind != -1 && behind != -2 && behind <= 0 {
             return Err(program_error(
                 "Wimp_OpenWindow has an unsupported stack position",
@@ -1927,6 +2063,9 @@ impl WimpServer {
         if !window.maximized && !window.toggle_request_pending {
             window.last_user_area = area;
             window.last_user_scroll = (scroll_x, scroll_y);
+        } else if window.needs_display_reflow {
+            window.last_user_area =
+                clamp_work_area_to_metrics(window, window.last_user_area, metrics);
         }
         window.work_area = area;
         window.scroll_x = scroll_x;
@@ -1936,6 +2075,7 @@ impl WimpServer {
         window.preview_area = None;
         window.preview_scroll = None;
         window.toggle_request_pending = false;
+        window.needs_display_reflow = false;
         state.stacking = next_stacking;
         if first_open {
             add_invalid_region(
@@ -2008,6 +2148,7 @@ impl WimpServer {
         }
         let mut redraw = RedrawLoop {
             window_handle: handle,
+            display_generation: state.display_generation,
             rectangles,
             clears_background: window.work_area_background != 0xFF,
             current_work: None,
@@ -2068,6 +2209,7 @@ impl WimpServer {
         }
         let mut redraw = RedrawLoop {
             window_handle: handle,
+            display_generation: state.display_generation,
             rectangles: visible_redraw_rectangles(&state, handle, region).into(),
             clears_background: false,
             current_work: None,
@@ -2113,7 +2255,7 @@ impl WimpServer {
         if window.owner_task_handle != owner {
             return Err(program_error("window handle belongs to another Wimp task"));
         }
-        let (rectangle, clears_background) = {
+        let (rectangle, clears_background, redraw_generation) = {
             let task_state = state
                 .tasks
                 .get_mut(&owner)
@@ -2129,7 +2271,11 @@ impl WimpServer {
             if let Some(rectangle) = rectangle {
                 redraw.current_work = Some(rectangle.work);
             }
-            (rectangle, redraw.clears_background)
+            (
+                rectangle,
+                redraw.clears_background,
+                redraw.display_generation,
+            )
         };
         if let Some(rectangle) = rectangle {
             write_redraw_block(&mut block, &window, rectangle);
@@ -2149,6 +2295,11 @@ impl WimpServer {
                 .get_mut(&owner)
                 .expect("task remains registered")
                 .redraw_loop = None;
+            if redraw_generation != state.display_generation {
+                if let Some(window) = state.windows.get_mut(&handle) {
+                    add_invalid_region(window, window.work_extent);
+                }
+            }
             context.registers[0] = 0;
         }
         drop(state);
@@ -2339,8 +2490,8 @@ impl WimpServer {
             (x, top)
         } else {
             (
-                clamp_menu_x(&root, context.registers[2] as i32),
-                clamp_menu_top(&root, context.registers[3] as i32),
+                clamp_menu_x(&root, context.registers[2] as i32, state.desktop_metrics),
+                clamp_menu_top(&root, context.registers[3] as i32, state.desktop_metrics),
             )
         };
         let (open_path, selected_path, preserved_adjust) = state
@@ -2631,7 +2782,8 @@ impl WimpServer {
                 .values()
                 .any(|window| window.owner_task_handle == handle && window.console_window);
             if !console_exists {
-                insert_console_window(&mut state, handle, task.id, "BASIC")?;
+                let metrics = state.desktop_metrics;
+                insert_console_window(&mut state, handle, task.id, "BASIC", metrics)?;
             }
             if state
                 .keyboard_focus
@@ -2962,7 +3114,8 @@ impl WimpServer {
                 ..WimpTask::default()
             },
         );
-        insert_console_window(&mut state, task_handle, task_id, label)?;
+        let metrics = state.desktop_metrics;
+        insert_console_window(&mut state, task_handle, task_id, label, metrics)?;
         state.pending_launches.push_back(DesktopTaskRequest {
             kind,
             task_id,
@@ -3180,12 +3333,17 @@ fn validate_min_dimensions(
     Ok(())
 }
 
-fn validate_screen_area(window: &WimpWindow, area: WorkArea) -> Result<(), RuntimeError> {
+fn validate_screen_area(
+    window: &WimpWindow,
+    area: WorkArea,
+    metrics: DesktopMetrics,
+) -> Result<(), RuntimeError> {
     validate_screen_area_parts(
         area,
         window.has_title || window.has_toggle_size_icon,
         window.has_vertical_scrollbar,
         window.resizable,
+        metrics,
     )
 }
 
@@ -3229,6 +3387,7 @@ fn validate_screen_area_parts(
     has_title: bool,
     has_vertical_scrollbar: bool,
     resizable: bool,
+    metrics: DesktopMetrics,
 ) -> Result<(), RuntimeError> {
     let left = area
         .min_x
@@ -3256,7 +3415,10 @@ fn validate_screen_area_parts(
             FRAME_BORDER
         })
         .ok_or_else(|| program_error("window system area coordinate overflowed"))?;
-    if left < 0 || bottom < DESKTOP_ICONBAR_HEIGHT || right > DESKTOP_WIDTH || top > DESKTOP_HEIGHT
+    if left < 0
+        || bottom < iconbar_height(metrics)
+        || right > metrics.os_width()
+        || top > metrics.os_height()
     {
         return Err(program_error(
             "window lies outside the hosted screen (off-screen windows are unsupported)",
@@ -3343,12 +3505,15 @@ fn menu_panel_height(menu: &WimpMenu) -> i32 {
     menu_geometry(menu, 0, 0).bounds.max_y - menu_geometry(menu, 0, 0).bounds.min_y
 }
 
-fn clamp_menu_x(menu: &WimpMenu, x: i32) -> i32 {
-    x.clamp(0, (DESKTOP_WIDTH - menu_panel_width(menu)).max(0))
+fn clamp_menu_x(menu: &WimpMenu, x: i32, metrics: DesktopMetrics) -> i32 {
+    x.clamp(0, (metrics.os_width() - menu_panel_width(menu)).max(0))
 }
 
-fn clamp_menu_top(menu: &WimpMenu, top: i32) -> i32 {
-    top.clamp(menu_panel_height(menu).min(DESKTOP_HEIGHT), DESKTOP_HEIGHT)
+fn clamp_menu_top(menu: &WimpMenu, top: i32, metrics: DesktopMetrics) -> i32 {
+    top.clamp(
+        menu_panel_height(menu).min(metrics.os_height()),
+        metrics.os_height(),
+    )
 }
 
 fn menu_at_level(active: &ActiveMenu, level: usize) -> Option<&WimpMenu> {
@@ -3372,23 +3537,27 @@ fn set_path_value(path: &mut Vec<usize>, level: usize, value: usize) {
     path[level] = value;
 }
 
-fn menu_level_geometry(active: &ActiveMenu, level: usize) -> Option<MenuGeometry> {
+fn menu_level_geometry(
+    active: &ActiveMenu,
+    level: usize,
+    metrics: DesktopMetrics,
+) -> Option<MenuGeometry> {
     let menu = menu_at_level(active, level)?;
     if level == 0 {
         return Some(menu_geometry(menu, active.root_x, active.root_top));
     }
     let parent_row_index = *active.open_path.get(level - 1)?;
-    let parent_geometry = menu_level_geometry(active, level - 1)?;
+    let parent_geometry = menu_level_geometry(active, level - 1, metrics)?;
     let parent_row = *parent_geometry.rows.get(parent_row_index)?;
     let child_width = menu_panel_width(menu);
     let right_x = parent_geometry.bounds.max_x - MENU_BORDER;
     let left_x = parent_geometry.bounds.min_x - child_width + MENU_BORDER;
-    let x = if right_x + child_width <= DESKTOP_WIDTH {
+    let x = if right_x + child_width <= metrics.os_width() {
         right_x
     } else if left_x >= 0 {
         left_x
     } else {
-        clamp_menu_x(menu, right_x)
+        clamp_menu_x(menu, right_x, metrics)
     };
     let top = parent_row.max_y
         + MENU_BORDER
@@ -3399,17 +3568,17 @@ fn menu_level_geometry(active: &ActiveMenu, level: usize) -> Option<MenuGeometry
         };
     Some(menu_geometry(
         menu,
-        clamp_menu_x(menu, x),
-        clamp_menu_top(menu, top),
+        clamp_menu_x(menu, x, metrics),
+        clamp_menu_top(menu, top, metrics),
     ))
 }
 
-fn active_menu_panels(active: &ActiveMenu) -> Vec<DesktopMenu> {
+fn active_menu_panels(active: &ActiveMenu, metrics: DesktopMetrics) -> Vec<DesktopMenu> {
     let mut panels = Vec::new();
     for level in 0..=active.open_path.len() {
         let (Some(menu), Some(geometry)) = (
             menu_at_level(active, level),
-            menu_level_geometry(active, level),
+            menu_level_geometry(active, level, metrics),
         ) else {
             break;
         };
@@ -3448,9 +3617,14 @@ fn active_menu_panels(active: &ActiveMenu) -> Vec<DesktopMenu> {
     panels
 }
 
-fn active_menu_contains(active: &Option<ActiveMenu>, x: i32, y: i32) -> bool {
+fn active_menu_contains(
+    active: &Option<ActiveMenu>,
+    x: i32,
+    y: i32,
+    metrics: DesktopMetrics,
+) -> bool {
     active.as_ref().is_some_and(|menu| {
-        active_menu_panels(menu)
+        active_menu_panels(menu, metrics)
             .iter()
             .any(|panel| panel.bounds.contains(x, y))
     })
@@ -3467,8 +3641,14 @@ fn menu_row_arrow_contains(panel: &DesktopMenu, row: &DesktopMenuItem, x: i32, y
     }
 }
 
-fn update_menu_hover(active: &mut ActiveMenu, x: i32, y: i32, now: Instant) {
-    let panels = active_menu_panels(active);
+fn update_menu_hover(
+    active: &mut ActiveMenu,
+    x: i32,
+    y: i32,
+    now: Instant,
+    metrics: DesktopMetrics,
+) {
+    let panels = active_menu_panels(active, metrics);
     let Some((level, panel)) = panels
         .iter()
         .enumerate()
@@ -3537,8 +3717,12 @@ fn menu_candidate_is_still_hovered(
     candidate: MenuHoverCandidate,
     x: i32,
     y: i32,
+    metrics: DesktopMetrics,
 ) -> bool {
-    let Some(panel) = active_menu_panels(active).get(candidate.level).cloned() else {
+    let Some(panel) = active_menu_panels(active, metrics)
+        .get(candidate.level)
+        .cloned()
+    else {
         return false;
     };
     let Some(row) = panel.rows.get(candidate.row) else {
@@ -3585,12 +3769,12 @@ fn valid_selection_path(root: &WimpMenu, old_path: &[usize], open_path: &[usize]
     selected
 }
 
-fn menu_mouse_down(state: &mut WimpState, x: i32, y: i32, buttons: u32) {
+fn menu_mouse_down(state: &mut WimpState, x: i32, y: i32, buttons: u32, metrics: DesktopMetrics) {
     let selection = {
         let Some(active) = state.active_menu.as_mut() else {
             return;
         };
-        let panels = active_menu_panels(active);
+        let panels = active_menu_panels(active, metrics);
         let Some((level, panel)) = panels
             .iter()
             .enumerate()
@@ -3666,11 +3850,12 @@ fn menu_mouse_down(state: &mut WimpState, x: i32, y: i32, buttons: u32) {
 }
 
 fn pointer_window_and_icon(state: &WimpState, x: i32, y: i32) -> (i32, i32) {
-    if active_menu_contains(&state.active_menu, x, y) {
+    let metrics = state.desktop_metrics;
+    if active_menu_contains(&state.active_menu, x, y, metrics) {
         return (-1, -1);
     }
-    if (0..DESKTOP_ICONBAR_HEIGHT).contains(&y) {
-        let icon = layout_icon_bar(&state.icons, &state.windows)
+    if (0..iconbar_height(metrics)).contains(&y) {
+        let icon = layout_icon_bar(&state.icons, &state.windows, metrics)
             .into_iter()
             .find(|icon| icon.bounds.contains(x, y));
         return icon.map_or((-2, -1), |icon| {
@@ -3734,12 +3919,13 @@ fn enqueue_for_owner(state: &mut WimpState, owner: u32, event: QueuedEvent) -> b
             read_word(&event.block, 24) as i32,
         );
         let behind = read_word(&event.block, 28) as i32;
+        let metrics = state.desktop_metrics;
         let Ok(stacking) = stacking_after_open(state, handle, behind) else {
             return false;
         };
         let window = state.windows.get_mut(&handle).unwrap();
         if validate_visible_area(window.work_extent, area, scroll.0, scroll.1).is_err()
-            || validate_screen_area(window, area).is_err()
+            || validate_screen_area(window, area, metrics).is_err()
         {
             return false;
         }
@@ -3908,18 +4094,18 @@ fn send_to_back(state: &mut WimpState, handle: u32) {
     queue_visible_invalid_redraws(state);
 }
 
-fn maximum_window_area(window: &WimpWindow) -> WorkArea {
+fn maximum_window_area(window: &WimpWindow, metrics: DesktopMetrics) -> WorkArea {
     let min_x = FRAME_BORDER;
     let min_y = if window.resizable && !window.has_vertical_scrollbar {
-        DESKTOP_ICONBAR_HEIGHT + SIZE_ICON_HEIGHT + FRAME_BORDER
+        iconbar_height(metrics) + SIZE_ICON_HEIGHT + FRAME_BORDER
     } else {
-        DESKTOP_ICONBAR_HEIGHT + FRAME_BORDER
+        iconbar_height(metrics) + FRAME_BORDER
     };
     let width = (window.work_extent.max_x - window.work_extent.min_x)
-        .min(DESKTOP_WIDTH - min_x - window_outer_extra_x(window))
+        .min(metrics.os_width() - min_x - window_outer_extra_x(window))
         .max(1);
     let height = (window.work_extent.max_y - window.work_extent.min_y)
-        .min(DESKTOP_HEIGHT - min_y - window_outer_top_extra_y(window))
+        .min(metrics.os_height() - min_y - window_outer_top_extra_y(window))
         .max(1);
     WorkArea {
         min_x,
@@ -3927,6 +4113,123 @@ fn maximum_window_area(window: &WimpWindow) -> WorkArea {
         max_x: min_x + width,
         max_y: min_y + height,
     }
+}
+
+fn iconbar_height(metrics: DesktopMetrics) -> i32 {
+    DESKTOP_ICONBAR_HEIGHT.min(metrics.os_height())
+}
+
+fn clamp_work_area_to_metrics(
+    window: &WimpWindow,
+    area: WorkArea,
+    metrics: DesktopMetrics,
+) -> WorkArea {
+    let min_x = FRAME_BORDER;
+    let min_y = iconbar_height(metrics)
+        + if window.resizable && !window.has_vertical_scrollbar {
+            SIZE_ICON_HEIGHT + FRAME_BORDER
+        } else {
+            FRAME_BORDER
+        };
+    let max_work_width = metrics
+        .os_width()
+        .saturating_sub(min_x)
+        .saturating_sub(window_outer_extra_x(window))
+        .max(1);
+    let max_work_height = metrics
+        .os_height()
+        .saturating_sub(min_y)
+        .saturating_sub(window_outer_top_extra_y(window))
+        .max(1);
+    let old_width = area.max_x.saturating_sub(area.min_x).max(1);
+    let old_height = area.max_y.saturating_sub(area.min_y).max(1);
+    let width = old_width.min(max_work_width);
+    let height = old_height.min(max_work_height);
+    let max_min_x = metrics
+        .os_width()
+        .saturating_sub(width)
+        .saturating_sub(window_outer_extra_x(window))
+        .max(min_x);
+    let min_x = area.min_x.clamp(min_x, max_min_x);
+    let top_limit = metrics
+        .os_height()
+        .saturating_sub(window_outer_top_extra_y(window));
+    let max_y = area
+        .max_y
+        .clamp(min_y + height, top_limit.max(min_y + height));
+    let min_y = (max_y - height).max(min_y);
+    WorkArea {
+        min_x,
+        min_y,
+        max_x: min_x + width,
+        max_y: min_y + height,
+    }
+}
+
+/// Refit visible windows to a changed logical desktop while keeping their
+/// work extents and scroll origins. Hidden windows are marked for clamping on
+/// their next Wimp_OpenWindow call.
+fn reflow_windows_after_metrics_change(state: &mut WimpState) {
+    let metrics = state.desktop_metrics;
+    let handles = state
+        .windows
+        .keys()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let mut reflowed = std::collections::HashSet::new();
+
+    for window in state.windows.values_mut() {
+        window.preview_area = None;
+        window.preview_scroll = None;
+        window.toggle_request_pending = false;
+        if !window.open {
+            window.needs_display_reflow = true;
+            continue;
+        }
+        let area = clamp_work_area_to_metrics(window, window.work_area, metrics);
+        let last_user_area = clamp_work_area_to_metrics(window, window.last_user_area, metrics);
+        window.work_area = area;
+        window.last_user_area = last_user_area;
+        window.needs_display_reflow = !window.console_window;
+        add_invalid_region(window, window.work_extent);
+        reflowed.insert(window.handle);
+    }
+
+    // Supersede move/resize requests and redraw loops captured using the old
+    // desktop bounds. Input and close events remain ordered in each task.
+    for task in state.tasks.values_mut() {
+        task.events.retain(|event| {
+            !(matches!(event.reason, 2 | 10) && handles.contains(&read_word(&event.block, 0)))
+        });
+    }
+
+    let mut open_requests = Vec::new();
+    for handle in reflowed {
+        let Some(window) = state.windows.get(&handle) else {
+            continue;
+        };
+        if window.console_window {
+            continue;
+        }
+        let behind = window_behind(state, handle);
+        open_requests.push((
+            window.owner_task_handle,
+            open_request_event(
+                window,
+                window.work_area,
+                (window.scroll_x, window.scroll_y),
+                behind,
+                0,
+                0,
+            ),
+        ));
+    }
+    for (owner, event) in open_requests {
+        let _ = enqueue_for_owner(state, owner, event);
+    }
+    state.active_menu = None;
+    state.pointer.x = state.pointer.x.clamp(0, metrics.os_width());
+    state.pointer.y = state.pointer.y.clamp(0, metrics.os_height());
 }
 
 fn toggle_window_size(state: &mut WimpState, handle: u32, select: bool) {
@@ -3944,7 +4247,7 @@ fn toggle_window_size(state: &mut WimpState, handle: u32, select: bool) {
         )
     } else {
         let current_behind = window_behind(state, handle);
-        let area = maximum_window_area(&snapshot);
+        let area = maximum_window_area(&snapshot, state.desktop_metrics);
         (
             area,
             (snapshot.work_extent.min_x, snapshot.work_extent.max_y),
@@ -4098,6 +4401,11 @@ fn close_window_in_state(state: &mut WimpState, handle: u32) {
                 owner.input.take(); // unblock an idle host console's ReadLine
             }
         }
+    }
+    for task in state.tasks.values_mut() {
+        task.events.retain(|event| {
+            !(matches!(event.reason, 2 | 10) && read_word(&event.block, 0) == handle)
+        });
     }
     state.stacking.retain(|item| *item != handle);
     if state.keyboard_focus == Some(handle) {
@@ -4351,21 +4659,27 @@ fn write_redraw_block(block: &mut [u8], window: &WimpWindow, rectangle: RedrawRe
     put_word(block, 40, rectangle.screen.max_y as u32);
 }
 
-fn layout_icon_bar(icons: &[WimpIcon], windows: &HashMap<u32, WimpWindow>) -> Vec<DesktopIcon> {
+fn layout_icon_bar(
+    icons: &[WimpIcon],
+    windows: &HashMap<u32, WimpWindow>,
+    metrics: DesktopMetrics,
+) -> Vec<DesktopIcon> {
     let mut output = Vec::with_capacity(icons.len());
     let mut left = 8;
     // Keep the single OS control clear of application icons.
-    let mut right = DESKTOP_WIDTH - 8 - ICONBAR_SYSTEM_AREA_OS;
+    let width_limit = metrics.os_width();
+    let bar_height = iconbar_height(metrics);
+    let mut right = width_limit - 8 - ICONBAR_SYSTEM_AREA_OS;
     for icon in icons
         .iter()
         .filter(|icon| icon.side == IconBarSide::Devices)
     {
-        let width = icon.width.clamp(120, DESKTOP_WIDTH / 2);
+        let width = icon.width.clamp(120, width_limit / 2);
         let bounds = DesktopRect {
             min_x: left,
             min_y: 4,
             max_x: left + width,
-            max_y: DESKTOP_ICONBAR_HEIGHT - 4,
+            max_y: bar_height - 4,
         };
         left = bounds.max_x + 4;
         output.push(DesktopIcon {
@@ -4389,12 +4703,12 @@ fn layout_icon_bar(icons: &[WimpIcon], windows: &HashMap<u32, WimpWindow>) -> Ve
                     .any(|window| window.owner_task_id == task_id && window.open)
             })
     }) {
-        let width = icon.width.clamp(120, DESKTOP_WIDTH / 2);
+        let width = icon.width.clamp(120, width_limit / 2);
         let bounds = DesktopRect {
             min_x: right - width,
             min_y: 4,
             max_x: right,
-            max_y: DESKTOP_ICONBAR_HEIGHT - 4,
+            max_y: bar_height - 4,
         };
         right = bounds.min_x - 4;
         output.push(DesktopIcon {
@@ -4686,7 +5000,9 @@ fn read_icon_contents(
                 .expect("pinned RISC OS 3.71 system sprites parse and verify")
         });
         // Local BASIC64 type has modern art and a classic BASIC fallback.
-        if sprite_name != "file_064" && sprites.get(sprite_name).is_none() {
+        if !matches!(sprite_name.as_str(), "file_064" | "display")
+            && sprites.get(sprite_name).is_none()
+        {
             return Err(program_error(format!(
                 "Wimp sprite {sprite_name:?} is not in the hosted RISC OS 3.71 sprite pool"
             )));
@@ -4700,13 +5016,22 @@ fn insert_console_window(
     owner_task_handle: u32,
     owner_task_id: u64,
     title: &str,
+    metrics: DesktopMetrics,
 ) -> Result<(), RuntimeError> {
     let handle = allocate_handle(&mut state.next_window_handle)?;
+    let max_x = metrics
+        .os_width()
+        .saturating_sub(VERTICAL_SCROLLBAR_WIDTH + FRAME_BORDER)
+        .max(48 + 48);
+    let max_y = metrics.os_height().saturating_sub(72);
+    let min_y = iconbar_height(metrics) + 4;
+    let area_width = 1280.min(max_x - 48);
+    let area_height = 1024.min(max_y.saturating_sub(min_y)).max(48);
     let area = WorkArea {
         min_x: 48,
-        min_y: DESKTOP_HEIGHT - 72 - 1024,
-        max_x: 48 + 1280,
-        max_y: DESKTOP_HEIGHT - 72,
+        min_y: max_y.saturating_sub(area_height).max(min_y),
+        max_x: 48 + area_width,
+        max_y,
     };
     let extent = WorkArea {
         min_x: 0,
@@ -4752,6 +5077,7 @@ fn insert_console_window(
             toggle_request_pending: false,
             restore_behind: -1,
             console_window: true,
+            needs_display_reflow: false,
         },
     );
     bring_to_front(state, handle);
@@ -4856,9 +5182,17 @@ fn program_error(message: impl Into<String>) -> RuntimeError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            mpsc,
+        },
+    };
 
     use super::*;
+    use crate::configure::ConfigureStore;
 
     const DESCRIPTION: u32 = 0x1100;
     const WINDOW_BLOCK: u32 = 0x1200;
@@ -4867,10 +5201,19 @@ mod tests {
     const STATE_BLOCK: u32 = 0x1500;
     const TASK_MAGIC: u32 = 0x4B53_4154;
     const MODERN_WINDOW_FLAGS: u32 = 0xB600_0002;
+    static NEXT_CONFIG_PATH: AtomicU64 = AtomicU64::new(0);
 
     fn new_server() -> Arc<WimpServer> {
         let (updates, _receiver) = mpsc::channel();
         WimpServer::new(updates)
+    }
+
+    fn temporary_config_path() -> PathBuf {
+        let sequence = NEXT_CONFIG_PATH.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "acorn-2026-wimp-display-test-{}-{sequence}",
+            std::process::id()
+        ))
     }
 
     fn initialize(server: &WimpServer, task: &mut Task) -> u32 {
@@ -6059,7 +6402,10 @@ mod tests {
         server.drag_to(drag, 100_000, -100_000);
         let clamped = server.desktop_windows()[0].preview_area.unwrap();
         validate_visible_area(EXTENT, clamped, 0, 0).unwrap();
-        validate_screen_area(&server.state.lock().unwrap().windows[&handle], clamped).unwrap();
+        {
+            let state = server.state.lock().unwrap();
+            validate_screen_area(&state.windows[&handle], clamped, state.desktop_metrics).unwrap();
+        }
 
         server.drag_to(drag, grab_x + 50, grab_y - 12);
         server.finish_drag(drag);
@@ -6079,5 +6425,225 @@ mod tests {
         let after = server.desktop_windows();
         assert_eq!(after[0].work_area, preview);
         assert_eq!(after[0].preview_area, None);
+    }
+
+    #[test]
+    fn window_resolution_tracks_host_size_and_fixed_modes_keep_it_separate() {
+        let path = temporary_config_path();
+        let server = new_server();
+        server.set_configure_store(ConfigureStore::with_path(&path), DisplaySettings::default());
+
+        let windowed = server.set_host_window_size(960, 700);
+        assert_eq!(windowed.pixel_size(), (960, 700));
+        assert_eq!(windowed.host_pixel_size(), (960, 700));
+
+        server
+            .apply_display_settings(DisplaySettings {
+                resolution: DesktopResolution::R640x480,
+                colour: DisplayColour::Rgb555,
+            })
+            .unwrap();
+        let fixed = server.set_host_window_size(1024, 768);
+        assert_eq!(fixed.pixel_size(), (640, 480));
+        assert_eq!(fixed.host_pixel_size(), (1024, 768));
+        assert_eq!((fixed.os_width(), fixed.os_height()), (1280, 960));
+
+        server
+            .apply_display_settings(DisplaySettings {
+                resolution: DesktopResolution::Window,
+                colour: DisplayColour::Rgb555,
+            })
+            .unwrap();
+        assert_eq!(server.desktop_metrics().pixel_size(), (1024, 768));
+        assert_eq!(
+            server.display_settings().resolution,
+            DesktopResolution::Window
+        );
+        assert_eq!(
+            ConfigureStore::with_path(&path)
+                .load()
+                .unwrap()
+                .display
+                .colour,
+            DisplayColour::Rgb555
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn resize_requests_are_coalesced_on_resolution_change_and_old_drags_expire() {
+        let path = temporary_config_path();
+        let server = new_server();
+        server.set_configure_store(ConfigureStore::with_path(&path), DisplaySettings::default());
+        let mut task = Task::new(7);
+        initialize(&server, &mut task);
+        let handle = create_window(&server, &mut task, "Test", AREA, EXTENT, 3);
+        open_window(&server, &mut task, handle, AREA, 0, 0, -1).unwrap();
+        complete_redraw(&server, &mut task, POLL_BLOCK);
+
+        let title = desktop_window_furniture(&server.desktop_windows()[0])
+            .title_bar
+            .unwrap();
+        let x = (title.min_x + title.max_x) / 2;
+        let y = (title.min_y + title.max_y) / 2;
+        let drag = server.mouse_down(x, y, 4).expect("title starts a move");
+        server.drag_to(drag, x + 80, y + 40);
+        server.finish_drag(drag);
+        assert!(server.desktop_windows()[0].preview_area.is_some());
+
+        server
+            .apply_display_settings(DisplaySettings {
+                resolution: DesktopResolution::R640x480,
+                colour: DisplayColour::Rgb888,
+            })
+            .unwrap();
+        server.drag_to(drag, x + 200, y + 80);
+        assert_eq!(server.desktop_windows()[0].preview_area, None);
+
+        {
+            let state = server.state.lock().unwrap();
+            assert_eq!(
+                state.tasks[&1]
+                    .events
+                    .iter()
+                    .filter(|event| event.reason == 2 && read_word(&event.block, 0) == handle)
+                    .count(),
+                1
+            );
+        }
+        let (reason, event) = poll(&server, &mut task, 1 | (1 << 1), POLL_BLOCK).unwrap();
+        assert_eq!(reason, 2);
+        assert_eq!(read_word(&event, 0), handle);
+        assert_eq!(read_word(&event, 4), AREA.min_x as u32);
+        assert_eq!(read_word(&event, 8), AREA.min_y as u32);
+        open_window(&server, &mut task, handle, AREA, 0, 0, -1).unwrap();
+        assert_eq!(server.desktop_windows()[0].work_extent, EXTENT);
+        complete_redraw(&server, &mut task, POLL_BLOCK);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn resolution_change_during_redraw_preserves_loop_and_reinvalidates_window() {
+        let path = temporary_config_path();
+        let server = new_server();
+        server.set_configure_store(ConfigureStore::with_path(&path), DisplaySettings::default());
+        let mut task = Task::new(8);
+        initialize(&server, &mut task);
+        let handle = create_window(&server, &mut task, "Test", AREA, EXTENT, 3);
+        open_window(&server, &mut task, handle, AREA, 0, 0, -1).unwrap();
+        complete_redraw(&server, &mut task, POLL_BLOCK);
+
+        let mut force_context = SwiContext::default();
+        force_context.registers[0] = handle;
+        force_context.registers[1] = EXTENT.min_x as u32;
+        force_context.registers[2] = EXTENT.min_y as u32;
+        force_context.registers[3] = EXTENT.max_x as u32;
+        force_context.registers[4] = EXTENT.max_y as u32;
+        server
+            .dispatch(WIMP_FORCE_REDRAW, &mut task, &mut force_context)
+            .unwrap();
+        let (reason, event) = poll(&server, &mut task, 0, POLL_BLOCK).unwrap();
+        assert_eq!(reason, 1);
+        assert_eq!(read_word(&event, 0), handle);
+
+        let mut redraw = SwiContext::default();
+        redraw.registers[1] = POLL_BLOCK;
+        server
+            .dispatch(WIMP_REDRAW_WINDOW, &mut task, &mut redraw)
+            .unwrap();
+        assert_eq!(redraw.registers[0], 1);
+        assert!(server.state.lock().unwrap().tasks[&1].redraw_loop.is_some());
+
+        server
+            .apply_display_settings(DisplaySettings {
+                resolution: DesktopResolution::R640x480,
+                colour: DisplayColour::Rgb888,
+            })
+            .unwrap();
+        assert!(server.state.lock().unwrap().tasks[&1].redraw_loop.is_some());
+        while redraw.registers[0] != 0 {
+            redraw.registers[1] = POLL_BLOCK;
+            server
+                .dispatch(WIMP_GET_RECTANGLE, &mut task, &mut redraw)
+                .unwrap();
+        }
+        {
+            let state = server.state.lock().unwrap();
+            assert!(state.tasks[&1].redraw_loop.is_none());
+            let invalid_regions = &state.windows[&handle].invalid_regions;
+            assert!(!invalid_regions.is_empty());
+            assert!(invalid_regions.iter().all(|region| {
+                region.min_x >= EXTENT.min_x
+                    && region.min_y >= EXTENT.min_y
+                    && region.max_x <= EXTENT.max_x
+                    && region.max_y <= EXTENT.max_y
+            }));
+            let invalid_area = invalid_regions
+                .iter()
+                .map(|region| {
+                    i64::from(region.max_x - region.min_x) * i64::from(region.max_y - region.min_y)
+                })
+                .sum::<i64>();
+            let extent_area =
+                i64::from(EXTENT.max_x - EXTENT.min_x) * i64::from(EXTENT.max_y - EXTENT.min_y);
+            assert_eq!(invalid_area, extent_area);
+        }
+
+        let (reason, event) = poll(&server, &mut task, 0, POLL_BLOCK).unwrap();
+        assert_eq!(reason, 2);
+        assert_eq!(read_word(&event, 0), handle);
+        let area = WorkArea {
+            min_x: read_word(&event, 4) as i32,
+            min_y: read_word(&event, 8) as i32,
+            max_x: read_word(&event, 12) as i32,
+            max_y: read_word(&event, 16) as i32,
+        };
+        open_window(
+            &server,
+            &mut task,
+            handle,
+            area,
+            read_word(&event, 20) as i32,
+            read_word(&event, 24) as i32,
+            read_word(&event, 28) as i32,
+        )
+        .unwrap();
+        let (reason, event) = poll(&server, &mut task, 0, POLL_BLOCK).unwrap();
+        assert_eq!(reason, 1);
+        assert_eq!(read_word(&event, 0), handle);
+        let mut redraw = SwiContext::default();
+        redraw.registers[1] = POLL_BLOCK;
+        server
+            .dispatch(WIMP_REDRAW_WINDOW, &mut task, &mut redraw)
+            .unwrap();
+        while redraw.registers[0] != 0 {
+            redraw.registers[1] = POLL_BLOCK;
+            server
+                .dispatch(WIMP_GET_RECTANGLE, &mut task, &mut redraw)
+                .unwrap();
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_display_persistence_keeps_the_active_metrics_unchanged() {
+        let server = new_server();
+        server.set_configure_store(
+            ConfigureStore::with_path("/proc/self/acorn-2026-display-test/configure"),
+            DisplaySettings::default(),
+        );
+        let before_metrics = server.desktop_metrics();
+        let before_settings = server.display_settings();
+        assert!(
+            server
+                .apply_display_settings(DisplaySettings {
+                    resolution: DesktopResolution::R640x480,
+                    colour: DisplayColour::Grey4,
+                })
+                .is_err()
+        );
+        assert_eq!(server.desktop_metrics(), before_metrics);
+        assert_eq!(server.display_settings(), before_settings);
     }
 }

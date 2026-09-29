@@ -907,7 +907,7 @@ fn parse_palette(
     Ok(palette)
 }
 
-fn default_palette(bits_per_pixel: usize) -> Result<Vec<[u8; 4]>, ResourceError> {
+pub(crate) fn default_palette(bits_per_pixel: usize) -> Result<Vec<[u8; 4]>, ResourceError> {
     match bits_per_pixel {
         1 => Ok(vec![wimp_palette()[0], wimp_palette()[7]]),
         2 => Ok(vec![

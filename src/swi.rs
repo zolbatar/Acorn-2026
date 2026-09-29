@@ -1,5 +1,6 @@
 use crate::{
     configure::{BasicConfiguration, BasicEngine, ConfigureStore, StartupLanguage},
+    display::{DesktopResolution, DisplayColour, DisplaySettings},
     error::RuntimeError,
     filesystem::{
         FILETYPE_BASIC, FILETYPE_BASIC64, FILETYPE_TEXT, FileMetadata, HostFileSystem, OpenFile,
@@ -96,6 +97,11 @@ const R3: usize = 3;
 const R4: usize = 4;
 const R5: usize = 5;
 const R6: usize = 6;
+const R7: usize = 7;
+const R8: usize = 8;
+const ACORN_DISPLAY_ABI_VERSION: u32 = 1;
+const ACORN_DISPLAY_QUERY: u32 = 0;
+const ACORN_DISPLAY_APPLY: u32 = 1;
 const HOST_FS_NUMBER: u32 = 1;
 const HOST_FS_CONTROL_BLOCK: u32 = GUEST_MEMORY_BASE;
 const GUEST_ADDRESS_MASK: u32 = 0x3FFF_FFFF;
@@ -122,6 +128,19 @@ fn work_area_to_graphics_clip(
         right: right.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
         top: top.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
     }
+}
+
+fn write_display_query(wimp: &WimpServer, context: &mut SwiContext) {
+    let settings = wimp.display_settings();
+    let metrics = wimp.desktop_metrics();
+    let (width, height) = metrics.pixel_size();
+    let (host_width, host_height) = metrics.host_pixel_size();
+    context.registers[R2] = settings.resolution.id();
+    context.registers[R3] = settings.colour.id();
+    context.registers[R4] = width;
+    context.registers[R5] = height;
+    context.registers[R6] = host_width;
+    context.registers[R7] = host_height;
 }
 
 fn hsv_to_rgb(hue: f64, saturation: f64, value: f64) -> (u8, u8, u8) {
@@ -450,6 +469,7 @@ impl SwiDispatcher {
             "WIMP_CLOSEDOWN" => self.dispatch_wimp(WIMP_CLOSE_DOWN, task, context),
             "WIMP_STARTTASK" => self.dispatch_wimp(WIMP_START_TASK, task, context),
             "ACORN_DESKTOP" => self.acorn_desktop(task, context),
+            "ACORN_DISPLAY" => self.acorn_display(context),
             _ => Err(RuntimeError::Program(format!(
                 "named SWI {name} is not available in the hosted profile"
             ))),
@@ -693,6 +713,51 @@ impl SwiDispatcher {
             }
             action => Err(RuntimeError::Program(format!(
                 "Acorn_Desktop action {action} is not supported"
+            ))),
+        }
+    }
+
+    /// Versioned, register-only Display Manager service. A combined apply is
+    /// persisted before Wimp state changes; R8 reports a persistence failure
+    /// without terminating the BASIC64 Desktop task.
+    fn acorn_display(&mut self, context: &mut SwiContext) -> Result<(), RuntimeError> {
+        if context.registers[R0] != ACORN_DISPLAY_ABI_VERSION {
+            return Err(RuntimeError::Program(format!(
+                "Acorn_Display ABI version {} is unsupported",
+                context.registers[R0]
+            )));
+        }
+        let wimp = self.wimp.as_ref().ok_or_else(|| {
+            RuntimeError::Program("Acorn_Display requires the hosted Wimp desktop".into())
+        })?;
+        match context.registers[R1] {
+            ACORN_DISPLAY_QUERY => {
+                write_display_query(wimp, context);
+                context.registers[R8] = 0;
+                Ok(())
+            }
+            ACORN_DISPLAY_APPLY => {
+                let resolution =
+                    DesktopResolution::from_id(context.registers[R2]).ok_or_else(|| {
+                        RuntimeError::Program(format!(
+                            "Acorn_Display resolution ID {} is invalid",
+                            context.registers[R2]
+                        ))
+                    })?;
+                let colour = DisplayColour::from_id(context.registers[R3]).ok_or_else(|| {
+                    RuntimeError::Program(format!(
+                        "Acorn_Display colour ID {} is invalid",
+                        context.registers[R3]
+                    ))
+                })?;
+                let settings = DisplaySettings { resolution, colour };
+                let saved = wimp.apply_display_settings(settings).is_ok();
+                write_display_query(wimp, context);
+                context.registers[R8] = if saved { 0 } else { 1 };
+                Ok(())
+            }
+            action => Err(RuntimeError::Program(format!(
+                "Acorn_Display action {action} is unsupported"
             ))),
         }
     }
@@ -2201,9 +2266,9 @@ impl SwiDispatcher {
 
             // Validate the saved preference at the desktop boundary, then
             // make the same store available to BASIC tasks started by Wimp.
-            self.load_basic_configuration()?;
+            let configuration = self.load_basic_configuration()?;
             self.desktop_service = None;
-            wimp.set_configure_store(self.configure.clone());
+            wimp.set_configure_store(self.configure.clone(), configuration.display);
 
             self.desktop_requested = true;
             self.wimp = Some(Arc::clone(&wimp));
@@ -2237,7 +2302,7 @@ impl SwiDispatcher {
         if arguments.is_empty() {
             self.write_inline(
                 task,
-                b"Syntax: *CONFIGURE <option> <value>\n\r  Language 0|3 (MOS prompt|desktop on load)\n\r  WindowFurniture Flat|Bevelled (restart app to apply)\n\r  BASICMode Auto|Classic|BASIC64|Hybrid\n\r  BASICProfile Auto|<profile>\n\r  BASICTarget Auto|Hosted|RISCOS|Agon\n\r  BASICEngine Interpreter|Hybrid|Strict\n\r  *CONFIGURE DEFAULTS resets all configuration preferences.",
+                b"Syntax: *CONFIGURE <option> <value>\n\r  Language 0|3 (MOS prompt|desktop on load)\n\r  WindowFurniture Flat|Bevelled (restart app to apply)\n\r  DisplayResolution Window|640x480|800x600|1024x768|1152x864|1280x1024|1600x1200\n\r  DisplayColour BW|4Grey|16Grey|16Colour|256Grey|256Colour|32KRGB555|16MRGB888\n\r  BASICMode Auto|Classic|BASIC64|Hybrid\n\r  BASICProfile Auto|<profile>\n\r  BASICTarget Auto|Hosted|RISCOS|Agon\n\r  BASICEngine Interpreter|Hybrid|Strict\n\r  *CONFIGURE DEFAULTS resets all configuration preferences.",
             )?;
             return self.write_new_line(task);
         }
@@ -2586,6 +2651,8 @@ fn log_jit_report(command: &str, report: crate::basic_compat::JitExecutionReport
 mod tests {
     use std::sync::mpsc;
 
+    use crate::display::{DesktopResolution, DisplayColour, DisplaySettings};
+
     use super::*;
 
     fn put_word(block: &mut [u8], offset: usize, value: u32) {
@@ -2793,6 +2860,87 @@ mod tests {
             );
         }
         let _ = std::fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn acorn_display_swi_queries_applies_and_reports_save_failure_in_registers() {
+        let path =
+            std::env::temp_dir().join(format!("acorn-2026-display-swi-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let (display_sender, _display_receiver) = mpsc::channel();
+        let wimp = WimpServer::new(mpsc::channel().0);
+        wimp.set_configure_store(ConfigureStore::with_path(&path), DisplaySettings::default());
+        let mut dispatcher = SwiDispatcher::desktop_task(
+            HostConsole::windowed(mpsc::channel().1),
+            display_sender,
+            77,
+            wimp.clone(),
+        );
+        let mut task = Task::new(77);
+        let mut query = SwiContext::default();
+        query.registers[R0] = ACORN_DISPLAY_ABI_VERSION;
+        query.registers[R1] = ACORN_DISPLAY_QUERY;
+        dispatcher
+            .dispatch_named_swi("ACORN_DISPLAY", &mut task, &mut query)
+            .unwrap();
+        assert_eq!(query.registers[R2], DesktopResolution::Window.id());
+        assert_eq!(query.registers[R3], DisplayColour::Rgb888.id());
+        assert_eq!((query.registers[R4], query.registers[R5]), (800, 600));
+        assert_eq!((query.registers[R6], query.registers[R7]), (800, 600));
+
+        let mut apply = SwiContext::default();
+        apply.registers[R0] = ACORN_DISPLAY_ABI_VERSION;
+        apply.registers[R1] = ACORN_DISPLAY_APPLY;
+        apply.registers[R2] = DesktopResolution::R640x480.id();
+        apply.registers[R3] = DisplayColour::Rgb555.id();
+        dispatcher
+            .dispatch_named_swi("ACORN_DISPLAY", &mut task, &mut apply)
+            .unwrap();
+        assert_eq!(apply.registers[R8], 0);
+        assert_eq!((apply.registers[R4], apply.registers[R5]), (640, 480));
+        assert_eq!(
+            ConfigureStore::with_path(&path).load().unwrap().display,
+            DisplaySettings {
+                resolution: DesktopResolution::R640x480,
+                colour: DisplayColour::Rgb555,
+            }
+        );
+
+        let mut invalid_version = SwiContext::default();
+        invalid_version.registers[R0] = 2;
+        invalid_version.registers[R1] = ACORN_DISPLAY_QUERY;
+        assert!(
+            dispatcher
+                .dispatch_named_swi("ACORN_DISPLAY", &mut task, &mut invalid_version)
+                .is_err()
+        );
+        let _ = std::fs::remove_file(path);
+
+        #[cfg(target_os = "linux")]
+        {
+            let (failed_display_sender, _failed_display_receiver) = mpsc::channel();
+            let failed_wimp = WimpServer::new(mpsc::channel().0);
+            failed_wimp.set_configure_store(
+                ConfigureStore::with_path("/proc/self/acorn-2026-display-test/configure"),
+                DisplaySettings::default(),
+            );
+            let mut failed_dispatcher = SwiDispatcher::desktop_task(
+                HostConsole::windowed(mpsc::channel().1),
+                failed_display_sender,
+                78,
+                failed_wimp.clone(),
+            );
+            let mut failed_apply = SwiContext::default();
+            failed_apply.registers[R0] = ACORN_DISPLAY_ABI_VERSION;
+            failed_apply.registers[R1] = ACORN_DISPLAY_APPLY;
+            failed_apply.registers[R2] = DesktopResolution::R640x480.id();
+            failed_apply.registers[R3] = DisplayColour::Grey4.id();
+            failed_dispatcher
+                .dispatch_named_swi("ACORN_DISPLAY", &mut Task::new(78), &mut failed_apply)
+                .unwrap();
+            assert_eq!(failed_apply.registers[R8], 1);
+            assert_eq!(failed_wimp.display_settings(), DisplaySettings::default());
+        }
     }
 
     #[test]

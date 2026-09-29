@@ -1,8 +1,15 @@
-# Acorn-2026
+# Trellis (Acorn-2026)
 
 > **Build the computer Acorn might have built in 2026.**
 
-Acorn-2026 is a design and implementation project for a modern, tinkerable computer environment inspired by Acorn and RISC OS. It preserves useful ideas and source-compatible interfaces while replacing historical implementation limits. It is not a full RISC OS simulator or desktop remake; its desktop keeps the Wimp interaction model and Filer conventions, with a modern visual style by default.
+Trellis is a design and implementation project for a modern, tinkerable
+computer environment inspired by Acorn and RISC OS. Its mission is to make the
+computer understandable, programmable and malleable by the person using it.
+It preserves useful ideas and source-compatible interfaces while replacing
+historical implementation limits. It is not a full RISC OS simulator or desktop
+remake; its desktop keeps the Wimp interaction model and Filer conventions, with
+a modern visual style by default. The live-system direction and bootstrap model
+are documented in [`docs/trellis-architecture.md`](docs/trellis-architecture.md).
 
 This project was also inspired by [pmirvine/risc-os](https://github.com/pmirvine/risc-os).
 
@@ -114,6 +121,22 @@ BASIC runs. `WimpAlpha` and `WimpBeta` in
 [`demo-volume/Examples`](demo-volume/Examples) demonstrate shared Wimp windows.
 For a headless rendering of the default Desktop and Filer, run
 `cargo run -- --filer-snapshot /tmp/acorn-filer.ppm`.
+
+The monitor icon opens Display Manager. **Window** resolution follows the host
+window's logical content size; fixed resolutions keep a stable workspace and
+scale to fit. **Colours** selects a GPU output profile for the whole desktop,
+without changing a running BASIC program's MODE or pixel-read semantics.
+Cancel discards pending choices; Change applies and saves both settings.
+
+To exercise the real BASIC64 dialog and capture its menus and display changes
+through the GPU, run:
+
+```sh
+ACORN_VELLO_SNAPSHOT=1 cargo run -- --display-manager-snapshots /tmp/acorn-display-manager
+```
+
+This validation command uses an isolated configuration and requires a graphics
+adapter; it does not change your saved display preferences.
 
 The Filer does not edit or mutate files. The current Wimp content adapter paints
 each task's BASIC display snapshot inside its window; guest redraw rectangles,

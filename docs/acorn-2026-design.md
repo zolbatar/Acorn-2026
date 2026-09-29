@@ -1,8 +1,14 @@
-# Acorn-2026: Design Brief
+# Acorn-2026 / Trellis: Design Brief
 
 Rendering validation: set `ACORN_VELLO_SNAPSHOT=1` when running the existing Filer snapshot commands to render the real Vello scene on the GPU, including an sRGB presentation round trip. This requires access to a graphics adapter; it must fail explicitly rather than silently substitute the legacy software renderer. Vello's display-encoded output must not receive a second sRGB encoding during presentation. The native backend prefers a non-sRGB surface; its sRGB-only fallback samples through a decoding view before the destination encodes.
 
 > **Build the computer Acorn might have built in 2026.**
+
+The environment is named **Trellis**. Its mission is to make the computer
+understandable, programmable and malleable by the person using it, continuing
+the Acorn tradition through a modern, live and inspectable RISC OS environment.
+The live-system architecture, module-owned SWI decision, and bootstrap boundary
+are specified in [`trellis-architecture.md`](trellis-architecture.md).
 
 This is a design brief for a new, tinkerable computer environment inspired by Acorn and RISC OS. It is a re-imagining, not a RISC OS 3.71 simulator or a cosmetic remake. RISC OS supplies ideas and a valuable body of API knowledge; it does not dictate the implementation.
 
@@ -55,7 +61,7 @@ The Rust runtime is the machine's low-level service core, not a traditional kern
 │                  optional experimental JIT                    │
 ├───────────────────────────────────────────────────────────────┤
 │ Global SWI dispatcher and module namespace                     │
-│ Rust services             BASIC64 modules                      │
+│ BASIC64 modules wrapping protected Rust primitives             │
 ├───────────────────────────────────────────────────────────────┤
 │ Rust runtime core: tasks, logical memory, IPC, host I/O,        │
 │ graphics/text service boundary, scheduling policy              │
@@ -64,7 +70,7 @@ The Rust runtime is the machine's low-level service core, not a traditional kern
 └───────────────────────────────────────────────────────────────┘
 ```
 
-Rust owns mechanisms that need a small, dependable implementation boundary: task identity and scheduling, address translation, memory allocation and protection, service dispatch, inter-task communication, and access to host facilities. BASIC64 owns most system policy and user-facing behavior: desktop rules, Filer behavior, application conventions, and higher-level services. A service can be implemented in either language and still appear through the same SWI namespace.
+Rust owns mechanisms that need a small, dependable implementation boundary: task identity and scheduling, address translation, memory allocation and protection, service dispatch, inter-task communication, and access to host facilities. BASIC64 owns the public SWI implementations as well as most system policy and user-facing behavior: desktop rules, Filer behavior, application conventions, and higher-level services. A BASIC64 SWI definition may wrap a protected Rust primitive, but the primitive is not itself a public SWI provider.
 
 This boundary is a starting point, not a demand to put every policy decision in one layer. Keep the trusted Rust core small enough to inspect, and make system behavior that users may reasonably want to change available as BASIC64 source.
 
@@ -153,21 +159,37 @@ API compatibility is a central constraint. Preserve familiar service names, `SYS
 
 Do not confuse the historical implementation with the public contract. A SWI can keep its name and calling behavior while its handler uses Rust-owned task contexts and translated memory access rather than dereferencing a process-wide host pointer. BASIC64 may add higher-level APIs, but those should sit alongside the stable service surface.
 
-### One namespace, multiple implementation languages
+### One namespace, module-owned implementations
 
-The dispatcher exposes one global SWI namespace. A provider may be written in Rust or BASIC64. The caller should not need to know which language implements a service.
+The dispatcher exposes one global SWI namespace. Every public SWI is exported
+by a module and implemented by a versioned BASIC64 definition. That definition
+may implement the service, alias another definition, or wrap a private,
+capability-protected Rust primitive. Rust hard-codes no public SWI name, number,
+or semantic handler.
 
 ```text
-                    Global SWI namespace
-                    /                   \
-          Rust service               BASIC64 module
-                 \                    /
-                  SWI caller context
+                  Global SWI namespace
                            │
-                 translated memory access
+                 BASIC64 module definition
+                           │
+             BASIC64 service, alias, or wrapper
+                           │
+              protected Rust primitive if needed
+                           │
+                  host or machine mechanism
 ```
 
-The Rust core provides foundational services and the execution/runtime machinery. The desktop, Filer, Wimp-like behavior, and most higher-level OS policy can be BASIC64 modules. Module workspaces belong to modules; parameters supplied by an application belong to the calling task. The dispatcher carries caller identity across the whole call chain.
+Rust owns dispatch, caller context, logical-memory translation, capability
+enforcement, module lifecycle, and execution machinery. Module workspaces belong
+to modules; parameters supplied by an application belong to the calling task.
+The dispatcher carries caller identity across the whole call chain.
+
+The initial SWI environment is supplied by BASIC64 foundation modules loaded
+from a trusted boot capsule. Before they are published, no SWI environment
+exists. Native bootstrap operations and emergency diagnostics use a private
+primitive interface rather than special hard-coded SWIs. See
+[`trellis-architecture.md`](trellis-architecture.md) for the normative bootstrap
+sequence and module model.
 
 `SYS`, module concepts, and the RISC OS service vocabulary are valuable points of continuity. They should remain usable even though the implementation beneath them is new.
 
@@ -493,6 +515,15 @@ Transparent margins are trimmed and aspect ratio preserved within the existing
 sampling at host display scale. The source PNG is unchanged. Compatibility sprite
 rendering is retained for other guest applications.
 
+Modern Filer selection highlights the filename while leaving the icon artwork
+unchanged, including caller-supplied fallback artwork. The complete icon and label
+remain the existing Wimp click target. Compatibility-profile icons retain their
+selection recolouring; selection flags and public Wimp contracts are unchanged.
+The compositor reuses converted icon images and modern text layouts across
+repaints with bounded caches, keeping selection colour separate from text shaping.
+Classic guest graphics remain CPU-authoritative; line rasterization holds the
+surface lock for a complete primitive rather than acquiring it for every pixel.
+
 ### BASIC64 source filetype
 
 Acorn-2026 assigns the local user-range filetype **&064 (BASIC64)** to UTF-8
@@ -583,3 +614,43 @@ Extended MODE blocks publish their new raster immediately, just like numbered
 VDU modes. Desktop file launches use the same throttled snapshot batching and
 final-frame publication as MOS BASIC launches, so ColourTrans drawing and shared
 true-colour surfaces reach the compositor without replaying millions of plots.
+
+### Display Manager and hosted display settings
+
+The Display Manager is BASIC64 desktop policy. Its monitor icon uses the supplied
+`display-glossy-v1-1024.png` system artwork and opens one reusable window with
+Colours and Resolution menus and Cancel/Change buttons. Menu choices are pending
+until Change; Cancel discards them. Accepted settings are saved together through
+the host configuration store. A save failure leaves the active settings unchanged.
+
+Resolution describes the Acorn workspace, never the host monitor mode. Window
+tracks the host client area's logical size, including subsequent resizes. Fixed
+640×480, 800×600, 1024×768, 1152×864, 1280×1024 and 1600×1200 settings retain their
+logical dimensions while the host window scales/letterboxes that workspace.
+There are two Wimp OS units per logical desktop pixel. Host backing pixels are
+separate: Vello renders at physical surface resolution while drawing and pointer
+input share the same transform. The old 1600×1200-OS-unit default corresponds to
+800×600 logical pixels; guest coordinate blocks remain expressed in OS units.
+Window plus 16 million colours is the default for configurations without display
+settings. Shared mutable metrics replace fixed runtime desktop bounds. Mode
+changes retain guest surfaces and work extents, keep window controls reachable,
+and notify affected guest windows so their content can reflow.
+
+Colours constrains the final composed desktop on the GPU. The compositor and
+source images remain full-colour: black/white and 4/16/256 greys use quantized
+luminance, 16 and 256 colours use the bundled Wimp and `8desktop` palettes,
+32 thousand uses RGB555, and 16 million preserves RGB888 output. Presentation
+must retain the existing sRGB round-trip rules. These are output profiles, not
+indexed guest framebuffer implementations: BASIC MODE, palette state and
+synchronous OS_ReadPoint results are unchanged. Lower colour counts do not
+promise better performance. Switching back restores the original source colours.
+
+The additive named `Acorn_Display` service has a register-only versioned ABI:
+R0=1, R1=0 queries; R0=1, R1=1 applies R2=resolution and R3=colour together.
+Resolution IDs 0–6 are Window followed by the six fixed modes above. Colour IDs
+0–7 are black/white, 4 greys, 16 greys, 16 colours, 256 greys, 256 colours,
+32 thousand and 16 million. Query/apply returns active IDs in R2/R3, active logical
+dimensions in R4/R5 and current host logical dimensions in R6/R7. R8 is zero on
+success or one when saving an otherwise valid request fails. Invalid ABI versions,
+actions and enum IDs are checked errors. The service does not expose host pointers
+or reinterpret an existing RISC OS SWI.

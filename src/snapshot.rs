@@ -11,13 +11,15 @@ use std::{
 };
 
 use crate::{
+    configure::ConfigureStore,
+    display::{DesktopResolution, DisplayColour, DisplaySettings},
     graphics::{GraphicsService, GraphicsSnapshot},
     renderer, riscos_font,
     runtime::Runtime,
     swi::DisplayEvent,
     wimp::{
         DESKTOP_PIXEL_HEIGHT, DESKTOP_PIXEL_WIDTH, DesktopIcon, DesktopMenu, DesktopMenuItem,
-        DesktopWindow, DesktopWindowIcon, WimpServer,
+        DesktopRect, DesktopWindow, DesktopWindowIcon, IconBarSide, WimpServer,
     },
 };
 
@@ -45,6 +47,16 @@ struct FilerDesktopScene {
     desktop_icons: Vec<DesktopIcon>,
     window_icons: Vec<DesktopWindowIcon>,
     menus: Vec<DesktopMenu>,
+}
+
+#[derive(Clone)]
+struct DisplayManagerScene {
+    windows: Vec<DesktopWindow>,
+    desktop_icons: Vec<DesktopIcon>,
+    window_icons: Vec<DesktopWindowIcon>,
+    menus: Vec<DesktopMenu>,
+    metrics: crate::display::DesktopMetrics,
+    colour: DisplayColour,
 }
 
 /// Execute both BASIC Wimp examples and save the rendered desktop as a P6 PPM.
@@ -154,6 +166,566 @@ pub fn write_filer_interaction_snapshots(
 ) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(directory.as_ref())?;
     write_filer_snapshot_mode(directory, FilerSnapshotMode::Interactions)
+}
+
+/// Exercise the BASIC64 Display Manager and save dynamic-size, colour-profile
+/// captures for its popup, pending, Cancel, and Change states.
+pub fn write_display_manager_snapshots(directory: impl AsRef<Path>) -> Result<(), Box<dyn Error>> {
+    let directory = directory.as_ref().to_path_buf();
+    fs::create_dir_all(&directory)?;
+    let configure_path = std::env::temp_dir().join(format!(
+        "acorn-2026-display-snapshot-{}-{}.configure",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    let _ = fs::remove_file(&configure_path);
+    let blocked_parent_path = configure_path.with_extension("blocker-file");
+    let configure = ConfigureStore::with_path(&configure_path);
+    let initial_settings = configure.load().map_err(io::Error::other)?.display;
+
+    let (display_sender, display_receiver) = mpsc::channel();
+    let (task_error_sender, task_error_receiver) = mpsc::channel();
+    let (desktop_updates, _desktop_update_receiver) = mpsc::channel();
+    let wimp = WimpServer::new(desktop_updates);
+    wimp.set_configure_store(configure.clone(), initial_settings);
+    wimp.task_started(DESKTOP_TASK, "Acorn Desktop")?;
+
+    let desktop_source = fs::read_to_string(format!(
+        "{}/demo-volume/System/Desktop.bas64",
+        env!("CARGO_MANIFEST_DIR")
+    ))?;
+    let (desktop_input_sender, desktop_input_receiver) = mpsc::channel();
+    let task_wimp = Arc::clone(&wimp);
+    let task_display = display_sender.clone();
+    let task_errors = task_error_sender.clone();
+    let desktop_worker = thread::Builder::new()
+        .name("snapshot-display-manager-desktop".into())
+        .spawn(move || {
+            let _keep_input_open = desktop_input_sender;
+            let mut runtime = Runtime::desktop_task(
+                DESKTOP_TASK,
+                desktop_input_receiver,
+                task_display,
+                Arc::clone(&task_wimp),
+            );
+            if let Err(error) = runtime.run_application(&desktop_source) {
+                if !matches!(error, crate::error::RuntimeError::EndOfInput) {
+                    let _ = task_errors.send(format!("Desktop task failed: {error}"));
+                }
+            }
+            task_wimp.task_exited(DESKTOP_TASK);
+        })?;
+    drop(display_sender);
+    drop(task_error_sender);
+
+    let capture = (|| -> Result<(), Box<dyn Error>> {
+        wait_for_display_icon(&wimp, &task_error_receiver)?;
+        write_display_manager_scene(
+            directory.join("display-manager-iconbar.ppm"),
+            &capture_display_manager_scene(&wimp),
+        )?;
+
+        click_display_icon(&wimp)?;
+        let manager = wait_for_display_manager_window(&wimp, &task_error_receiver)?;
+        let singleton_handle = manager.handle;
+        write_display_manager_scene(
+            directory.join("display-manager-open.ppm"),
+            &capture_display_manager_scene(&wimp),
+        )?;
+
+        click_display_window_control(&wimp, "16 million")?;
+        let colour_menu = wait_for_display_menu("Colours", &wimp, &task_error_receiver)?;
+        let colour_labels = colour_menu
+            .rows
+            .iter()
+            .map(|row| row.label.as_str())
+            .collect::<Vec<_>>();
+        if colour_labels
+            != [
+                "Black/white",
+                "4 greys",
+                "16 greys",
+                "16 colours",
+                "256 greys",
+                "256 colours",
+                "32 thousand",
+                "16 million",
+            ]
+        {
+            return Err(io::Error::other(format!(
+                "Display Manager colour menu is incomplete: {colour_labels:?}"
+            ))
+            .into());
+        }
+        write_display_manager_scene(
+            directory.join("display-manager-colours-menu.ppm"),
+            &capture_display_manager_scene(&wimp),
+        )?;
+        click_display_menu_row(&wimp, &colour_menu, "Black/white")?;
+        wait_for_display_window_icon(&wimp, &task_error_receiver, "Black/white")?;
+
+        let resolution_label = wimp
+            .desktop_window_icons()
+            .into_iter()
+            .find(|icon| {
+                icon.window_handle == singleton_handle && icon.label.starts_with("Window (")
+            })
+            .map(|icon| icon.label)
+            .ok_or_else(|| io::Error::other("Display Manager lost its Window resolution value"))?;
+        click_display_window_control(&wimp, &resolution_label)?;
+        let resolution_menu = wait_for_display_menu("Resolution", &wimp, &task_error_receiver)?;
+        let resolution_labels = resolution_menu
+            .rows
+            .iter()
+            .map(|row| row.label.as_str())
+            .collect::<Vec<_>>();
+        if resolution_labels
+            != [
+                "Window (800 x 600)",
+                "640 x 480",
+                "800 x 600",
+                "1024 x 768",
+                "1152 x 864",
+                "1280 x 1024",
+                "1600 x 1200",
+            ]
+        {
+            return Err(io::Error::other(format!(
+                "Display Manager resolution menu is incomplete: {resolution_labels:?}"
+            ))
+            .into());
+        }
+        write_display_manager_scene(
+            directory.join("display-manager-resolution-menu.ppm"),
+            &capture_display_manager_scene(&wimp),
+        )?;
+        click_display_menu_row(&wimp, &resolution_menu, "1024 x 768")?;
+        wait_for_display_window_icon(&wimp, &task_error_receiver, "1024 x 768")?;
+        write_display_manager_scene(
+            directory.join("display-manager-cancel-pending.ppm"),
+            &capture_display_manager_scene(&wimp),
+        )?;
+        click_display_window_control(&wimp, "Cancel")?;
+        wait_for_display_manager_closed(&wimp, &task_error_receiver)?;
+        if wimp.display_settings() != initial_settings {
+            return Err(io::Error::other("Cancel applied pending Display Manager settings").into());
+        }
+        write_display_manager_scene(
+            directory.join("display-manager-cancelled.ppm"),
+            &capture_display_manager_scene(&wimp),
+        )?;
+
+        click_display_icon(&wimp)?;
+        let reopened = wait_for_display_manager_window(&wimp, &task_error_receiver)?;
+        if reopened.handle != singleton_handle {
+            return Err(
+                io::Error::other("Display Manager opened a second window after Cancel").into(),
+            );
+        }
+        let resolution_label = wimp
+            .desktop_window_icons()
+            .into_iter()
+            .find(|icon| {
+                icon.window_handle == singleton_handle && icon.label.starts_with("Window (")
+            })
+            .map(|icon| icon.label)
+            .ok_or_else(|| {
+                io::Error::other("Display Manager did not refresh its resolution value")
+            })?;
+        click_display_window_control(&wimp, &resolution_label)?;
+        let resolution_menu = wait_for_display_menu("Resolution", &wimp, &task_error_receiver)?;
+        click_display_menu_row(&wimp, &resolution_menu, "1024 x 768")?;
+        wait_for_display_window_icon(&wimp, &task_error_receiver, "1024 x 768")?;
+        click_display_window_control(&wimp, "16 million")?;
+        let colour_menu = wait_for_display_menu("Colours", &wimp, &task_error_receiver)?;
+        click_display_menu_row(&wimp, &colour_menu, "256 greys")?;
+        wait_for_display_window_icon(&wimp, &task_error_receiver, "256 greys")?;
+        write_display_manager_scene(
+            directory.join("display-manager-change-pending.ppm"),
+            &capture_display_manager_scene(&wimp),
+        )?;
+        click_display_window_control(&wimp, "Change")?;
+        wait_for_display_manager_closed(&wimp, &task_error_receiver)?;
+        let expected = DisplaySettings {
+            resolution: DesktopResolution::R1024x768,
+            colour: DisplayColour::Grey256,
+        };
+        if wimp.display_settings() != expected {
+            return Err(io::Error::other(format!(
+                "Change did not apply both Display Manager settings: {:?}",
+                wimp.display_settings()
+            ))
+            .into());
+        }
+        if configure.load().map_err(io::Error::other)?.display != expected {
+            return Err(
+                io::Error::other("Change did not persist both Display Manager settings").into(),
+            );
+        }
+        if wimp.desktop_metrics().pixel_size() != (1024, 768) {
+            return Err(io::Error::other(format!(
+                "Change left unexpected desktop metrics: {:?}",
+                wimp.desktop_metrics().pixel_size()
+            ))
+            .into());
+        }
+        write_display_manager_scene(
+            directory.join("display-manager-changed.ppm"),
+            &capture_display_manager_scene(&wimp),
+        )?;
+
+        wimp.set_host_window_size(900, 700);
+        click_display_icon(&wimp)?;
+        let windowed_manager = wait_for_display_manager_window(&wimp, &task_error_receiver)?;
+        if windowed_manager.handle != singleton_handle {
+            return Err(
+                io::Error::other("Display Manager opened a second window after Change").into(),
+            );
+        }
+        let active_resolution_label = wimp
+            .desktop_window_icons()
+            .into_iter()
+            .find(|icon| icon.window_handle == singleton_handle && icon.label == "1024 x 768")
+            .map(|icon| icon.label)
+            .ok_or_else(|| {
+                io::Error::other("Display Manager did not refresh its fixed resolution")
+            })?;
+        click_display_window_control(&wimp, &active_resolution_label)?;
+        let resolution_menu = wait_for_display_menu("Resolution", &wimp, &task_error_receiver)?;
+        let host_resolution_label = "Window (900 x 700)";
+        if !resolution_menu
+            .rows
+            .iter()
+            .any(|row| row.label == host_resolution_label)
+        {
+            return Err(io::Error::other(format!(
+                "Window resolution did not refresh to the current host size: {:?}",
+                resolution_menu
+                    .rows
+                    .iter()
+                    .map(|row| &row.label)
+                    .collect::<Vec<_>>()
+            ))
+            .into());
+        }
+        click_display_menu_row(&wimp, &resolution_menu, host_resolution_label)?;
+        wait_for_display_window_icon(&wimp, &task_error_receiver, host_resolution_label)?;
+        click_display_window_control(&wimp, "Change")?;
+        wait_for_display_manager_closed(&wimp, &task_error_receiver)?;
+        let expected_windowed = DisplaySettings {
+            resolution: DesktopResolution::Window,
+            colour: DisplayColour::Grey256,
+        };
+        if wimp.display_settings() != expected_windowed
+            || wimp.desktop_metrics().pixel_size() != (900, 700)
+        {
+            return Err(io::Error::other(format!(
+                "Window mode did not use the current host size: {:?} {:?}",
+                wimp.display_settings(),
+                wimp.desktop_metrics().pixel_size()
+            ))
+            .into());
+        }
+        if configure.load().map_err(io::Error::other)?.display != expected_windowed {
+            return Err(io::Error::other("Window mode change was not persisted").into());
+        }
+        write_display_manager_scene(
+            directory.join("display-manager-windowed.ppm"),
+            &capture_display_manager_scene(&wimp),
+        )?;
+
+        fs::write(
+            &blocked_parent_path,
+            b"file blocking ConfigureStore parent creation",
+        )?;
+        let failing_configure = ConfigureStore::with_path(blocked_parent_path.join("configure"));
+        wimp.set_configure_store(failing_configure, expected_windowed);
+        click_display_icon(&wimp)?;
+        let failure_manager = wait_for_display_manager_window(&wimp, &task_error_receiver)?;
+        if failure_manager.handle != singleton_handle {
+            return Err(
+                io::Error::other("Display Manager lost its singleton window after resize").into(),
+            );
+        }
+        click_display_window_control(&wimp, "256 greys")?;
+        let colour_menu = wait_for_display_menu("Colours", &wimp, &task_error_receiver)?;
+        click_display_menu_row(&wimp, &colour_menu, "Black/white")?;
+        wait_for_display_window_icon(&wimp, &task_error_receiver, "Black/white")?;
+        click_display_window_control(&wimp, "Change")?;
+        wait_for_display_window_icon(
+            &wimp,
+            &task_error_receiver,
+            "Unable to save display settings.",
+        )?;
+        if !wimp.desktop_windows().iter().any(|window| {
+            window.owner_task_id == DESKTOP_TASK
+                && window.title == "Display Manager"
+                && window.handle == singleton_handle
+        }) {
+            return Err(io::Error::other("Display Manager closed after a save failure").into());
+        }
+        if wimp.display_settings() != expected_windowed
+            || configure.load().map_err(io::Error::other)?.display != expected_windowed
+        {
+            return Err(io::Error::other(
+                "Save failure changed the active or persisted Display Manager settings",
+            )
+            .into());
+        }
+        write_display_manager_scene(
+            directory.join("display-manager-save-error.ppm"),
+            &capture_display_manager_scene(&wimp),
+        )?;
+        click_display_window_control(&wimp, "Cancel")?;
+        wait_for_display_manager_closed(&wimp, &task_error_receiver)?;
+        if wimp.display_settings() != expected_windowed
+            || configure.load().map_err(io::Error::other)?.display != expected_windowed
+        {
+            return Err(io::Error::other("Cancel did not recover from a save failure").into());
+        }
+        Ok(())
+    })();
+
+    wimp.stop();
+    let join = desktop_worker
+        .join()
+        .map_err(|_| io::Error::other("Display Manager desktop task panicked"));
+    let _ = fs::remove_file(&configure_path);
+    let _ = fs::remove_file(&blocked_parent_path);
+    capture?;
+    join?;
+    let _ = display_receiver.try_iter().count();
+    Ok(())
+}
+
+fn capture_display_manager_scene(wimp: &WimpServer) -> DisplayManagerScene {
+    DisplayManagerScene {
+        windows: wimp.desktop_windows(),
+        desktop_icons: wimp.desktop_icons(),
+        window_icons: wimp.desktop_window_icons(),
+        menus: wimp.desktop_menus(),
+        metrics: wimp.desktop_metrics(),
+        colour: wimp.display_settings().colour,
+    }
+}
+
+fn write_display_manager_scene(
+    path: impl AsRef<Path>,
+    scene: &DisplayManagerScene,
+) -> io::Result<()> {
+    let metrics = scene.metrics;
+    let (logical_width, logical_height) = metrics.pixel_size();
+    let width = logical_width.saturating_mul(2);
+    let height = logical_height.saturating_mul(2);
+    let mut builder = crate::desktop_scene::DesktopSceneBuilder::new();
+    let gpu_scene = builder.build(
+        &scene.windows,
+        &HashMap::new(),
+        &scene.desktop_icons,
+        &scene.window_icons,
+        &scene.menus,
+        None,
+        crate::desktop_scene::Viewport::for_desktop(
+            width,
+            height,
+            metrics.os_width(),
+            metrics.os_height(),
+        ),
+    );
+    let rgba =
+        crate::vello_backend::snapshot_scene_with_colour(&gpu_scene, width, height, scene.colour)
+            .map_err(io::Error::other)?;
+    write_ppm_with_size(path.as_ref(), width, height, &rgba)
+}
+
+fn wait_for_display_icon(
+    wimp: &WimpServer,
+    task_errors: &mpsc::Receiver<String>,
+) -> Result<DesktopIcon, Box<dyn Error>> {
+    let deadline = Instant::now() + SNAPSHOT_TIMEOUT;
+    loop {
+        if let Some(icon) = wimp
+            .desktop_icons()
+            .into_iter()
+            .find(|icon| icon.owner_task_id == DESKTOP_TASK && icon.label == "Display")
+        {
+            if icon.side != IconBarSide::Applications
+                || icon.sprite_name.as_deref() != Some("display")
+            {
+                return Err(io::Error::other("Display icon has the wrong side or artwork").into());
+            }
+            return Ok(icon);
+        }
+        if let Ok(error) = task_errors.try_recv() {
+            return Err(io::Error::other(error).into());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "BASIC64 Desktop did not create the Display icon",
+            )
+            .into());
+        }
+        thread::sleep(EVENT_WAIT_SLICE);
+    }
+}
+
+fn click_display_icon(wimp: &WimpServer) -> Result<(), Box<dyn Error>> {
+    let icon = wimp
+        .desktop_icons()
+        .into_iter()
+        .find(|icon| icon.owner_task_id == DESKTOP_TASK && icon.label == "Display")
+        .ok_or_else(|| io::Error::other("Display icon disappeared"))?;
+    click_display_point(wimp, icon.bounds)
+}
+
+fn wait_for_display_manager_window(
+    wimp: &WimpServer,
+    task_errors: &mpsc::Receiver<String>,
+) -> Result<DesktopWindow, Box<dyn Error>> {
+    let deadline = Instant::now() + SNAPSHOT_TIMEOUT;
+    loop {
+        if let Some(window) = wimp.desktop_windows().into_iter().find(|window| {
+            window.owner_task_id == DESKTOP_TASK && window.title == "Display Manager"
+        }) {
+            return Ok(window);
+        }
+        if let Ok(error) = task_errors.try_recv() {
+            return Err(io::Error::other(error).into());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Display icon did not open the Display Manager",
+            )
+            .into());
+        }
+        thread::sleep(EVENT_WAIT_SLICE);
+    }
+}
+
+fn wait_for_display_manager_closed(
+    wimp: &WimpServer,
+    task_errors: &mpsc::Receiver<String>,
+) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + SNAPSHOT_TIMEOUT;
+    loop {
+        if !wimp
+            .desktop_windows()
+            .iter()
+            .any(|window| window.owner_task_id == DESKTOP_TASK && window.title == "Display Manager")
+        {
+            return Ok(());
+        }
+        if let Ok(error) = task_errors.try_recv() {
+            return Err(io::Error::other(error).into());
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                io::Error::new(io::ErrorKind::TimedOut, "Display Manager did not close").into(),
+            );
+        }
+        thread::sleep(EVENT_WAIT_SLICE);
+    }
+}
+
+fn wait_for_display_menu(
+    title: &str,
+    wimp: &WimpServer,
+    task_errors: &mpsc::Receiver<String>,
+) -> Result<DesktopMenu, Box<dyn Error>> {
+    let deadline = Instant::now() + SNAPSHOT_TIMEOUT;
+    loop {
+        if let Some(menu) = wimp
+            .desktop_menus()
+            .into_iter()
+            .find(|menu| menu.title == title)
+        {
+            return Ok(menu);
+        }
+        if let Ok(error) = task_errors.try_recv() {
+            return Err(io::Error::other(error).into());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("Display Manager {title:?} popup did not open"),
+            )
+            .into());
+        }
+        thread::sleep(EVENT_WAIT_SLICE);
+    }
+}
+
+fn click_display_window_control(wimp: &WimpServer, label: &str) -> Result<(), Box<dyn Error>> {
+    let window = wimp
+        .desktop_windows()
+        .into_iter()
+        .find(|window| window.owner_task_id == DESKTOP_TASK && window.title == "Display Manager")
+        .ok_or_else(|| io::Error::other("Display Manager window is not open"))?;
+    let icon = wimp
+        .desktop_window_icons()
+        .into_iter()
+        .find(|icon| icon.window_handle == window.handle && icon.label == label)
+        .ok_or_else(|| io::Error::other(format!("Display Manager has no {label:?} control")))?;
+    click_display_point(wimp, icon.bounds)
+}
+
+fn wait_for_display_window_icon(
+    wimp: &WimpServer,
+    task_errors: &mpsc::Receiver<String>,
+    label: &str,
+) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + SNAPSHOT_TIMEOUT;
+    loop {
+        if let Some(window) = wimp.desktop_windows().into_iter().find(|window| {
+            window.owner_task_id == DESKTOP_TASK && window.title == "Display Manager"
+        }) {
+            if wimp
+                .desktop_window_icons()
+                .iter()
+                .any(|icon| icon.window_handle == window.handle && icon.label == label)
+            {
+                return Ok(());
+            }
+        }
+        if let Ok(error) = task_errors.try_recv() {
+            return Err(io::Error::other(error).into());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("Display Manager did not show {label:?}"),
+            )
+            .into());
+        }
+        thread::sleep(EVENT_WAIT_SLICE);
+    }
+}
+
+fn click_display_menu_row(
+    wimp: &WimpServer,
+    menu: &DesktopMenu,
+    label: &str,
+) -> Result<(), Box<dyn Error>> {
+    let row = menu
+        .rows
+        .iter()
+        .find(|row| row.label == label)
+        .ok_or_else(|| io::Error::other(format!("Display Manager menu has no {label:?} row")))?;
+    click_display_point(wimp, row.bounds)
+}
+
+fn click_display_point(wimp: &WimpServer, bounds: DesktopRect) -> Result<(), Box<dyn Error>> {
+    let x = (bounds.min_x + bounds.max_x) / 2;
+    let y = (bounds.min_y + bounds.max_y) / 2;
+    if wimp.mouse_down(x, y, 4).is_some() {
+        return Err(io::Error::other("Display Manager click started a drag").into());
+    }
+    wimp.mouse_button_up(4);
+    Ok(())
 }
 
 fn write_filer_snapshot_mode(
@@ -1727,7 +2299,11 @@ fn has_text(snapshot: &GraphicsSnapshot, needle: &[u8]) -> bool {
 }
 
 fn write_ppm(path: &Path, rgba: &[u8]) -> io::Result<()> {
-    let pixel_count = DESKTOP_PIXEL_WIDTH as usize * DESKTOP_PIXEL_HEIGHT as usize;
+    write_ppm_with_size(path, DESKTOP_PIXEL_WIDTH, DESKTOP_PIXEL_HEIGHT, rgba)
+}
+
+fn write_ppm_with_size(path: &Path, width: u32, height: u32, rgba: &[u8]) -> io::Result<()> {
+    let pixel_count = width as usize * height as usize;
     let expected_rgba_bytes = pixel_count * 4;
     if rgba.len() < expected_rgba_bytes {
         return Err(io::Error::new(
@@ -1735,14 +2311,95 @@ fn write_ppm(path: &Path, rgba: &[u8]) -> io::Result<()> {
             "rendered desktop buffer is shorter than its pixel dimensions",
         ));
     }
-    let mut ppm = format!(
-        "P6\n{} {}\n255\n",
-        DESKTOP_PIXEL_WIDTH, DESKTOP_PIXEL_HEIGHT
-    )
-    .into_bytes();
+    let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
     ppm.reserve(pixel_count * 3);
     for pixel in rgba[..expected_rgba_bytes].chunks_exact(4) {
         ppm.extend_from_slice(&pixel[..3]);
     }
     fs::write(path, ppm)
+}
+
+#[cfg(test)]
+mod display_manager_name_tests {
+    use super::*;
+
+    #[test]
+    fn desktop_display_name_functions_return_every_menu_label() {
+        let desktop_source = include_str!("../demo-volume/System/Desktop.bas64");
+        let definitions_start = desktop_source
+            .find("DEF FNcolour_name$(")
+            .expect("Desktop should define display name functions");
+        let definitions = &desktop_source[definitions_start..];
+        let colour_names = [
+            "Black/white",
+            "4 greys",
+            "16 greys",
+            "16 colours",
+            "256 greys",
+            "256 colours",
+            "32 thousand",
+            "16 million",
+        ];
+        let resolution_names = [
+            "Window (900 x 700)",
+            "640 x 480",
+            "800 x 600",
+            "1024 x 768",
+            "1152 x 864",
+            "1280 x 1024",
+            "1600 x 1200",
+        ];
+        let mut calls = String::from("DIM dmcolours$(7)\nDIM dmresolutions$(6)\n");
+        for (id, name) in colour_names.iter().enumerate() {
+            calls.push_str(&format!("dmcolours$({id})=\"{name}\"\n"));
+        }
+        for (id, name) in resolution_names.iter().enumerate() {
+            calls.push_str(&format!("dmresolutions$({id})=\"{name}\"\n"));
+        }
+        for id in 0..colour_names.len() {
+            calls.push_str(&format!("PRINT FNcolour_name$({id})\n"));
+        }
+        for id in 0..resolution_names.len() {
+            calls.push_str(&format!("PRINT FNresolution_menu_name$({id})\n"));
+            calls.push_str(&format!("PRINT FNresolution_name$({id})\n"));
+        }
+        calls.push_str("END\n");
+        let source = format!("{calls}{definitions}");
+
+        let (_input_sender, input_receiver) = mpsc::channel();
+        let (display_sender, display_receiver) = mpsc::channel();
+        let (updates, _update_receiver) = mpsc::channel();
+        let wimp = WimpServer::new(updates);
+        let configure_path = std::env::temp_dir().join(format!(
+            "acorn-2026-display-name-test-{}.configure",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&configure_path);
+        wimp.set_configure_store(
+            ConfigureStore::with_path(&configure_path),
+            DisplaySettings::default(),
+        );
+        wimp.task_started(991, "display-name-test")
+            .expect("test task should register with the hosted Wimp");
+        let mut runtime = Runtime::desktop_task(991, input_receiver, display_sender, wimp.clone());
+        runtime
+            .run_application(&source)
+            .expect("Desktop display-name functions should execute");
+
+        let output = display_receiver
+            .try_iter()
+            .filter_map(|event| match event {
+                DisplayEvent::WriteByte { byte, .. } => Some(char::from(byte)),
+                _ => None,
+            })
+            .collect::<String>();
+        for label in colour_names.into_iter().chain(resolution_names) {
+            assert!(
+                output.contains(label),
+                "output omitted {label:?}: {output:?}"
+            );
+        }
+        wimp.stop();
+        let _ = fs::remove_file(configure_path);
+    }
 }

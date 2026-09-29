@@ -4,6 +4,12 @@ DIM description% 31
 $description%="Acorn Filer"
 SYS "Wimp_Initialise",310,&4B534154,description%,0 TO version%,task%
 
+SYS "Acorn_Display",1,0,0,0 TO display_abi%,display_action%,active_resolution%,active_colour%,active_display_width%,active_display_height%,host_display_width%,host_display_height%,display_status%
+display_extent_width%=active_display_width%*2
+display_extent_height%=active_display_height%*2
+IF display_extent_width%<1600 THEN display_extent_width%=1600
+IF display_extent_height%<1200 THEN display_extent_height%=1200
+
 DIM definition% 87
 !(definition%+28)=&3F000002-2147483648
 !(definition%+56)=1
@@ -11,7 +17,7 @@ title%=definition%+72
 $title%="HostFS:$"
 !definition%=22:!(definition%+4)=872:!(definition%+8)=562:!(definition%+12)=1128
 !(definition%+16)=0:!(definition%+20)=0
-!(definition%+40)=0:!(definition%+44)=-2048:!(definition%+48)=1600:!(definition%+52)=0
+!(definition%+40)=0:!(definition%+44)=0-display_extent_height%:!(definition%+48)=display_extent_width%:!(definition%+52)=0
 !(definition%+60)=&A000:!(definition%+68)=0:!(definition%+84)=0
 SYS "Wimp_CreateWindow",,definition% TO window%
 
@@ -154,14 +160,19 @@ IF layout_mode%=2 THEN columns%=1:cell_width%=view_width%:cell_height%=64:entry_
 PROCbuild_sort_page
 sorted_shown%=shown%
 REM Expand the work extent before creating icons for a larger directory.
+SYS "Acorn_Display",1,0,0,0 TO display_abi%,display_action%,active_resolution%,active_colour%,active_display_width%,active_display_height%,host_display_width%,host_display_height%,display_status%
+display_extent_width%=active_display_width%*2
+display_extent_height%=active_display_height%*2
+IF display_extent_width%<1600 THEN display_extent_width%=1600
+IF display_extent_height%<1200 THEN display_extent_height%=1200
 rows%=(sorted_shown%+columns%-1) DIV columns%
 extent_height%=8+rows%*cell_height%
 REM Keep a desktop-sized workspace so shrinking does not prevent growing back.
-IF extent_height%<1200 THEN extent_height%=1200
+IF extent_height%<display_extent_height% THEN extent_height%=display_extent_height%
 IF extent_height%<view_height% THEN extent_height%=view_height%
 extent_width%=columns%*cell_width%
 IF extent_width%<view_width% THEN extent_width%=view_width%
-IF extent_width%<1600 THEN extent_width%=1600
+IF extent_width%<display_extent_width% THEN extent_width%=display_extent_width%
 !extent%=0:!(extent%+4)=0-extent_height%:!(extent%+8)=extent_width%:!(extent%+12)=0
 SYS "Wimp_SetExtent",window%,extent%
 shown%=0

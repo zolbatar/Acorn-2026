@@ -6,6 +6,15 @@ fn main() -> ExitCode {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
     let result = if let Some(index) = arguments
         .iter()
+        .position(|argument| argument == "--display-manager-snapshots")
+    {
+        match arguments.get(index + 1) {
+            Some(directory) => snapshot::write_display_manager_snapshots(directory)
+                .map_err(|error| error.to_string()),
+            None => Err("--display-manager-snapshots requires an output directory".into()),
+        }
+    } else if let Some(index) = arguments
+        .iter()
         .position(|argument| argument == "--task-menu-snapshot")
     {
         match arguments.get(index + 1) {

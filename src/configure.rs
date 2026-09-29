@@ -11,6 +11,7 @@ use std::{
     },
 };
 
+use crate::display::{DesktopResolution, DisplayColour, DisplaySettings};
 use crate::graphics::GraphicsProfile;
 
 const CONFIG_HEADER: &str = "# Acorn-2026 MOS configuration v1";
@@ -103,6 +104,7 @@ pub(crate) struct BasicConfiguration {
     pub(crate) profile: Option<String>,
     pub(crate) target: Option<GraphicsProfile>,
     pub(crate) engine: BasicEngine,
+    pub(crate) display: DisplaySettings,
 }
 
 impl BasicConfiguration {
@@ -155,6 +157,16 @@ impl BasicConfiguration {
             self.engine = BasicEngine::parse(value)
                 .ok_or_else(|| "BASICEngine must be Interpreter, Hybrid, or Strict".to_string())?;
             Ok("BASICEngine")
+        } else if option.eq_ignore_ascii_case("DISPLAYRESOLUTION") {
+            self.display.resolution = DesktopResolution::parse(value).ok_or_else(|| {
+                "DisplayResolution must be Window, 640x480, 800x600, 1024x768, 1152x864, 1280x1024, or 1600x1200".to_string()
+            })?;
+            Ok("DisplayResolution")
+        } else if option.eq_ignore_ascii_case("DISPLAYCOLOUR") {
+            self.display.colour = DisplayColour::parse(value).ok_or_else(|| {
+                "DisplayColour must be BW, 4Grey, 16Grey, 16Colour, 256Grey, 256Colour, 32KRGB555, or 16MRGB888".to_string()
+            })?;
+            Ok("DisplayColour")
         } else {
             Err(format!(
                 "unknown *CONFIGURE option '{option}'; use *CONFIGURE to list supported settings"
@@ -199,12 +211,16 @@ impl BasicConfiguration {
             ))
         } else if option.eq_ignore_ascii_case("BASICENGINE") {
             Some(("BASICEngine", self.engine.as_str().into()))
+        } else if option.eq_ignore_ascii_case("DISPLAYRESOLUTION") {
+            Some(("DisplayResolution", self.display.resolution.as_str().into()))
+        } else if option.eq_ignore_ascii_case("DISPLAYCOLOUR") {
+            Some(("DisplayColour", self.display.colour.as_str().into()))
         } else {
             None
         }
     }
 
-    pub(crate) fn status_entries(&self) -> [(&'static str, String); 6] {
+    pub(crate) fn status_entries(&self) -> [(&'static str, String); 8] {
         [
             self.status_value("LANGUAGE").expect("known option"),
             self.status_value("WINDOWFURNITURE").expect("known option"),
@@ -212,6 +228,9 @@ impl BasicConfiguration {
             self.status_value("BASICPROFILE").expect("known option"),
             self.status_value("BASICTARGET").expect("known option"),
             self.status_value("BASICENGINE").expect("known option"),
+            self.status_value("DISPLAYRESOLUTION")
+                .expect("known option"),
+            self.status_value("DISPLAYCOLOUR").expect("known option"),
         ]
     }
 
@@ -267,7 +286,6 @@ impl Default for ConfigureStore {
 }
 
 impl ConfigureStore {
-    #[cfg(test)]
     pub(crate) fn with_path(path: impl Into<PathBuf>) -> Self {
         Self {
             path: Some(path.into()),
@@ -294,6 +312,19 @@ impl ConfigureStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut configuration = self.load()?;
         configuration.set(option, value)?;
+        self.save(&configuration)?;
+        Ok(configuration)
+    }
+
+    pub(crate) fn set_display_settings(
+        &self,
+        settings: DisplaySettings,
+    ) -> Result<BasicConfiguration, String> {
+        let _lock = CONFIGURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut configuration = self.load()?;
+        configuration.display = settings;
         self.save(&configuration)?;
         Ok(configuration)
     }
@@ -402,6 +433,7 @@ fn validate_profile(profile: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{BasicConfiguration, BasicEngine, ConfigureStore, StartupLanguage};
+    use crate::display::{DesktopResolution, DisplayColour, DisplaySettings};
     use std::{
         fs,
         path::PathBuf,
@@ -450,6 +482,11 @@ mod tests {
         store.set("BASICProfile", "BBCV-1.05").unwrap();
         store.set("BASICTarget", "Agon").unwrap();
         store.set("Language", "3").unwrap();
+        let display = DisplaySettings {
+            resolution: DesktopResolution::R1280x1024,
+            colour: DisplayColour::Grey16,
+        };
+        store.set_display_settings(display).unwrap();
 
         let reloaded = store.load().unwrap();
         assert_eq!(reloaded, store.load().unwrap());
@@ -462,6 +499,12 @@ mod tests {
         assert_eq!(reloaded.status_value("BASICTarget").unwrap().1, "AGON");
         assert_eq!(reloaded.status_value("Language").unwrap().1, "3");
         assert_eq!(reloaded.startup_language, StartupLanguage::Desktop);
+        assert_eq!(reloaded.display, display);
+        assert_eq!(
+            reloaded.status_value("DisplayResolution").unwrap().1,
+            "1280x1024"
+        );
+        assert_eq!(reloaded.status_value("DisplayColour").unwrap().1, "16GREY");
 
         store.reset().unwrap();
         assert_eq!(store.load().unwrap(), BasicConfiguration::default());
@@ -507,6 +550,25 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn old_configuration_files_default_to_windowed_rgb888_output() {
+        let legacy = BasicConfiguration::parse("Language=3\nBASICEngine=INTERPRETER\n").unwrap();
+        assert_eq!(
+            legacy.display,
+            DisplaySettings {
+                resolution: DesktopResolution::Window,
+                colour: DisplayColour::Rgb888,
+            }
+        );
+
+        let mut configuration = BasicConfiguration::default();
+        configuration.set("DisplayResolution", "640x480").unwrap();
+        configuration.set("DisplayColour", "32KRGB555").unwrap();
+        let parsed = BasicConfiguration::parse(&configuration.serialized()).unwrap();
+        assert_eq!(parsed.display.resolution, DesktopResolution::R640x480);
+        assert_eq!(parsed.display.colour, DisplayColour::Rgb555);
     }
 
     #[test]

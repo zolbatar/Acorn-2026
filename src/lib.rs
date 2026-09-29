@@ -2,6 +2,7 @@ pub mod basic64;
 pub mod basic_compat;
 pub(crate) mod configure;
 mod desktop_scene;
+pub mod display;
 pub mod error;
 pub mod filesystem;
 pub mod font;

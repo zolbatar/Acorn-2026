@@ -154,6 +154,38 @@ impl SharedRasterSurface {
         data.pixels[offset..offset + 4].copy_from_slice(&color);
     }
 
+    fn draw_line(&self, from: (i32, i32), to: (i32, i32), color: [u8; 4]) {
+        let mut data = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut x0, mut y0) = from;
+        let (x1, y1) = to;
+        let dx = (i64::from(x1) - i64::from(x0)).abs() as i32;
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let dy = -((i64::from(y1) - i64::from(y0)).abs() as i32);
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut error = dx + dy;
+        loop {
+            if x0 >= 0 && y0 >= 0 && (x0 as u32) < data.width && (y0 as u32) < data.height {
+                let offset = (y0 as usize * data.width as usize + x0 as usize) * 4;
+                data.pixels[offset..offset + 4].copy_from_slice(&color);
+            }
+            if x0 == x1 && y0 == y1 {
+                break;
+            }
+            let twice_error = 2 * error;
+            if twice_error >= dy {
+                error += dy;
+                x0 += sx;
+            }
+            if twice_error <= dx {
+                error += dx;
+                y0 += sy;
+            }
+        }
+    }
+
     fn read_pixel(&self, x: u32, y: u32) -> Option<[u8; 4]> {
         let data = self
             .0
@@ -1115,29 +1147,11 @@ fn rasterize_primitive(
             };
             let (x0_u, y0_u) = screen_point(from, snapshot);
             let (x1_u, y1_u) = screen_point(to, snapshot);
-            let (mut x0, mut y0) = (x0_u as i32, y0_u as i32);
-            let (x1, y1) = (x1_u as i32, y1_u as i32);
-            let dx = (x1 as i64 - x0 as i64).abs() as i32;
-            let sx = if x0 < x1 { 1 } else { -1 };
-            let dy = -((y1 as i64 - y0 as i64).abs() as i32);
-            let sy = if y0 < y1 { 1 } else { -1 };
-            let mut error = dx + dy;
-            let color = graphics_colour(*logical_colour, snapshot.mode);
-            loop {
-                surface.set_pixel(x0 as u32, y0 as u32, color);
-                if x0 == x1 && y0 == y1 {
-                    break;
-                }
-                let twice_error = 2 * error;
-                if twice_error >= dy {
-                    error += dy;
-                    x0 += sx;
-                }
-                if twice_error <= dx {
-                    error += dx;
-                    y0 += sy;
-                }
-            }
+            surface.draw_line(
+                (x0_u as i32, y0_u as i32),
+                (x1_u as i32, y1_u as i32),
+                graphics_colour(*logical_colour, snapshot.mode),
+            );
         }
     }
 }
@@ -1379,7 +1393,27 @@ fn default_palette(mode: ScreenMode) -> Vec<[u8; 4]> {
 
 #[cfg(test)]
 mod output_surface_tests {
-    use super::{GraphicsService, GraphicsWindow, text_cell_bounds};
+    use super::{GraphicsService, GraphicsWindow, Point, text_cell_bounds};
+
+    fn rasterized_line_pixels(from: Point, to: Point) -> Vec<(usize, usize)> {
+        let mut graphics = GraphicsService::default();
+        graphics.set_extended_mode(5, 5, 0, 0).unwrap();
+        graphics.set_rgb_gcol(0x0033_2211);
+        graphics.plot(4, from.x, from.y).unwrap();
+        graphics.plot(5, to.x, to.y).unwrap();
+
+        let surface = graphics.snapshot().raster_surface.as_ref().unwrap();
+        let color = [0x22, 0x33, 0x00, 0xFF];
+        let mut pixels = Vec::new();
+        for y in 0..5 {
+            for x in 0..5 {
+                if surface.read_pixel(x, y) == Some(color) {
+                    pixels.push((x as usize, y as usize));
+                }
+            }
+        }
+        pixels
+    }
 
     #[test]
     fn adjacent_redraw_clears_cover_every_pixel_without_seams() {
@@ -1478,6 +1512,47 @@ mod output_surface_tests {
             frame
                 .chunks_exact(4)
                 .any(|pixel| { pixel[0] < 100 && pixel[1] < 100 && pixel[2] < 100 })
+        );
+    }
+
+    #[test]
+    fn line_rasterization_keeps_bresenham_pixels_and_color() {
+        let mut graphics = GraphicsService::default();
+        graphics.set_extended_mode(5, 5, 0, 0).unwrap();
+        graphics.set_rgb_gcol(0x0033_2211);
+        graphics.plot(1, 4, 2).unwrap();
+
+        let surface = graphics.snapshot().raster_surface.as_ref().unwrap();
+        let expected_line_pixels = [(0, 4), (1, 3), (2, 3), (3, 2), (4, 2)];
+        for y in 0..5 {
+            for x in 0..5 {
+                let expected = if expected_line_pixels.contains(&(x, y)) {
+                    [0x22, 0x33, 0x00, 0xFF]
+                } else {
+                    [0x00, 0x00, 0x00, 0xFF]
+                };
+                assert_eq!(surface.read_pixel(x, y), Some(expected), "pixel ({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn line_rasterization_handles_clipped_reverse_vertical_and_degenerate_lines() {
+        assert_eq!(
+            rasterized_line_pixels(Point { x: -2, y: 2 }, Point { x: 6, y: 2 }),
+            [(0, 2), (1, 2), (2, 2), (3, 2), (4, 2)]
+        );
+        assert_eq!(
+            rasterized_line_pixels(Point { x: 4, y: 2 }, Point { x: 0, y: 0 }),
+            [(4, 2), (2, 3), (3, 3), (0, 4), (1, 4)]
+        );
+        assert_eq!(
+            rasterized_line_pixels(Point { x: 2, y: 0 }, Point { x: 2, y: 4 }),
+            [(2, 0), (2, 1), (2, 2), (2, 3), (2, 4)]
+        );
+        assert_eq!(
+            rasterized_line_pixels(Point { x: 1, y: 3 }, Point { x: 1, y: 3 }),
+            [(1, 1)]
         );
     }
 }

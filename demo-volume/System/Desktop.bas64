@@ -9,6 +9,16 @@ DIM label% 31
 DIM sprval% 31
 DIM volume_buffer% 255
 DIM volume_image% 16383
+DIM dmcolours$(7)
+DIM dmresolutions$(6)
+dmcolours$(0)="Black/white":dmcolours$(1)="4 greys"
+dmcolours$(2)="16 greys":dmcolours$(3)="16 colours"
+dmcolours$(4)="256 greys":dmcolours$(5)="256 colours"
+dmcolours$(6)="32 thousand":dmcolours$(7)="16 million"
+dmresolutions$(0)="Window (800 x 600)"
+dmresolutions$(1)="640 x 480":dmresolutions$(2)="800 x 600"
+dmresolutions$(3)="1024 x 768":dmresolutions$(4)="1152 x 864"
+dmresolutions$(5)="1280 x 1024":dmresolutions$(6)="1600 x 1200"
 SYS "Acorn_Desktop",2,volume_buffer%,256 TO volume_length%
 IF volume_length%>12 THEN volume_length%=12
 volume_name$=""
@@ -32,11 +42,29 @@ PROCmake_volume_image
 !icon%+52=2
 SYS "Wimp_CreateIconEx",,icon% TO volume_icon%
 
+DIM display_icon% 55
+DIM display_label% 31
+DIM display_sprite_validation% 31
+$display_label%="Display"
+$display_sprite_validation%="Sdisplay"
+!display_icon%=-1
+!(display_icon%+4)=0:!(display_icon%+8)=4:!(display_icon%+12)=152
+!(display_icon%+16)=96:!(display_icon%+20)=&A11B
+!(display_icon%+24)=display_label%
+!(display_icon%+28)=display_sprite_validation%
+!(display_icon%+32)=32
+!(display_icon%+36)=1:!(display_icon%+40)=0
+!(display_icon%+44)=0:!(display_icon%+48)=0:!(display_icon%+52)=2
+SYS "Wimp_CreateIconEx",,display_icon% TO display_icon_handle%
+
 DIM command% 255
 DIM event% 255
 DIM task_menu% 127
 DIM commands_label% 31
 DIM basic_label% 31
+display_window_open%=0
+display_window%=-1
+display_menu_open%=0
 $commands_label%="*Commands"
 $basic_label%="BASIC window"
 $task_menu%="Task"
@@ -64,11 +92,16 @@ REPEAT
     ENDIF
   ENDIF
   IF reason%=9 THEN
-    IF !event%=0 THEN $command%="Commands"
-    IF !event%=1 THEN $command%="BASIC"
-    SYS "Wimp_StartTask",command% TO console_task%
+    display_menu_selection%=display_menu_open%
+    IF display_menu_selection%=1 THEN PROCdisplay_menu_selection
+    IF display_menu_selection%=0 THEN
+      IF !event%=0 THEN $command%="Commands"
+      IF !event%=1 THEN $command%="BASIC"
+      IF !event%=0 OR !event%=1 THEN SYS "Wimp_StartTask",command% TO console_task%
+    ENDIF
   ENDIF
   IF reason%=6 THEN
+    IF display_menu_open%=1 THEN PROCclose_display_menu
     IF !(event%+12)=-1 AND !(event%+16)=-1 AND !(event%+8)=2 THEN
       SYS "Wimp_CreateMenu",,task_menu%,!(event%),192
     ENDIF
@@ -76,8 +109,253 @@ REPEAT
       $command%="BASIC $.System.Filer"
       SYS "Wimp_StartTask",command% TO filer_task%
     ENDIF
+    IF !(event%+12)=-1 AND !(event%+16)=display_icon_handle% AND !(event%+8)<>2 THEN
+      PROCopen_display_manager
+    ENDIF
+    IF display_window%>=0 AND !(event%+12)=display_window% THEN PROCdisplay_click
   ENDIF
+  IF reason%=3 AND display_window%>=0 AND !event%=display_window% THEN
+    SYS "Wimp_CloseWindow",,event%
+    display_window_open%=0
+    PROCclose_display_menu
+  ENDIF
+  IF (reason%=2 OR reason%=10) AND display_window_open%=1 AND !event%=display_window% THEN
+    SYS "Wimp_OpenWindow",,event%
+  ENDIF
+  IF reason%=8 AND display_menu_open%=1 AND !(event%+24)=27 THEN PROCclose_display_menu
 UNTIL FALSE
+
+DEF PROCopen_display_manager
+PROCquery_display
+IF display_window_open%=0 THEN
+  pending_resolution%=active_resolution%
+  pending_colour%=active_colour%
+  display_dirty%=0
+ENDIF
+display_save_error%=0
+IF display_window%<0 THEN PROCcreate_display_window
+PROCrebuild_display_icons
+screen_width%=active_width%*2
+screen_height%=active_height%*2
+dialog_width%=660:dialog_height%=236
+dialog_left%=(screen_width%-dialog_width%) DIV 2
+dialog_bottom%=(screen_height%-dialog_height%) DIV 2
+!display_open%=display_window%
+!(display_open%+4)=dialog_left%
+!(display_open%+8)=dialog_bottom%
+!(display_open%+12)=dialog_left%+dialog_width%
+!(display_open%+16)=dialog_bottom%+dialog_height%
+!(display_open%+20)=0:!(display_open%+24)=0:!(display_open%+28)=-1
+SYS "Wimp_OpenWindow",,display_open%
+display_window_open%=1
+ENDPROC
+
+DEF PROCquery_display
+SYS "Acorn_Display",1,0,0,0 TO display_abi%,display_action%,active_resolution%,active_colour%,active_width%,active_height%,host_width%,host_height%,display_status%
+dmresolutions$(0)="Window ("+STR$(host_width%)+" x "+STR$(host_height%)+")"
+IF display_dirty%=0 THEN
+  pending_resolution%=active_resolution%
+  pending_colour%=active_colour%
+ENDIF
+ENDPROC
+
+DEF PROCcreate_display_window
+DIM display_definition% 87
+DIM display_title% 31
+DIM display_open% 31
+DIM display_icon_definition% 35
+DIM display_delete_icon% 7
+DIM display_icon_handles% 63
+DIM display_icon_text% 1023
+DIM display_menus% 543
+DIM display_menu_text% 511
+$display_title%="Display Manager"
+screen_width%=active_width%*2
+screen_height%=active_height%*2
+dialog_width%=660:dialog_height%=236
+dialog_left%=(screen_width%-dialog_width%) DIV 2
+dialog_bottom%=(screen_height%-dialog_height%) DIV 2
+!display_definition%=dialog_left%:!(display_definition%+4)=dialog_bottom%
+!(display_definition%+8)=dialog_left%+dialog_width%
+!(display_definition%+12)=dialog_bottom%+dialog_height%
+!(display_definition%+16)=0:!(display_definition%+20)=0
+!(display_definition%+24)=-1
+!(display_definition%+28)=&06000000-2147483648
+!(display_definition%+40)=0:!(display_definition%+44)=-236
+!(display_definition%+48)=660:!(display_definition%+52)=0
+!(display_definition%+56)=257
+!(display_definition%+72)=display_title%
+!(display_definition%+76)=0:!(display_definition%+80)=32
+!(display_definition%+84)=0
+SYS "Wimp_CreateWindow",,display_definition% TO display_window%
+PROCbuild_display_menus
+ENDPROC
+
+DEF PROCdisplay_click
+clicked_icon%=!(event%+16)
+IF clicked_icon%=display_colour_value_icon% OR clicked_icon%=display_colour_arrow_icon% THEN
+  PROCrefresh_display_popup
+  display_menu_kind%=0
+  PROCbuild_display_menus
+  SYS "Wimp_CreateMenu",,display_menus%,!(event%),!(event%+4)
+  display_menu_open%=1
+ENDIF
+IF clicked_icon%=display_resolution_value_icon% OR clicked_icon%=display_resolution_arrow_icon% THEN
+  PROCrefresh_display_popup
+  display_menu_kind%=1
+  PROCbuild_display_menus
+  SYS "Wimp_CreateMenu",,display_menus%+256,!(event%),!(event%+4)
+  display_menu_open%=1
+ENDIF
+IF clicked_icon%=display_cancel_icon% THEN
+  PROCclose_display_menu
+  !display_delete_icon%=display_window%
+  SYS "Wimp_CloseWindow",,display_delete_icon%
+  display_window_open%=0
+  display_dirty%=0
+ENDIF
+IF clicked_icon%=display_change_icon% THEN PROCapply_display
+ENDPROC
+
+DEF PROCrefresh_display_popup
+PROCquery_display
+IF display_dirty%=0 THEN
+  pending_resolution%=active_resolution%
+  pending_colour%=active_colour%
+ENDIF
+display_save_error%=0
+PROCrebuild_display_icons
+ENDPROC
+
+DEF PROCdisplay_menu_selection
+menu_choice%=!event%
+PROCclose_display_menu
+IF display_menu_kind%=0 THEN pending_colour%=menu_choice%
+IF display_menu_kind%=1 THEN pending_resolution%=menu_choice%
+display_dirty%=1
+display_save_error%=0
+PROCrebuild_display_icons
+ENDPROC
+
+DEF PROCclose_display_menu
+IF display_menu_open%=1 THEN SYS "Wimp_CreateMenu",,-1
+display_menu_open%=0
+ENDPROC
+
+DEF PROCapply_display
+PROCclose_display_menu
+SYS "Acorn_Display",1,1,pending_resolution%,pending_colour% TO display_abi%,display_action%,active_resolution%,active_colour%,active_width%,active_height%,host_width%,host_height%,display_status%
+IF display_status%=0 THEN
+  pending_resolution%=active_resolution%
+  pending_colour%=active_colour%
+  display_dirty%=0
+  !display_delete_icon%=display_window%
+  SYS "Wimp_CloseWindow",,display_delete_icon%
+  display_window_open%=0
+ENDIF
+IF display_status%<>0 THEN
+  display_dirty%=1
+  display_save_error%=1
+  PROCrebuild_display_icons
+ENDIF
+ENDPROC
+
+DEF PROCrebuild_display_icons
+IF display_window%<0 THEN ENDPROC
+PROCdelete_display_icons
+display_icon_count%=0
+display_colour_value$=FNcolour_name$(pending_colour%)
+display_resolution_value$=FNresolution_name$(pending_resolution%)
+PROCmake_display_icon("Colours",32,-64,220,-16,&111)
+PROCmake_display_icon(display_colour_value$,246,-64,558,-16,&3135)
+display_colour_value_icon%=display_created_icon%
+PROCmake_display_icon("v",566,-64,612,-16,&313D)
+display_colour_arrow_icon%=display_created_icon%
+PROCmake_display_icon("Resolution",32,-124,220,-76,&111)
+PROCmake_display_icon(display_resolution_value$,246,-124,558,-76,&3135)
+display_resolution_value_icon%=display_created_icon%
+PROCmake_display_icon("v",566,-124,612,-76,&313D)
+display_resolution_arrow_icon%=display_created_icon%
+PROCmake_display_icon("Cancel",246,-188,416,-136,&313D)
+display_cancel_icon%=display_created_icon%
+PROCmake_display_icon("Change",442,-188,612,-136,&313D)
+display_change_icon%=display_created_icon%
+IF display_save_error%=1 THEN
+  PROCmake_display_icon("Unable to save display settings.",32,-224,612,-196,&111)
+ENDIF
+ENDPROC
+
+DEF PROCdelete_display_icons
+FOR display_delete_index%=0 TO display_icon_count%-1
+  !display_delete_icon%=display_window%
+  display_icon_slot%=display_icon_handles%+display_delete_index%*4
+  !(display_delete_icon%+4)=!display_icon_slot%
+  SYS "Wimp_DeleteIcon",,display_delete_icon%
+NEXT
+ENDPROC
+
+DEF PROCmake_display_icon(label$,x0%,y0%,x1%,y1%,flags%)
+text_slot%=display_icon_text%+display_icon_count%*64
+$text_slot%=label$
+!display_icon_definition%=display_window%
+!(display_icon_definition%+4)=x0%
+!(display_icon_definition%+8)=y0%
+!(display_icon_definition%+12)=x1%
+!(display_icon_definition%+16)=y1%
+!(display_icon_definition%+20)=flags%
+!(display_icon_definition%+24)=text_slot%
+!(display_icon_definition%+28)=0
+!(display_icon_definition%+32)=64
+SYS "Wimp_CreateIcon",,display_icon_definition% TO display_created_icon%
+display_icon_slot%=display_icon_handles%+display_icon_count%*4
+!display_icon_slot%=display_created_icon%
+display_icon_count%+=1
+ENDPROC
+
+DEF PROCbuild_display_menus
+display_colours_menu%=display_menus%
+display_resolutions_menu%=display_menus%+256
+PROCdisplay_menu_header(display_colours_menu%,"Colours",240)
+PROCdisplay_menu_header(display_resolutions_menu%,"Resolution",300)
+FOR display_menu_row%=0 TO 7
+  menu_row%=display_colours_menu%+28+display_menu_row%*24
+  !menu_row%=0
+  IF display_menu_row%=pending_colour% THEN !menu_row%=1
+  IF display_menu_row%=7 THEN !menu_row%=!menu_row% OR 128
+  !(menu_row%+4)=-1:!(menu_row%+8)=&101
+  display_menu_label%=display_menu_text%+display_menu_row%*32
+  $display_menu_label%=FNcolour_name$(display_menu_row%)
+  !(menu_row%+12)=display_menu_label%
+  !(menu_row%+16)=0:!(menu_row%+20)=32
+NEXT
+FOR display_menu_row%=0 TO 6
+  menu_row%=display_resolutions_menu%+28+display_menu_row%*24
+  !menu_row%=0
+  IF display_menu_row%=pending_resolution% THEN !menu_row%=1
+  IF display_menu_row%=6 THEN !menu_row%=!menu_row% OR 128
+  !(menu_row%+4)=-1:!(menu_row%+8)=&101
+  display_menu_label%=display_menu_text%+256+display_menu_row%*32
+  $display_menu_label%=FNresolution_menu_name$(display_menu_row%)
+  !(menu_row%+12)=display_menu_label%
+  !(menu_row%+16)=0:!(menu_row%+20)=32
+NEXT
+ENDPROC
+
+DEF PROCdisplay_menu_header(menu%,title$,width%)
+$menu%=title$
+?(menu%+12)=7:?(menu%+13)=2
+?(menu%+14)=7:?(menu%+15)=0
+!(menu%+16)=width%:!(menu%+20)=28:!(menu%+24)=0
+ENDPROC
+
+DEF FNcolour_name$(dmcolour%)
+=dmcolours$(dmcolour%)
+
+DEF FNresolution_menu_name$(dmresolution%)
+=dmresolutions$(dmresolution%)
+
+DEF FNresolution_name$(dmresolution%)
+=dmresolutions$(dmresolution%)
 
 DEF PROCmake_volume_image
 FOR y%=0 TO 63
