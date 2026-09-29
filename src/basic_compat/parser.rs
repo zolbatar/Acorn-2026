@@ -80,6 +80,9 @@ const TOKEN_LET: u8 = 0xE9;
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Expr {
     Number(f64),
+    /// An exact integer literal in the native System Profile lexer. Classic
+    /// BASIC source continues to use the historical floating representation.
+    Integer(i128),
     String(Vec<u8>),
     Variable(String),
     ArrayElement(String, Box<Expr>),
@@ -87,17 +90,23 @@ pub(crate) enum Expr {
     Binary(Box<Expr>, BinaryOp, Box<Expr>),
     Builtin(u8, Vec<Expr>),
     UserFunction(String, Vec<Expr>),
+    ImportedFunction {
+        module: String,
+        name: String,
+        arguments: Vec<Expr>,
+    },
     MemoryRead(MemoryWidth, Box<Expr>),
+    Member(Box<Expr>, String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UnaryOp {
     Plus,
     Minus,
     Not,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BinaryOp {
     Add,
     Subtract,
@@ -117,7 +126,7 @@ pub(crate) enum BinaryOp {
     GreaterEqual,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MemoryWidth {
     Byte,
     Word,
@@ -132,6 +141,8 @@ pub(crate) enum LValue {
     MemoryOffset(MemoryWidth, Expr, Expr),
     MemoryString(Expr),
     StringSlice(String, Expr, Expr),
+    RecordField(String, String),
+    RecordPath(Vec<String>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -199,12 +210,38 @@ pub(crate) enum Statement {
     Repeat,
     Until(Expr),
     ProcedureCall(String, Vec<Expr>),
+    ImportedProcedureCall {
+        module: String,
+        name: String,
+        arguments: Vec<Expr>,
+    },
+    LocalReadOnly {
+        name: String,
+        value_type: SystemType,
+        value: Expr,
+    },
     DefineProcedure(String, Vec<String>),
     DefineFunction(String, Vec<String>),
     Sys {
         name: Vec<u8>,
         arguments: Vec<Option<Expr>>,
         results: Vec<String>,
+    },
+    PrimitiveCall {
+        name: String,
+        arguments: Vec<Option<Expr>>,
+        results: Vec<String>,
+    },
+    Try,
+    Catch {
+        error_name: String,
+        error_type: String,
+    },
+    EndTry,
+    Throw {
+        error_type: String,
+        code: Expr,
+        message: Expr,
     },
     FunctionReturn(Expr),
     Return,
@@ -227,7 +264,57 @@ pub(crate) struct ParsedProgram {
     pub line_entries: BTreeMap<u16, usize>,
     pub procedures: std::collections::HashMap<String, Definition>,
     pub functions: std::collections::HashMap<String, Definition>,
+    pub typed_parameters: std::collections::HashMap<String, Vec<SystemType>>,
+    pub typed_results: std::collections::HashMap<String, SystemType>,
+    pub throws_types: std::collections::HashMap<String, String>,
+    pub system_types: BTreeMap<String, SystemTypeDefinition>,
+    pub module_state_types: BTreeMap<String, SystemType>,
+    pub readonly_bindings: std::collections::BTreeSet<String>,
+    pub readonly_local_bindings: std::collections::HashMap<String, BTreeMap<String, SystemType>>,
     pub options: ProgramOptions,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SystemType {
+    Byte,
+    UInt16,
+    UInt32,
+    Int32,
+    UInt64,
+    Int64,
+    Address32,
+    String,
+    Record(String),
+    Enum(String),
+    Flags(String),
+    Handle(String),
+    Error(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SystemField {
+    pub name: String,
+    pub value_type: SystemType,
+    pub read_only: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SystemTypeDefinition {
+    Record {
+        fields: Vec<SystemField>,
+    },
+    Enum {
+        underlying: SystemType,
+        members: BTreeMap<String, i64>,
+    },
+    Flags {
+        underlying: SystemType,
+        members: BTreeMap<String, i64>,
+    },
+    Error {
+        fields: Vec<SystemField>,
+    },
+    Handle,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -343,7 +430,7 @@ pub(crate) fn parse_source(source: &str) -> Result<ParsedProgram, RuntimeError> 
     Ok(parsed)
 }
 
-fn record_statement(parsed: &mut ParsedProgram, line_number: u16, statement: Statement) {
+pub(super) fn record_statement(parsed: &mut ParsedProgram, line_number: u16, statement: Statement) {
     let index = parsed.instructions.len();
     match &statement {
         Statement::DefineProcedure(name, parameters) => {
@@ -372,7 +459,10 @@ fn record_statement(parsed: &mut ParsedProgram, line_number: u16, statement: Sta
     });
 }
 
-fn split_source_line_number(line: &str, fallback: u16) -> Result<(u16, &str), RuntimeError> {
+pub(super) fn split_source_line_number(
+    line: &str,
+    fallback: u16,
+) -> Result<(u16, &str), RuntimeError> {
     let leading_trimmed = line.trim_start_matches([' ', '\t']);
     let digits = leading_trimmed
         .bytes()
@@ -390,7 +480,7 @@ fn split_source_line_number(line: &str, fallback: u16) -> Result<(u16, &str), Ru
     ))
 }
 
-fn source_rem_comment(line: &str) -> Option<&str> {
+pub(super) fn source_rem_comment(line: &str) -> Option<&str> {
     let line = line.trim_start_matches([' ', '\t']);
     let bytes = line.as_bytes();
     if bytes.len() < 3 || !bytes[..3].eq_ignore_ascii_case(b"REM") {
@@ -419,7 +509,7 @@ fn is_basic64_directive(comment: &[u8]) -> bool {
         && comment.get(8).is_none_or(u8::is_ascii_whitespace)
 }
 
-fn parse_basic64_directive(
+pub(super) fn parse_basic64_directive(
     comment: &[u8],
     line_number: u16,
     options: &mut ProgramOptions,
@@ -596,13 +686,17 @@ fn validate_shared_boundary_core(line: &TokenizedBasicLine) -> Result<(), Runtim
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-enum LexMode {
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum LexMode {
     Tokenized,
     Source,
+    SystemSource,
 }
 
-fn parse_line(line: &TokenizedBasicLine, mode: LexMode) -> Result<Vec<Statement>, RuntimeError> {
+pub(super) fn parse_line(
+    line: &TokenizedBasicLine,
+    mode: LexMode,
+) -> Result<Vec<Statement>, RuntimeError> {
     if line.bytes.first() == Some(&b'*') {
         return Ok(vec![Statement::StarCommand(line.bytes[1..].to_vec())]);
     }
@@ -632,10 +726,16 @@ fn parse_line(line: &TokenizedBasicLine, mode: LexMode) -> Result<Vec<Statement>
 #[derive(Clone, Debug, PartialEq)]
 enum Token {
     Number(f64),
+    Integer(i128),
     String(Vec<u8>),
     Identifier(String),
     Keyword(u8),
     Sys,
+    Primitive,
+    SystemTry,
+    SystemCatch,
+    SystemEndTry,
+    SystemThrow,
     LineReference(u16),
     Symbol(u8),
     End,
@@ -764,7 +864,11 @@ impl<'a> Lexer<'a> {
             .map_err(|_| syntax_error(self.line_number, "invalid hexadecimal literal"))?;
         let value = u32::from_str_radix(digits, 16)
             .map_err(|_| syntax_error(self.line_number, "hexadecimal literal is too large"))?;
-        Ok(Token::Number(f64::from(value)))
+        if self.mode == LexMode::SystemSource {
+            Ok(Token::Integer(i128::from(value)))
+        } else {
+            Ok(Token::Number(f64::from(value)))
+        }
     }
 
     fn number_literal(&mut self) -> Result<Token, RuntimeError> {
@@ -780,10 +884,17 @@ impl<'a> Lexer<'a> {
         }
         let text = std::str::from_utf8(&self.bytes[start..self.offset])
             .map_err(|_| syntax_error(self.line_number, "invalid numeric literal"))?;
-        let value = text
-            .parse::<f64>()
-            .map_err(|_| syntax_error(self.line_number, "invalid numeric literal"))?;
-        Ok(Token::Number(value))
+        if self.mode == LexMode::SystemSource && !text.contains('.') {
+            let value = text
+                .parse::<i128>()
+                .map_err(|_| syntax_error(self.line_number, "integer literal is too large"))?;
+            Ok(Token::Integer(value))
+        } else {
+            let value = text
+                .parse::<f64>()
+                .map_err(|_| syntax_error(self.line_number, "invalid numeric literal"))?;
+            Ok(Token::Number(value))
+        }
     }
 
     fn identifier(&mut self) -> Result<Token, RuntimeError> {
@@ -807,7 +918,23 @@ impl<'a> Lexer<'a> {
         let value = std::str::from_utf8(&self.bytes[start..self.offset])
             .map_err(|_| syntax_error(self.line_number, "invalid variable name"))?
             .to_ascii_uppercase();
-        if matches!(self.mode, LexMode::Source) {
+        if self.mode == LexMode::SystemSource && matches!(self.previous, Some(Token::Symbol(b'.')))
+        {
+            return Ok(Token::Identifier(value));
+        }
+        if self.mode == LexMode::SystemSource && value == "PRIMITIVE" {
+            return Ok(Token::Primitive);
+        }
+        if self.mode == LexMode::SystemSource {
+            match value.as_str() {
+                "TRY" => return Ok(Token::SystemTry),
+                "CATCH" => return Ok(Token::SystemCatch),
+                "ENDTRY" => return Ok(Token::SystemEndTry),
+                "THROW" => return Ok(Token::SystemThrow),
+                _ => {}
+            }
+        }
+        if matches!(self.mode, LexMode::Source | LexMode::SystemSource) {
             if value == "SYS" {
                 return Ok(Token::Sys);
             }
@@ -1050,6 +1177,7 @@ fn token_ends_expression(token: &Token) -> bool {
     matches!(
         token,
         Token::Number(_)
+            | Token::Integer(_)
             | Token::String(_)
             | Token::Identifier(_)
             | Token::LineReference(_)
@@ -1104,6 +1232,7 @@ struct Parser {
     cursor: usize,
     line_number: u16,
     source_mode: bool,
+    system_source: bool,
 }
 
 impl Parser {
@@ -1112,7 +1241,8 @@ impl Parser {
             tokens: Lexer::new(bytes, line_number, mode).tokenize()?,
             cursor: 0,
             line_number,
-            source_mode: matches!(mode, LexMode::Source),
+            source_mode: matches!(mode, LexMode::Source | LexMode::SystemSource),
+            system_source: mode == LexMode::SystemSource,
         })
     }
 
@@ -1124,7 +1254,16 @@ impl Parser {
             Token::Keyword(TOKEN_CLS) => Ok(Statement::ClearScreen),
             Token::Keyword(TOKEN_CLG) => Ok(Statement::ClearGraphics),
             Token::Keyword(TOKEN_COLOUR) => self.parse_colour(),
-            Token::Keyword(TOKEN_LET) => self.parse_statement(),
+            Token::Keyword(TOKEN_LET) => {
+                if self.system_source
+                    && matches!(self.peek(), Token::Identifier(name) if name == "READONLY")
+                {
+                    self.next();
+                    self.parse_readonly_local()
+                } else {
+                    self.parse_statement()
+                }
+            }
             Token::Keyword(TOKEN_MODE) => Ok(Statement::Mode(self.parse_expression(0)?)),
             Token::Symbol(b'@') => {
                 self.expect_symbol(b'%')?;
@@ -1132,6 +1271,33 @@ impl Parser {
                 Ok(Statement::PrintFormat(self.parse_expression(0)?))
             }
             Token::Keyword(TOKEN_VDU) => self.parse_vdu(),
+            Token::Primitive => self.parse_primitive_call(),
+            Token::SystemTry => Ok(Statement::Try),
+            Token::SystemCatch => {
+                let error_name = self.expect_identifier("catch error binding")?;
+                let as_name = self.expect_identifier("AS")?;
+                if as_name != "AS" {
+                    return self.error("CATCH syntax is CATCH name AS ErrorType");
+                }
+                let error_type = self.expect_identifier("structured error type")?;
+                Ok(Statement::Catch {
+                    error_name,
+                    error_type,
+                })
+            }
+            Token::SystemEndTry => Ok(Statement::EndTry),
+            Token::SystemThrow => {
+                let error_type = self.expect_identifier("structured error type")?;
+                self.expect_symbol(b',')?;
+                let code = self.parse_expression(0)?;
+                self.expect_symbol(b',')?;
+                let message = self.parse_expression(0)?;
+                Ok(Statement::Throw {
+                    error_type,
+                    code,
+                    message,
+                })
+            }
             Token::Keyword(TOKEN_LINE) => self.parse_line_statement(),
             Token::Keyword(TOKEN_MOVE) => self.parse_move_statement(false),
             Token::Keyword(TOKEN_DRAW) => self.parse_move_statement(true),
@@ -1149,7 +1315,8 @@ impl Parser {
             Token::Keyword(TOKEN_DATA) => self.parse_data(),
             Token::Keyword(TOKEN_RESTORE) => {
                 let target = if matches!(self.peek(), Token::LineReference(_))
-                    || (self.source_mode && matches!(self.peek(), Token::Number(_)))
+                    || (self.source_mode
+                        && matches!(self.peek(), Token::Number(_) | Token::Integer(_)))
                 {
                     Some(self.expect_line_reference("RESTORE target")?)
                 } else {
@@ -1170,13 +1337,29 @@ impl Parser {
             Token::Keyword(TOKEN_REPEAT) => Ok(Statement::Repeat),
             Token::Keyword(TOKEN_UNTIL) => Ok(Statement::Until(self.parse_expression(0)?)),
             Token::Keyword(TOKEN_PROC) => {
-                let name = self.expect_routine_name("procedure name")?;
+                let mut name = self.expect_routine_name("procedure name")?;
+                let module = if self.system_source && self.consume_symbol(b'.') {
+                    let symbol = self.expect_routine_name("imported procedure name")?;
+                    let module = name;
+                    name = symbol;
+                    Some(module)
+                } else {
+                    None
+                };
                 let arguments = if self.consume_symbol(b'(') {
                     self.parse_call_arguments_after_open()?
                 } else {
                     Vec::new()
                 };
-                Ok(Statement::ProcedureCall(name, arguments))
+                if let Some(module) = module {
+                    Ok(Statement::ImportedProcedureCall {
+                        module,
+                        name,
+                        arguments,
+                    })
+                } else {
+                    Ok(Statement::ProcedureCall(name, arguments))
+                }
             }
             Token::Keyword(TOKEN_DEF) => self.parse_definition(),
             Token::Sys => self.parse_sys(),
@@ -1234,6 +1417,29 @@ impl Parser {
         }
     }
 
+    fn parse_readonly_local(&mut self) -> Result<Statement, RuntimeError> {
+        let name = self.expect_identifier("read-only local binding name")?;
+        let as_keyword = self.expect_identifier("AS")?;
+        if as_keyword != "AS" {
+            return self.error("LET READONLY syntax is name AS Type = expression");
+        }
+        let mut type_name = self.expect_identifier("read-only local type")?;
+        if type_name == "HANDLE" && self.consume_symbol(b'<') {
+            let handle_type = self.expect_identifier("opaque handle type")?;
+            self.expect_symbol(b'>')?;
+            type_name = format!("HANDLE<{handle_type}>");
+        }
+        let value_type = super::system_profile::parse_system_type(&type_name)
+            .map_err(|message| syntax_error(self.line_number, &message))?;
+        self.expect_symbol(b'=')?;
+        let value = self.parse_expression(0)?;
+        Ok(Statement::LocalReadOnly {
+            name,
+            value_type,
+            value,
+        })
+    }
+
     fn parse_if(&mut self) -> Result<Statement, RuntimeError> {
         let condition = self.parse_expression(0)?;
         self.consume_keyword(TOKEN_THEN);
@@ -1259,6 +1465,14 @@ impl Parser {
                 continue;
             }
             if self.source_mode {
+                if let Token::Integer(target) = self.peek() {
+                    if (0..=i128::from(u16::MAX)).contains(target) {
+                        let target = *target as u16;
+                        self.next();
+                        body.push(Statement::Goto(target));
+                        continue;
+                    }
+                }
                 if let Token::Number(target) = self.peek() {
                     if target.is_finite()
                         && *target >= 0.0
@@ -1503,6 +1717,41 @@ impl Parser {
         })
     }
 
+    fn parse_primitive_call(&mut self) -> Result<Statement, RuntimeError> {
+        let mut name = self.expect_identifier("primitive import name")?;
+        while self.consume_symbol(b'.') {
+            name.push('.');
+            name.push_str(&self.expect_identifier("qualified primitive name")?);
+        }
+        let mut arguments = Vec::new();
+        if self.consume_symbol(b',') {
+            loop {
+                if self.peek_symbol(b',') || self.peek_keyword(TOKEN_TO) || self.is_end() {
+                    arguments.push(None);
+                } else {
+                    arguments.push(Some(self.parse_expression(0)?));
+                }
+                if !self.consume_symbol(b',') {
+                    break;
+                }
+            }
+        }
+        let mut results = Vec::new();
+        if self.consume_keyword(TOKEN_TO) {
+            loop {
+                results.push(self.expect_identifier("primitive result variable")?);
+                if !self.consume_symbol(b',') {
+                    break;
+                }
+            }
+        }
+        Ok(Statement::PrimitiveCall {
+            name,
+            arguments,
+            results,
+        })
+    }
+
     fn parse_string_slice_assignment(&mut self) -> Result<Statement, RuntimeError> {
         let arguments = self.parse_call_arguments()?;
         if arguments.len() != 3 {
@@ -1522,6 +1771,21 @@ impl Parser {
         &mut self,
         name: String,
     ) -> Result<Statement, RuntimeError> {
+        if self.system_source && self.consume_symbol(b'.') {
+            let mut path = vec![name.clone(), self.expect_identifier("record field")?];
+            while self.consume_symbol(b'.') {
+                path.push(self.expect_identifier("record field")?);
+            }
+            if !self.consume_symbol(b'=') {
+                return self.error("expected '=' after record field");
+            }
+            let target = if path.len() == 2 {
+                LValue::RecordField(path[0].clone(), path[1].clone())
+            } else {
+                LValue::RecordPath(path)
+            };
+            return Ok(Statement::Assign(target, self.parse_expression(0)?));
+        }
         let target = if self.consume_symbol(b'(') {
             let index = self.parse_expression(0)?;
             self.expect_symbol(b')')?;
@@ -1590,6 +1854,9 @@ impl Parser {
     }
 
     fn parse_expression_list_until(&mut self, terminator: u8) -> Result<Vec<Expr>, RuntimeError> {
+        if self.consume_symbol(terminator) {
+            return Ok(Vec::new());
+        }
         let mut values = vec![self.parse_expression(0)?];
         while self.consume_symbol(b',') {
             values.push(self.parse_expression(0)?);
@@ -1603,6 +1870,11 @@ impl Parser {
     fn parse_expression(&mut self, minimum_precedence: u8) -> Result<Expr, RuntimeError> {
         let mut left = self.parse_prefix()?;
         loop {
+            if self.system_source && minimum_precedence <= 9 && self.consume_symbol(b'.') {
+                let field = self.expect_identifier("record or enum member")?;
+                left = Expr::Member(Box::new(left), field);
+                continue;
+            }
             let Some((operator, precedence, width)) = self.peek_binary_operator() else {
                 break;
             };
@@ -1620,12 +1892,16 @@ impl Parser {
         let token = self.next().clone();
         match token {
             Token::Number(value) => Ok(Expr::Number(value)),
+            Token::Integer(value) => Ok(Expr::Integer(value)),
             Token::String(value) => Ok(Expr::String(value)),
             Token::Identifier(name) => {
                 if self.consume_symbol(b'(') {
                     let index = self.parse_expression(0)?;
                     self.expect_symbol(b')')?;
                     Ok(Expr::ArrayElement(name, Box::new(index)))
+                } else if self.system_source && self.consume_symbol(b'.') {
+                    let field = self.expect_identifier("record or enum member")?;
+                    Ok(Expr::Member(Box::new(Expr::Variable(name)), field))
                 } else {
                     Ok(Expr::Variable(name))
                 }
@@ -1667,7 +1943,15 @@ impl Parser {
                 Ok(Expr::Builtin(token, self.parse_call_arguments()?))
             }
             Token::Keyword(TOKEN_FN) => {
-                let name = self.expect_named_routine("function name")?;
+                let mut name = self.expect_named_routine("function name")?;
+                let module = if self.system_source && self.consume_symbol(b'.') {
+                    let symbol = self.expect_named_routine("imported function name")?;
+                    let module = name;
+                    name = symbol;
+                    Some(module)
+                } else {
+                    None
+                };
                 let arguments = if self.consume_symbol(b'(') {
                     self.parse_expression_list_until(b')')?
                 } else {
@@ -1676,7 +1960,15 @@ impl Parser {
                 if self.peek_symbol(b')') {
                     self.next();
                 }
-                Ok(Expr::UserFunction(name, arguments))
+                if let Some(module) = module {
+                    Ok(Expr::ImportedFunction {
+                        module,
+                        name,
+                        arguments,
+                    })
+                } else {
+                    Ok(Expr::UserFunction(name, arguments))
+                }
             }
             Token::Keyword(TOKEN_NOT) | Token::Symbol(b'-') | Token::Symbol(b'+') => {
                 let operator = match token {
@@ -1765,6 +2057,11 @@ impl Parser {
                     && target >= 0.0
                     && target <= f64::from(u16::MAX)
                     && target.fract() == 0.0 =>
+            {
+                Ok(target as u16)
+            }
+            Token::Integer(target)
+                if self.source_mode && (0..=i128::from(u16::MAX)).contains(&target) =>
             {
                 Ok(target as u16)
             }

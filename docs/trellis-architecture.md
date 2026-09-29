@@ -6,10 +6,50 @@ This document records the architectural direction for **Trellis**, the project
 previously described under the working name Acorn-2026. It is the basis for
 future work packages.
 
+The dependency-ordered implementation plan is maintained in
+[`trellis-work-packages.md`](trellis-work-packages.md).
+
 The mission, module ownership of SWIs, absence of native public SWI handlers,
 and bootstrap boundary described here are firm design decisions. The complete
 live-system experience, language extensions, persistence model, optimisation
 strategy, and desktop projections remain staged design work.
+
+### Implementation checkpoint — 2026-09-29
+
+The Phase 0–3 first Console slice now routes `OS_ReadLine`, `OS_WriteC`,
+`OS_WriteS`, `OS_Write0`, `OS_NewLine`, and `OS_ReadC` through versioned
+registry entry cells to interpreted definitions in `modules/Console.bas64`.
+The remaining dispatcher handlers use an explicitly counted transitional
+Rust route.
+
+This does not yet realize the zero-public-SWI bootstrap described below. The
+current `SwiDispatcher` constructor embeds and parses Console source, registers
+its host primitives, grants its capabilities, and publishes/starts those six
+exports. Existing Rust Console handler branches and numeric constants remain as
+migration scaffolding. The source module's `@SWI` declarations own the active
+six definitions, but Rust is still the bootstrap installer; the boot capsule
+and empty-table startup are Phase 4 work. `Host.Graphics.AcceptByte` owns the
+hosted VDU byte-stream policy while `Host.Console.WriteByte` performs raw host
+output. A trusted in-process `Basic64ModuleManager` supports compatible live
+replacement but is not a guest-facing system browser. See
+[`trellis-work-packages.md`](trellis-work-packages.md) for the package-by-package
+completion boundary and remaining compatibility, serialization, and compilation
+gaps.
+
+System Profile 0.1 now has a separate, source-located typed high-level IR whose
+operations represent the supported expressions/statements without retaining
+parser AST payload. Interpreted module calls prepare that representation and
+reconstruct the common reference-interpreter program from its IR. The slice
+also executes linked cross-module PROC/FN calls, checks managed resource rights
+at use, scopes typed local read-only bindings in PROC/FN calls, and preserves
+exact explicitly typed `INT64`/`UINT64` operations. Hybrid/Strict JIT and AOT
+requests use the same admission boundary and reject native System Profile
+lowering explicitly. This is not a serialized capsule format or native module
+compiler. Lifecycle workspace writes are transactional: failed `Quiesce`
+restores the prior workspace and `Active` admission; failed `Finalise` restores
+workspace state but leaves the module safely quiesced, exports inaccessible and
+source/workspace retained for retry. Irreversible host effects performed by a
+hook primitive remain outside that transaction and must be deferred by hooks.
 
 ## Mission
 
@@ -105,10 +145,9 @@ Higher-level policy belongs in BASIC64 modules wherever practical.
 
 BASIC64 remains recognisably descended from BBC BASIC and retains an explicit
 BBC BASIC V/VI compatibility personality. Its native system-language profile
-may add facilities required to build Trellis, such as modules, closures,
-structured values, exceptions, tasks, reflection, and controlled dynamic
-dispatch. Extensions must be additive or explicitly selected; they must not
-silently reinterpret compatible BBC BASIC source.
+adds the bounded facilities specified below and in the System Profile document.
+Extensions are additive and explicitly selected; they must not silently
+reinterpret compatible BBC BASIC source.
 
 The language should grow from concrete requirements imposed by the next system
 layer. Trellis does not assume that every operation requires universal
@@ -119,6 +158,16 @@ The interpreter remains the reference and universal execution path. Portable
 IR can feed an interpreter, a tiered JIT, and later AOT compilation. Optimised
 code must preserve caller identity, logical memory checks, capabilities, source
 locations, dependency information, invalidation, and deoptimisation.
+
+Before executable Trellis modules are built, the native language will gain a
+deliberately bounded **BASIC64 System Profile 0.1**. Its agreed facilities are
+modules and visibility, named records, enums and flags, typed definitions,
+structured errors, opaque handles, read-only bindings, SWI/primitive metadata,
+and a strict distinction between managed references and logical addresses.
+Structures, resource identities, and behavioural modules remain separate
+concepts. Classes, inheritance, generics, universal message dispatch, macros,
+and async syntax are deferred until concrete system requirements justify them.
+See [`basic64-system-profile.md`](basic64-system-profile.md).
 
 ## Live entities and relationships
 
@@ -238,6 +287,42 @@ an anonymous host function directly into the SWI table.
 This preserves the useful RISC OS module concept without retaining historical
 module headers, ARM branch tables, relocation conventions, shared-address-space
 entry points, raw host pointers, or privileged native module code.
+
+### Manifest schema 1 checkpoint
+
+The current native model serializes a resolved module manifest as deterministic
+UTF-8 text headed by `TRELLIS-MANIFEST<TAB>1`. Each subsequent row is
+`key<TAB>value`; strings are percent-escaped, collections use indexed fields
+plus explicit counts, and fields have one canonical ordering. Schema 1 records:
+
+- module name, semantic version, language and target profiles;
+- source path and change-detection hash;
+- dependency names/minimum versions and imported/exported BASIC64 symbols;
+- primitive imports and requested capabilities;
+- lifecycle procedure names and the replacement policy;
+- each SWI number/name/definition, typed register directions, caller-memory
+  pointer/direction/size, PC/carry contract, blocking/re-entrancy properties,
+  and failure-transport label.
+
+The decoder rejects unknown, duplicate, missing, malformed, and trailing
+fields. Validation also rejects invalid module/source paths, unsupported target
+profiles, duplicate/self dependencies, unresolved symbol visibility,
+duplicate SWI ownership inside the manifest, invalid register widths or
+directions, ambiguous PC declarations, unsafe memory pointer contracts, and
+primitive imports not covered by a declared request and host grant. The full
+source metadata spelling and example are in
+[`basic64-system-profile.md`](basic64-system-profile.md); the SWI surface is
+tracked in [`trellis-swi-inventory.yaml`](trellis-swi-inventory.yaml).
+
+Replacement metadata values are `IMMEDIATE`, `QUIESCENT`, `MIGRATING`, and
+`RESTART`. The Phase 0–3 live path currently accepts only a compatible immediate
+definition replacement with the same module version, dependencies, exports,
+contracts, capabilities, lifecycle, and workspace schema. It retains active
+old generations and invalidates derived identities on source/dependency change.
+The other values are reserved policy labels, not working state-migration or
+restart workflows. Schema 1 and source fingerprints are deterministic and
+serializable but are not signed or cryptographically authenticated; FNV-1a is
+only a cache/change detector.
 
 ### Live replacement
 
@@ -492,7 +577,7 @@ Future work packages should preserve these invariants:
 
 The following questions remain open for work-package design:
 
-- the exact BASIC64 module and manifest syntax;
+- the exact spelling and grammar of the agreed BASIC64 System Profile features;
 - the portable IR and boot-capsule format;
 - the first primitive ABI and capability vocabulary;
 - the initial foundation-module split and dependency graph;

@@ -144,6 +144,10 @@ struct StrictCompiler<'a> {
 
 impl<'a> StrictCompiler<'a> {
     fn new(program: &'a ParsedProgram, options: StrictJitOptions) -> Result<Self, String> {
+        super::system_ir::PortableSystemIr::native_boundary_for_program(
+            program,
+            super::system_ir::SystemIrBackend::StrictJit,
+        )?;
         let isa_builder = cranelift_native::builder().map_err(|message| message.to_string())?;
         let mut flags_builder = settings::builder();
         flags_builder
@@ -1344,7 +1348,14 @@ impl<'a> StrictCompiler<'a> {
             | Statement::Draw(_, _)
             | Statement::Plot(_, _, _)
             | Statement::Gcol(_, _)
-            | Statement::Sys { .. } => {
+            | Statement::Sys { .. }
+            | Statement::PrimitiveCall { .. }
+            | Statement::ImportedProcedureCall { .. }
+            | Statement::LocalReadOnly { .. }
+            | Statement::Try
+            | Statement::Catch { .. }
+            | Statement::EndTry
+            | Statement::Throw { .. } => {
                 if address.is_some() {
                     return Err(compile_error(
                         line,
@@ -1434,6 +1445,17 @@ impl<'a> StrictCompiler<'a> {
         let line_value = iconst_i32(builder, i32::from(line));
         match expression {
             Expr::Number(value) => Ok(CompiledExpr::Number(builder.ins().f64const(*value))),
+            Expr::Integer(value)
+                if self.program.options.mode != crate::configure::BasicLanguageMode::Basic64 =>
+            {
+                // Preserve the pre-BASIC64 floating number model for classic
+                // source while the typed BASIC64 path remains interpreter-only.
+                Ok(CompiledExpr::Number(builder.ins().f64const(*value as f64)))
+            }
+            Expr::Integer(_) => Err(compile_error(
+                line,
+                "exact BASIC64 integer literals are not supported by strict native lowering",
+            )),
             Expr::String(value) => Ok(CompiledExpr::String(iconst_i32(
                 builder,
                 self.constant_string_slot(value)?,
@@ -1704,6 +1726,14 @@ impl<'a> StrictCompiler<'a> {
                 self.guard_context(builder, ctx, error_block);
                 Ok(CompiledExpr::Number(value))
             }
+            Expr::Member(_, _) => Err(compile_error(
+                line,
+                "BASIC64 record and enum member access is not supported by strict native lowering",
+            )),
+            Expr::ImportedFunction { .. } => Err(compile_error(
+                line,
+                "qualified BASIC64 function imports are not supported by strict native lowering",
+            )),
         }
     }
 
@@ -2490,6 +2520,12 @@ impl<'a> StrictCompiler<'a> {
                 );
                 self.guard_status(builder, result, error_block);
             }
+            LValue::RecordField(_, _) | LValue::RecordPath(_) => {
+                return Err(compile_error(
+                    line,
+                    "BASIC64 record field assignment is not supported by strict native lowering",
+                ));
+            }
         }
         Ok(())
     }
@@ -2642,6 +2678,60 @@ fn compile_error(line: u16, message: impl AsRef<str>) -> String {
             "BASICJIT strict compile at line {line}: {}",
             message.as_ref()
         )
+    }
+}
+
+#[cfg(test)]
+mod system_profile_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn strict_jit_reports_system_profile_types_as_unsupported_instead_of_miscompiling() {
+        let mut program = ParsedProgram::default();
+        program.system_types.insert(
+            "FILEINFO".into(),
+            super::super::parser::SystemTypeDefinition::Record { fields: Vec::new() },
+        );
+        let error = match StrictCompiler::new(&program, StrictJitOptions::default()) {
+            Ok(_) => {
+                panic!("System Profile records must not silently enter strict native compilation")
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("strict native compilation does not support BASIC64 System Profile")
+        );
+        assert!(error.contains("select the interpreter or Hybrid mode"));
+
+        let mut typed = ParsedProgram::default();
+        typed
+            .typed_parameters
+            .insert("ENTRY".into(), vec![super::super::parser::SystemType::Byte]);
+        let error = match StrictCompiler::new(&typed, StrictJitOptions::default()) {
+            Ok(_) => {
+                panic!("typed System Profile parameters must not enter strict native compilation")
+            }
+            Err(error) => error,
+        };
+        assert!(error.contains("typed definitions"));
+
+        let mut basic64 = ParsedProgram::default();
+        basic64.options.mode = crate::configure::BasicLanguageMode::Basic64;
+        basic64
+            .instructions
+            .push(super::super::parser::LocatedStatement {
+                line_number: 10,
+                statement: Statement::Assign(
+                    LValue::Variable("VALUE".into()),
+                    Expr::Integer(9_007_199_254_740_993),
+                ),
+            });
+        let error = match StrictCompiler::new(&basic64, StrictJitOptions::default()) {
+            Ok(_) => panic!("BASIC64 integer operations must not be lowered as f64"),
+            Err(error) => error,
+        };
+        assert!(error.contains("BASIC64 System Profile typed assignment"));
+        assert!(error.contains("select the interpreter or Hybrid mode"));
     }
 }
 
@@ -3022,7 +3112,7 @@ fn scan_name(name: &str, scan: &mut ProgramScan) {
 
 fn scan_expression(expression: &Expr, scan: &mut ProgramScan) {
     match expression {
-        Expr::Number(_) => {}
+        Expr::Number(_) | Expr::Integer(_) => {}
         Expr::String(value) => {
             scan.string_constants.insert(value.clone());
         }
@@ -3041,7 +3131,13 @@ fn scan_expression(expression: &Expr, scan: &mut ProgramScan) {
                 scan_expression(argument, scan);
             }
         }
+        Expr::ImportedFunction { arguments, .. } => {
+            for argument in arguments {
+                scan_expression(argument, scan);
+            }
+        }
         Expr::MemoryRead(_, address) => scan_expression(address, scan),
+        Expr::Member(base, _) => scan_expression(base, scan),
     }
 }
 
@@ -3063,6 +3159,12 @@ fn scan_lvalue(target: &LValue, scan: &mut ProgramScan) {
             scan_name(name, scan);
             scan_expression(start, scan);
             scan_expression(length, scan);
+        }
+        LValue::RecordField(name, _) => scan_name(name, scan),
+        LValue::RecordPath(path) => {
+            if let Some(name) = path.first() {
+                scan_name(name, scan);
+            }
         }
     }
 }
@@ -3168,6 +3270,19 @@ fn scan_statement(statement: &Statement, scan: &mut ProgramScan) {
                 scan_expression(argument, scan);
             }
         }
+        Statement::ImportedProcedureCall { arguments, .. } => {
+            for argument in arguments {
+                scan_expression(argument, scan);
+            }
+        }
+        Statement::LocalReadOnly {
+            name,
+            value_type: _,
+            value,
+        } => {
+            scan_name(name, scan);
+            scan_expression(value, scan);
+        }
         Statement::DefineProcedure(_, parameters) | Statement::DefineFunction(_, parameters) => {
             for name in parameters {
                 scan_name(name, scan);
@@ -3179,6 +3294,19 @@ fn scan_statement(statement: &Statement, scan: &mut ProgramScan) {
             results,
         } => {
             scan.string_constants.insert(name.clone());
+            for argument in arguments.iter().flatten() {
+                scan_expression(argument, scan);
+            }
+            for result in results {
+                scan_name(result, scan);
+            }
+        }
+        Statement::PrimitiveCall {
+            name,
+            arguments,
+            results,
+        } => {
+            scan.string_constants.insert(name.as_bytes().to_vec());
             for argument in arguments.iter().flatten() {
                 scan_expression(argument, scan);
             }
@@ -3199,6 +3327,10 @@ fn scan_statement(statement: &Statement, scan: &mut ProgramScan) {
         | Statement::EndProcedure
         | Statement::End
         | Statement::EndIf
+        | Statement::Try
+        | Statement::Catch { .. }
+        | Statement::EndTry
+        | Statement::Throw { .. }
         | Statement::NoOp => {}
     }
 }

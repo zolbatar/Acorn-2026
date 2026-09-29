@@ -6,6 +6,42 @@ fn main() -> ExitCode {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
     let result = if let Some(index) = arguments
         .iter()
+        .position(|argument| argument == "--write-boot-capsule")
+    {
+        match arguments.get(index + 1) {
+            Some(path) => acorn_2026::boot::embedded_capsule_bytes()
+                .map_err(|error| error.to_string())
+                .and_then(|bytes| {
+                    std::fs::write(path, bytes)
+                        .map_err(|error| format!("could not write boot capsule {path}: {error}"))
+                }),
+            None => Err("--write-boot-capsule requires an output path".into()),
+        }
+    } else if let Some(index) = arguments
+        .iter()
+        .position(|argument| argument == "--verify-boot-capsule")
+    {
+        match arguments.get(index + 1) {
+            Some(path) => std::fs::read(path)
+                .map_err(|error| format!("could not read boot capsule {path}: {error}"))
+                .and_then(|bytes| {
+                    acorn_2026::boot::BootCapsule::decode(
+                        &bytes,
+                        acorn_2026::boot::RUNTIME_ABI_VERSION,
+                    )
+                    .map(|capsule| {
+                        println!(
+                            "verified Trellis boot capsule: ABI {}, {} module(s)",
+                            capsule.runtime_abi,
+                            capsule.modules.len()
+                        );
+                    })
+                    .map_err(|error| error.to_string())
+                }),
+            None => Err("--verify-boot-capsule requires an input path".into()),
+        }
+    } else if let Some(index) = arguments
+        .iter()
         .position(|argument| argument == "--display-manager-snapshots")
     {
         match arguments.get(index + 1) {

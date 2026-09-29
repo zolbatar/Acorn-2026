@@ -1708,7 +1708,7 @@ fn acorn_logo() -> &'static ImageData {
     static IMAGE: OnceLock<ImageData> = OnceLock::new();
     IMAGE.get_or_init(|| {
         decode_branding_png(include_bytes!(
-            "../resources/branding/acorn-glossy-v2-1024.png"
+            "../resources/branding/desktop-flat/acorn.png"
         ))
     })
 }
@@ -1774,7 +1774,7 @@ fn harddisc_logo() -> &'static ImageData {
     static IMAGE: OnceLock<ImageData> = OnceLock::new();
     IMAGE.get_or_init(|| {
         decode_branding_png(include_bytes!(
-            "../resources/branding/harddisc-glossy-v2-1024.png"
+            "../resources/branding/desktop-flat/harddisk-v2-1024.png"
         ))
     })
 }

@@ -1,6 +1,8 @@
 #[doc(hidden)]
 pub mod compiler_api;
 
+pub mod system_profile;
+
 #[cfg(feature = "experimental-jit")]
 mod jit;
 #[cfg(feature = "experimental-jit")]
@@ -9,6 +11,7 @@ mod parser;
 mod runtime;
 #[cfg(feature = "experimental-jit")]
 mod strict_jit;
+mod system_ir;
 
 #[derive(Clone, Debug, Default)]
 pub struct JitExecutionReport {

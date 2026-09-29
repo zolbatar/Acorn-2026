@@ -105,17 +105,11 @@ impl Runtime {
     }
 
     pub fn run(&mut self) -> Result<(), RuntimeError> {
-        if self.dispatcher.desktop_is_configured_for_startup()? {
-            // Use the public MOS command path so power-on desktop startup runs
-            // the same system component and display handoff as `DESKTOP`.
-            self.task.memory.write_bytes(LINE_BUFFER, b"DESKTOP\0")?;
-            let mut command = SwiContext::default();
-            command.registers[0] = LINE_BUFFER;
-            self.dispatcher
-                .dispatch(OS_CLI, &mut self.task, &mut command)?;
-            if self.dispatcher.desktop_requested() {
-                return Ok(());
-            }
+        if self.dispatcher.has_boot_failure() && !self.dispatcher.recover_boot()? {
+            return Ok(());
+        }
+        if self.dispatcher.enter_boot_startup()? {
+            return Ok(());
         }
 
         self.write_prompt()?;
@@ -542,12 +536,7 @@ mod tests {
                 .startup_language,
             StartupLanguage::Desktop
         );
-        assert!(
-            !runtime
-                .dispatcher
-                .desktop_is_configured_for_startup()
-                .unwrap()
-        );
+        assert!(!runtime.dispatcher.desktop_is_configured_for_startup());
         let _ = std::fs::remove_file(config_path);
     }
 

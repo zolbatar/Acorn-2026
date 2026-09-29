@@ -9,6 +9,11 @@ pub enum RuntimeError {
     Io(io::Error),
     Memory(MemoryError),
     Program(String),
+    Structured {
+        type_name: String,
+        code: u32,
+        message: String,
+    },
 }
 
 impl fmt::Display for RuntimeError {
@@ -19,6 +24,13 @@ impl fmt::Display for RuntimeError {
             Self::Io(error) => write!(f, "host I/O error: {error}"),
             Self::Memory(error) => write!(f, "guest memory error: {error}"),
             Self::Program(message) => write!(f, "{message}"),
+            Self::Structured {
+                type_name,
+                code,
+                message,
+            } => {
+                write!(f, "{type_name} (&{code:08X}): {message}")
+            }
         }
     }
 }
@@ -28,7 +40,9 @@ impl Error for RuntimeError {
         match self {
             Self::Io(error) => Some(error),
             Self::Memory(error) => Some(error),
-            Self::EndOfInput | Self::InvalidSwi(_) | Self::Program(_) => None,
+            Self::EndOfInput | Self::InvalidSwi(_) | Self::Program(_) | Self::Structured { .. } => {
+                None
+            }
         }
     }
 }

@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use crate::{
     error::RuntimeError,
@@ -25,25 +28,250 @@ const PRINT_ZONE_WIDTH: usize = 14;
 const DEFAULT_PRINT_FORMAT: u32 = 0x0000_090A;
 
 #[derive(Clone, Debug, PartialEq)]
-enum Value {
+pub(crate) enum Value {
     Number(f64),
+    /// Exact native integer literal, normalized when assigned to a typed
+    /// System Profile binding.
+    Integer(i128),
+    UInt64(u64),
+    Int64(i64),
     String(Vec<u8>),
+    Enum {
+        type_name: String,
+        value: i64,
+    },
+    Flags {
+        type_name: String,
+        value: u64,
+    },
+    Record {
+        type_name: String,
+        fields: HashMap<String, Value>,
+        readonly_fields: std::collections::HashSet<String>,
+    },
+    Handle {
+        type_name: String,
+        raw: u32,
+    },
+    LogicalAddress {
+        owner_task: u64,
+        raw: u32,
+    },
+    Error {
+        type_name: String,
+        code: u32,
+        message: Vec<u8>,
+        fields: HashMap<String, Value>,
+        readonly_fields: std::collections::HashSet<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExactIntegerKind {
+    Literal,
+    Signed64,
+    Unsigned64,
+}
+
+fn exact_integer(value: &Value) -> Option<(i128, ExactIntegerKind)> {
+    match value {
+        Value::Integer(value) => Some((*value, ExactIntegerKind::Literal)),
+        Value::Int64(value) => Some((i128::from(*value), ExactIntegerKind::Signed64)),
+        Value::UInt64(value) => Some((i128::from(*value), ExactIntegerKind::Unsigned64)),
+        _ => None,
+    }
+}
+
+fn exact_integer_result(
+    kind: ExactIntegerKind,
+    value: i128,
+    line: u16,
+) -> Result<Value, RuntimeError> {
+    match kind {
+        ExactIntegerKind::Literal => Ok(Value::Integer(value)),
+        ExactIntegerKind::Signed64 => i64::try_from(value)
+            .map(Value::Int64)
+            .map_err(|_| program_error(line, "INT64 arithmetic overflowed")),
+        ExactIntegerKind::Unsigned64 => u64::try_from(value)
+            .map(Value::UInt64)
+            .map_err(|_| program_error(line, "UINT64 arithmetic overflowed")),
+    }
+}
+
+fn exact_integer_pair(
+    left: &Value,
+    right: &Value,
+    line: u16,
+) -> Result<Option<(i128, i128, ExactIntegerKind)>, RuntimeError> {
+    let (Some((left_value, left_kind)), Some((right_value, right_kind))) =
+        (exact_integer(left), exact_integer(right))
+    else {
+        return Ok(None);
+    };
+    let kind = match (left_kind, right_kind) {
+        (left, right) if left == right => left,
+        (ExactIntegerKind::Literal, kind) | (kind, ExactIntegerKind::Literal) => kind,
+        _ => {
+            return Err(program_error(
+                line,
+                "signed and unsigned 64-bit operands require an explicit conversion",
+            ));
+        }
+    };
+    Ok(Some((left_value, right_value, kind)))
+}
+
+fn coerce_exact_literal_with_float(
+    left: Value,
+    right: Value,
+    line: u16,
+) -> Result<(Value, Value), RuntimeError> {
+    match (left, right) {
+        (Value::Number(number), Value::Integer(integer)) => Ok((
+            Value::Number(number),
+            Value::Number(exact_i128_to_f64(integer, line).map_err(|_| {
+                program_error(
+                    line,
+                    "integer literal is not exactly representable with a floating operand; use an explicit conversion",
+                )
+            })?),
+        )),
+        (Value::Integer(integer), Value::Number(number)) => Ok((
+            Value::Number(exact_i128_to_f64(integer, line).map_err(|_| {
+                program_error(
+                    line,
+                    "integer literal is not exactly representable with a floating operand; use an explicit conversion",
+                )
+            })?),
+            Value::Number(number),
+        )),
+        (left, right) => Ok((left, right)),
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct ModuleWorkspace(Arc<Mutex<HashMap<String, Value>>>);
+
+#[derive(Clone, Debug)]
+pub(super) struct ModuleWorkspaceSnapshot(HashMap<String, Value>);
+
+impl ModuleWorkspace {
+    pub(super) fn snapshot(&self) -> ModuleWorkspaceSnapshot {
+        ModuleWorkspaceSnapshot(
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
+    }
+
+    pub(super) fn restore(&self, snapshot: ModuleWorkspaceSnapshot) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = snapshot.0;
+    }
+
+    #[cfg(test)]
+    pub(super) fn read_number(&self, name: &str) -> Option<f64> {
+        match self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(name)?
+        {
+            Value::Number(value) => Some(*value),
+            Value::Integer(value) => Some(*value as f64),
+            Value::UInt64(value) => Some(*value as f64),
+            Value::Int64(value) => Some(*value as f64),
+            Value::Enum { value, .. } => Some(*value as f64),
+            Value::Flags { value, .. } => Some(*value as f64),
+            _ => None,
+        }
+    }
 }
 
 impl Value {
     fn number(&self, line: u16) -> Result<f64, RuntimeError> {
         match self {
             Self::Number(value) => Ok(*value),
-            Self::String(_) => Err(program_error(line, "expected a numeric expression")),
+            Self::Integer(value) => exact_i128_to_f64(*value, line),
+            Self::UInt64(value) => exact_i128_to_f64(i128::from(*value), line),
+            Self::Int64(value) => exact_i128_to_f64(i128::from(*value), line),
+            Self::String(_)
+            | Self::Record { .. }
+            | Self::Handle { .. }
+            | Self::LogicalAddress { .. }
+            | Self::Error { .. } => Err(program_error(line, "expected a numeric expression")),
+            Self::Enum { .. } | Self::Flags { .. } => Err(program_error(
+                line,
+                "enum and flag values are not ordinary numbers",
+            )),
         }
     }
 
     fn string(&self, line: u16) -> Result<&[u8], RuntimeError> {
         match self {
             Self::String(value) => Ok(value),
-            Self::Number(_) => Err(program_error(line, "expected a string expression")),
+            Self::Number(_)
+            | Self::Integer(_)
+            | Self::UInt64(_)
+            | Self::Int64(_)
+            | Self::Enum { .. }
+            | Self::Flags { .. }
+            | Self::Record { .. }
+            | Self::Handle { .. }
+            | Self::LogicalAddress { .. }
+            | Self::Error { .. } => Err(program_error(line, "expected a string expression")),
         }
     }
+
+    fn record_field(&self, name: &str, line: u16) -> Result<Value, RuntimeError> {
+        match self {
+            Self::Record { fields, .. } | Self::Error { fields, .. } => fields
+                .get(name)
+                .cloned()
+                .ok_or_else(|| program_error(line, format!("unknown field {name}"))),
+            _ => Err(program_error(
+                line,
+                "member access requires a record or structured error",
+            )),
+        }
+    }
+
+    fn truthy(&self, line: u16) -> Result<bool, RuntimeError> {
+        match self {
+            Self::Integer(value) => Ok(*value != 0),
+            Self::UInt64(value) => Ok(*value != 0),
+            Self::Int64(value) => Ok(*value != 0),
+            value => value.number(line).map(|value| value != 0.0),
+        }
+    }
+
+    fn number_string(&self, line: u16) -> Result<Vec<u8>, RuntimeError> {
+        match self {
+            Self::Integer(value) => Ok(value.to_string().into_bytes()),
+            Self::UInt64(value) => Ok(value.to_string().into_bytes()),
+            Self::Int64(value) => Ok(value.to_string().into_bytes()),
+            value => Ok(format_number(value.number(line)?).into_bytes()),
+        }
+    }
+}
+
+fn exact_i128_to_f64(value: i128, line: u16) -> Result<f64, RuntimeError> {
+    let converted = value as f64;
+    let upper_bound = -(i128::MIN as f64);
+    if !converted.is_finite()
+        || converted < i128::MIN as f64
+        || converted >= upper_bound
+        || converted as i128 != value
+    {
+        return Err(program_error(
+            line,
+            "64-bit integer cannot be represented exactly as a floating value; use an explicit conversion",
+        ));
+    }
+    Ok(converted)
 }
 
 #[derive(Clone, Copy)]
@@ -57,14 +285,34 @@ struct ReturnFrame {
     kind: ReturnKind,
     address: usize,
     saved_variables: Vec<(String, Option<Value>)>,
+    routine_name: Option<String>,
+    local_readonly_scope: bool,
 }
 
 struct ForFrame {
     variable: String,
-    limit: f64,
-    step: f64,
+    limit: Value,
+    step: Value,
     body_address: usize,
     next_address: usize,
+}
+
+#[derive(Clone)]
+struct TryRegion {
+    catch_address: usize,
+    end_address: usize,
+    error_name: String,
+    error_type: String,
+}
+
+struct ActiveTry {
+    catch_address: usize,
+    end_address: usize,
+    error_name: String,
+    error_type: String,
+    return_depth: usize,
+    for_depth: usize,
+    repeat_depth: usize,
 }
 
 enum Flow {
@@ -84,6 +332,12 @@ pub(super) struct Interpreter {
     repeat_loops: Vec<usize>,
     for_pairs: HashMap<usize, usize>,
     if_blocks: HashMap<usize, usize>,
+    try_regions: HashMap<usize, TryRegion>,
+    try_frames: Vec<ActiveTry>,
+    completed_try_ends: std::collections::HashSet<usize>,
+    readonly_bindings: std::collections::HashSet<String>,
+    readonly_initialized: std::collections::HashSet<String>,
+    local_readonly_scopes: Vec<HashMap<String, Option<Value>>>,
     clock: MosClock,
     steps: u64,
     interpreted_statement_count: u64,
@@ -359,6 +613,8 @@ impl Interpreter {
             .collect();
         let for_pairs = match_for_loops(&program);
         let if_blocks = match_if_blocks(&program);
+        let try_regions = match_try_regions(&program);
+        let readonly_bindings = program.readonly_bindings.iter().cloned().collect();
 
         Self {
             program,
@@ -371,6 +627,12 @@ impl Interpreter {
             repeat_loops: Vec::new(),
             for_pairs,
             if_blocks,
+            try_regions,
+            try_frames: Vec::new(),
+            completed_try_ends: std::collections::HashSet::new(),
+            readonly_bindings,
+            readonly_initialized: std::collections::HashSet::new(),
+            local_readonly_scopes: Vec::new(),
             clock: MosClock::default(),
             steps: 0,
             interpreted_statement_count: 0,
@@ -567,7 +829,7 @@ impl Interpreter {
                     .and_then(|jit| jit.native_procedure_variables(&name))
                 {
                     let line = self.program.instructions[address].line_number;
-                    let values = self.evaluate_arguments(&arguments, line, task)?;
+                    let values = self.evaluate_arguments(&arguments, line, task, dispatcher)?;
                     let expected_arguments = self
                         .program
                         .procedures
@@ -611,7 +873,9 @@ impl Interpreter {
                         }
                     }
 
-                    match self.execute_procedure_call_values(&name, values, address, line)? {
+                    match self
+                        .execute_procedure_call_values(&name, values, task.id, address, line)?
+                    {
                         Flow::Next => address += 1,
                         Flow::Jump(destination) => address = destination,
                         Flow::Stop => break,
@@ -660,13 +924,26 @@ impl Interpreter {
             }
 
             let instruction = self.program.instructions[address].clone();
-            match self.execute_statement(
+            let executed = self.execute_statement(
                 &instruction.statement,
                 address,
                 instruction.line_number,
                 task,
                 dispatcher,
-            )? {
+            );
+            let flow = match executed {
+                Ok(flow) => flow,
+                Err(error) => {
+                    if let Some(catch_address) =
+                        self.handle_runtime_error(&error, instruction.line_number, task.id)?
+                    {
+                        address = catch_address;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            match flow {
                 Flow::Next => address += 1,
                 Flow::Jump(destination) => address = destination,
                 Flow::Stop => break,
@@ -686,13 +963,13 @@ impl Interpreter {
         self.interpreted_statement_count = self.interpreted_statement_count.saturating_add(1);
         match statement {
             Statement::Assign(target, expression) => {
-                let value = self.evaluate(expression, line, task)?;
-                self.assign(target, value, line, task)?;
+                let value = self.evaluate(expression, line, task, dispatcher)?;
+                self.assign(target, value, line, task, dispatcher)?;
                 Ok(Flow::Next)
             }
             Statement::Input(target) => {
                 let value = self.read_input(line, task, dispatcher)?;
-                self.assign(target, value, line, task)?;
+                self.assign(target, value, line, task, dispatcher)?;
                 Ok(Flow::Next)
             }
             Statement::Print(items) => {
@@ -711,17 +988,24 @@ impl Interpreter {
                 if colours.is_empty() || colours.len() > 2 {
                     return Err(program_error(line, "COLOUR expects one or two values"));
                 }
-                let foreground = self.evaluate(&colours[0], line, task)?.number(line)?;
+                let foreground = self
+                    .evaluate(&colours[0], line, task, dispatcher)?
+                    .number(line)?;
                 dispatcher.write_via_os_write_c(task, &[17, foreground.trunc() as u8])?;
                 if let Some(background) = colours.get(1) {
-                    let background = self.evaluate(background, line, task)?.number(line)?;
+                    let background = self
+                        .evaluate(background, line, task, dispatcher)?
+                        .number(line)?;
                     dispatcher
                         .write_via_os_write_c(task, &[17, (background.trunc() as u8) | 0x80])?;
                 }
                 Ok(Flow::Next)
             }
             Statement::PrintFormat(expression) => {
-                let format = self.evaluate(expression, line, task)?.number(line)?.trunc() as i64;
+                let format = self
+                    .evaluate(expression, line, task, dispatcher)?
+                    .number(line)?
+                    .trunc() as i64;
                 self.print_format = if format == 0 {
                     DEFAULT_PRINT_FORMAT
                 } else {
@@ -730,7 +1014,10 @@ impl Interpreter {
                 Ok(Flow::Next)
             }
             Statement::Mode(expression) => {
-                let mode = self.evaluate(expression, line, task)?.number(line)?.trunc();
+                let mode = self
+                    .evaluate(expression, line, task, dispatcher)?
+                    .number(line)?
+                    .trunc();
                 if mode >= f64::from(GUEST_MEMORY_BASE) {
                     dispatcher.set_mode_from_block(task, checked_guest_address(mode, line)?)?;
                 } else {
@@ -742,7 +1029,7 @@ impl Interpreter {
                 let mut bytes = Vec::new();
                 for argument in arguments {
                     let value = self
-                        .evaluate(&argument.value, line, task)?
+                        .evaluate(&argument.value, line, task, dispatcher)?
                         .number(line)?
                         .trunc() as i64;
                     match argument.format {
@@ -758,10 +1045,10 @@ impl Interpreter {
                 Ok(Flow::Next)
             }
             Statement::Line(x1, y1, x2, y2) => {
-                let x1 = self.evaluate(x1, line, task)?.number(line)?;
-                let y1 = self.evaluate(y1, line, task)?.number(line)?;
-                let x2 = self.evaluate(x2, line, task)?.number(line)?;
-                let y2 = self.evaluate(y2, line, task)?.number(line)?;
+                let x1 = self.evaluate(x1, line, task, dispatcher)?.number(line)?;
+                let y1 = self.evaluate(y1, line, task, dispatcher)?.number(line)?;
+                let x2 = self.evaluate(x2, line, task, dispatcher)?.number(line)?;
+                let y2 = self.evaluate(y2, line, task, dispatcher)?.number(line)?;
                 dispatcher.plot(
                     task,
                     4,
@@ -782,8 +1069,8 @@ impl Interpreter {
                 } else {
                     5
                 };
-                let x = self.evaluate(x, line, task)?.number(line)?;
-                let y = self.evaluate(y, line, task)?.number(line)?;
+                let x = self.evaluate(x, line, task, dispatcher)?.number(line)?;
+                let y = self.evaluate(y, line, task, dispatcher)?.number(line)?;
                 dispatcher.plot(
                     task,
                     plot_code,
@@ -793,9 +1080,12 @@ impl Interpreter {
                 Ok(Flow::Next)
             }
             Statement::Plot(code, x, y) => {
-                let code = self.evaluate(code, line, task)?.number(line)?.trunc() as u8;
-                let x = self.evaluate(x, line, task)?.number(line)?;
-                let y = self.evaluate(y, line, task)?.number(line)?;
+                let code = self
+                    .evaluate(code, line, task, dispatcher)?
+                    .number(line)?
+                    .trunc() as u8;
+                let x = self.evaluate(x, line, task, dispatcher)?.number(line)?;
+                let y = self.evaluate(y, line, task, dispatcher)?.number(line)?;
                 dispatcher.plot(
                     task,
                     code,
@@ -805,13 +1095,22 @@ impl Interpreter {
                 Ok(Flow::Next)
             }
             Statement::Gcol(action, colour) => {
-                let action = self.evaluate(action, line, task)?.number(line)?.trunc() as u8;
-                let colour = self.evaluate(colour, line, task)?.number(line)?.trunc() as u8;
+                let action = self
+                    .evaluate(action, line, task, dispatcher)?
+                    .number(line)?
+                    .trunc() as u8;
+                let colour = self
+                    .evaluate(colour, line, task, dispatcher)?
+                    .number(line)?
+                    .trunc() as u8;
                 dispatcher.write_via_os_write_c(task, &[18, action, colour])?;
                 Ok(Flow::Next)
             }
             Statement::If(condition, then_body, else_body) => {
-                let selected = if self.evaluate(condition, line, task)?.number(line)? != 0.0 {
+                let selected = if self
+                    .evaluate(condition, line, task, dispatcher)?
+                    .truthy(line)?
+                {
                     then_body
                 } else {
                     else_body
@@ -825,7 +1124,10 @@ impl Interpreter {
                 Ok(Flow::Next)
             }
             Statement::IfBlock(condition) => {
-                if self.evaluate(condition, line, task)?.number(line)? != 0.0 {
+                if self
+                    .evaluate(condition, line, task, dispatcher)?
+                    .truthy(line)?
+                {
                     Ok(Flow::Next)
                 } else {
                     let end = self
@@ -844,12 +1146,14 @@ impl Interpreter {
                     kind: ReturnKind::Subroutine,
                     address: address + 1,
                     saved_variables: Vec::new(),
+                    routine_name: None,
+                    local_readonly_scope: false,
                 });
                 Ok(Flow::Jump(destination))
             }
             Statement::Dim(declarations) => {
                 for declaration in declarations {
-                    self.dim(declaration, line, task)?;
+                    self.dim(declaration, line, task, dispatcher)?;
                 }
                 Ok(Flow::Next)
             }
@@ -859,8 +1163,8 @@ impl Interpreter {
                         return Err(program_error(line, "READ passed the end of DATA"));
                     };
                     self.data_cursor += 1;
-                    let value = self.evaluate(&expression, line, task)?;
-                    self.assign(target, value, line, task)?;
+                    let value = self.evaluate(&expression, line, task, dispatcher)?;
+                    self.assign(target, value, line, task, dispatcher)?;
                 }
                 Ok(Flow::Next)
             }
@@ -879,7 +1183,16 @@ impl Interpreter {
                 start,
                 end,
                 step,
-            } => self.start_for(variable, start, end, step.as_ref(), address, line, task),
+            } => self.start_for(
+                variable,
+                start,
+                end,
+                step.as_ref(),
+                address,
+                line,
+                task,
+                dispatcher,
+            ),
             Statement::Next(variable) => self.next_for(variable.as_deref(), address, line),
             Statement::Repeat => {
                 self.repeat_loops.push(address + 1);
@@ -889,7 +1202,10 @@ impl Interpreter {
                 let Some(repeat_address) = self.repeat_loops.last().copied() else {
                     return Err(program_error(line, "UNTIL has no matching REPEAT"));
                 };
-                if self.evaluate(condition, line, task)?.number(line)? != 0.0 {
+                if self
+                    .evaluate(condition, line, task, dispatcher)?
+                    .truthy(line)?
+                {
                     self.repeat_loops.pop();
                     Ok(Flow::Next)
                 } else {
@@ -899,7 +1215,7 @@ impl Interpreter {
             Statement::ProcedureCall(name, arguments) => {
                 #[cfg(feature = "experimental-jit")]
                 if name.eq_ignore_ascii_case("IT") {
-                    let values = self.evaluate_arguments(arguments, line, task)?;
+                    let values = self.evaluate_arguments(arguments, line, task, dispatcher)?;
                     if values.len() == 3 {
                         let real_c = values[0].number(line)?;
                         let imag_c = values[1].number(line)?;
@@ -917,7 +1233,8 @@ impl Interpreter {
                             return Ok(Flow::Next);
                         }
                     }
-                    return self.execute_procedure_call_values(name, values, address, line);
+                    return self
+                        .execute_procedure_call_values(name, values, task.id, address, line);
                 }
 
                 let Some(definition) = self.program.procedures.get(name).cloned() else {
@@ -926,8 +1243,74 @@ impl Interpreter {
                         format!("unknown procedure PROC {name}"),
                     ));
                 };
-                let values = self.evaluate_arguments(arguments, line, task)?;
-                self.enter_procedure(name, definition, values, address, line)
+                let values = self.evaluate_arguments(arguments, line, task, dispatcher)?;
+                self.enter_procedure(name, definition, values, task.id, address, line)
+            }
+            Statement::ImportedProcedureCall {
+                module,
+                name,
+                arguments,
+            } => {
+                let values = self.evaluate_arguments(arguments, line, task, dispatcher)?;
+                let symbol = name.to_ascii_uppercase();
+                let (provider_id, resolved_symbol, provider) =
+                    dispatcher.resolve_imported_basic64_symbol(&module, &symbol)?;
+                if resolved_symbol.starts_with("FN:") {
+                    return Err(program_error(
+                        line,
+                        format!("{}.{name} is a function, not a procedure", module),
+                    ));
+                }
+                provider.invoke_imported_symbol(
+                    provider_id,
+                    &resolved_symbol,
+                    values,
+                    false,
+                    task,
+                    dispatcher,
+                )?;
+                Ok(Flow::Next)
+            }
+            Statement::LocalReadOnly {
+                name,
+                value_type,
+                value,
+            } => {
+                if !self
+                    .returns
+                    .last()
+                    .is_some_and(|frame| matches!(frame.kind, ReturnKind::Procedure))
+                {
+                    return Err(program_error(
+                        line,
+                        "LET READONLY must execute inside a PROC",
+                    ));
+                }
+                let Some(scope) = self.local_readonly_scopes.last() else {
+                    return Err(program_error(line, "read-only local scope is missing"));
+                };
+                if scope.contains_key(name) {
+                    return Err(program_error(
+                        line,
+                        format!("read-only local {name} is declared more than once"),
+                    ));
+                }
+                let value = self.evaluate(value, line, task, dispatcher)?;
+                let value = normalize_system_arguments(
+                    std::slice::from_ref(value_type),
+                    vec![value],
+                    line,
+                    task.id,
+                )?
+                .into_iter()
+                .next()
+                .expect("one read-only local value");
+                let previous = self.variables.insert(name.clone(), value);
+                self.local_readonly_scopes
+                    .last_mut()
+                    .expect("read-only scope was checked above")
+                    .insert(name.clone(), previous);
+                Ok(Flow::Next)
             }
             Statement::DefineFunction(_, _) => Ok(Flow::Next),
             Statement::FunctionReturn(_) => Err(program_error(
@@ -947,8 +1330,9 @@ impl Interpreter {
                 for (register, argument) in arguments.iter().enumerate().take(10) {
                     if let Some(argument) = argument {
                         context.registers[register] =
-                            self.evaluate(argument, line, task)?.number(line)?.trunc() as i32
-                                as u32;
+                            self.evaluate(argument, line, task, dispatcher)?
+                                .number(line)?
+                                .trunc() as i32 as u32;
                     }
                 }
                 if swi_name == "OS_READC"
@@ -968,8 +1352,134 @@ impl Interpreter {
                 }
                 Ok(Flow::Next)
             }
+            Statement::PrimitiveCall {
+                name,
+                arguments,
+                results,
+            } => {
+                let signature = dispatcher.module_primitive_signature(&name)?;
+                let mut context = SwiContext::default();
+                for (register, argument) in arguments.iter().enumerate().take(10) {
+                    if let Some(argument) = argument {
+                        let value = self.evaluate(argument, line, task, dispatcher)?;
+                        context.registers[register] = value_to_primitive_register(
+                            &value,
+                            &signature.arguments[register],
+                            task.id,
+                            line,
+                        )?;
+                    }
+                }
+                dispatcher.call_module_primitive(&name, task, &mut context)?;
+                for (register, target) in results.iter().enumerate() {
+                    let value = if target == "CARRY%" {
+                        Value::Number(f64::from(u8::from(context.carry)))
+                    } else {
+                        match signature.results.get(register) {
+                            Some(crate::trellis::RegisterKind::OpaqueHandle { type_name }) => {
+                                Value::Handle {
+                                    type_name: type_name.to_ascii_uppercase(),
+                                    raw: context.registers[register],
+                                }
+                            }
+                            Some(crate::trellis::RegisterKind::LogicalAddress { .. }) => {
+                                Value::LogicalAddress {
+                                    owner_task: task.id,
+                                    raw: context.registers[register],
+                                }
+                            }
+                            _ => Value::Number(f64::from(context.registers[register])),
+                        }
+                    };
+                    self.set_variable(target, value, line)?;
+                }
+                Ok(Flow::Next)
+            }
+            Statement::Try => {
+                let region =
+                    self.try_regions.get(&address).cloned().ok_or_else(|| {
+                        program_error(line, "TRY has no matching CATCH and ENDTRY")
+                    })?;
+                self.try_frames.push(ActiveTry {
+                    catch_address: region.catch_address,
+                    end_address: region.end_address,
+                    error_name: region.error_name,
+                    error_type: region.error_type,
+                    return_depth: self.returns.len(),
+                    for_depth: self.for_loops.len(),
+                    repeat_depth: self.repeat_loops.len(),
+                });
+                Ok(Flow::Next)
+            }
+            Statement::Catch { .. } => {
+                if let Some(frame) = self.try_frames.last()
+                    && frame.catch_address == address
+                {
+                    let end_address = frame.end_address;
+                    self.try_frames.pop();
+                    return Ok(Flow::Jump(end_address + 1));
+                }
+                Err(program_error(line, "CATCH does not match an active TRY"))
+            }
+            Statement::EndTry => {
+                if self.completed_try_ends.remove(&address) {
+                    return Ok(Flow::Next);
+                }
+                if self
+                    .try_frames
+                    .last()
+                    .is_some_and(|frame| frame.end_address == address)
+                {
+                    self.try_frames.pop();
+                    Ok(Flow::Next)
+                } else {
+                    Err(program_error(line, "ENDTRY does not match an active TRY"))
+                }
+            }
+            Statement::Throw {
+                error_type,
+                code,
+                message,
+            } => {
+                let routine = self
+                    .returns
+                    .last()
+                    .and_then(|frame| frame.routine_name.as_deref())
+                    .ok_or_else(|| program_error(line, "THROW must occur inside a PROC or FN"))?;
+                if !self
+                    .program
+                    .throws_types
+                    .get(routine)
+                    .is_some_and(|declared| declared.eq_ignore_ascii_case(error_type))
+                {
+                    return Err(program_error(
+                        line,
+                        format!("{routine} must declare THROWS {error_type}"),
+                    ));
+                }
+                let code = self
+                    .evaluate(code, line, task, dispatcher)?
+                    .number(line)?
+                    .trunc();
+                if !(0.0..=f64::from(u32::MAX)).contains(&code) {
+                    return Err(program_error(
+                        line,
+                        "structured error code is outside UINT32 range",
+                    ));
+                }
+                let message = String::from_utf8_lossy(
+                    self.evaluate(message, line, task, dispatcher)?
+                        .string(line)?,
+                )
+                .into_owned();
+                Err(RuntimeError::Structured {
+                    type_name: error_type.to_ascii_uppercase(),
+                    code: code as u32,
+                    message,
+                })
+            }
             Statement::Call(expression) => {
-                let address = self.address_value(expression, line, task)?;
+                let address = self.address_value(expression, line, task, dispatcher)?;
                 let mut context = SwiContext::default();
                 for (register, name) in ["A%", "X%", "Y%"].into_iter().enumerate() {
                     context.registers[register] =
@@ -1007,6 +1517,102 @@ impl Interpreter {
         Ok(Flow::Jump(self.line_address(target, line)?))
     }
 
+    fn handle_runtime_error(
+        &mut self,
+        error: &RuntimeError,
+        line: u16,
+        task_id: u64,
+    ) -> Result<Option<usize>, RuntimeError> {
+        while let Some(frame) = self.try_frames.pop() {
+            let (actual_type, code, message) = match error {
+                RuntimeError::Structured {
+                    type_name,
+                    code,
+                    message,
+                } => {
+                    if !type_name.eq_ignore_ascii_case(&frame.error_type) {
+                        continue;
+                    }
+                    (type_name.clone(), *code, message.as_bytes().to_vec())
+                }
+                RuntimeError::InvalidSwi(number) => (
+                    frame.error_type.clone(),
+                    2,
+                    format!("unsupported SWI &{number:02X}").into_bytes(),
+                ),
+                RuntimeError::EndOfInput => (frame.error_type.clone(), 3, b"end of input".to_vec()),
+                RuntimeError::Memory(memory) => {
+                    (frame.error_type.clone(), 5, memory.to_string().into_bytes())
+                }
+                RuntimeError::Io(io) => (frame.error_type.clone(), 4, io.to_string().into_bytes()),
+                RuntimeError::Program(message) => {
+                    (frame.error_type.clone(), 1, message.as_bytes().to_vec())
+                }
+            };
+            let value = self.make_error_value(&actual_type, code, message, line, task_id)?;
+            // A caught error can leave nested procedures and loop frames
+            // behind. Restore their locals before resuming at CATCH so it has
+            // the same observable state as ordinary procedure unwinding.
+            while self.returns.len() > frame.return_depth {
+                if let Some(return_frame) = self.returns.pop() {
+                    if return_frame.local_readonly_scope {
+                        self.restore_local_readonly_scope();
+                    }
+                    self.restore_variables(return_frame.saved_variables);
+                }
+            }
+            self.for_loops.truncate(frame.for_depth);
+            self.repeat_loops.truncate(frame.repeat_depth);
+            self.set_variable(&frame.error_name, value, line)?;
+            self.completed_try_ends.insert(frame.end_address);
+            return Ok(Some(frame.catch_address + 1));
+        }
+        Ok(None)
+    }
+
+    fn make_error_value(
+        &self,
+        type_name: &str,
+        code: u32,
+        message: Vec<u8>,
+        line: u16,
+        task_id: u64,
+    ) -> Result<Value, RuntimeError> {
+        let Some(super::parser::SystemTypeDefinition::Error { fields: schema }) =
+            self.program.system_types.get(type_name)
+        else {
+            return Err(program_error(
+                line,
+                format!("{type_name} is not a structured error type"),
+            ));
+        };
+        let mut fields = HashMap::new();
+        let mut readonly_fields = std::collections::HashSet::new();
+        for field in schema {
+            let field_value = match field.name.as_str() {
+                "CODE" => Value::Number(f64::from(code)),
+                "MESSAGE" => Value::String(message.clone()),
+                _ => default_for_system_type(
+                    &field.value_type,
+                    &self.program.system_types,
+                    line,
+                    task_id,
+                )?,
+            };
+            if field.read_only {
+                readonly_fields.insert(field.name.clone());
+            }
+            fields.insert(field.name.clone(), field_value);
+        }
+        Ok(Value::Error {
+            type_name: type_name.to_owned(),
+            code,
+            message,
+            fields,
+            readonly_fields,
+        })
+    }
+
     fn line_address(&self, target: u16, line: u16) -> Result<usize, RuntimeError> {
         self.program
             .line_entries
@@ -1020,6 +1626,7 @@ impl Interpreter {
         &mut self,
         name: &str,
         values: Vec<Value>,
+        task_id: u64,
         address: usize,
         line: u16,
     ) -> Result<Flow, RuntimeError> {
@@ -1029,7 +1636,7 @@ impl Interpreter {
                 format!("unknown procedure PROC {name}"),
             ));
         };
-        self.enter_procedure(name, definition, values, address, line)
+        self.enter_procedure(name, definition, values, task_id, address, line)
     }
 
     fn enter_procedure(
@@ -1037,6 +1644,7 @@ impl Interpreter {
         name: &str,
         definition: super::parser::Definition,
         values: Vec<Value>,
+        task_id: u64,
         address: usize,
         line: u16,
     ) -> Result<Flow, RuntimeError> {
@@ -1046,11 +1654,19 @@ impl Interpreter {
                 format!("PROC {name} argument count mismatch"),
             ));
         }
+        let values = if let Some(types) = self.program.typed_parameters.get(name) {
+            normalize_system_arguments(types, values, line, task_id)?
+        } else {
+            values
+        };
         let saved_variables = self.bind_parameters(&definition.parameters, values, line)?;
+        self.local_readonly_scopes.push(HashMap::new());
         self.returns.push(ReturnFrame {
             kind: ReturnKind::Procedure,
             address: address + 1,
             saved_variables,
+            routine_name: Some(name.to_ascii_uppercase()),
+            local_readonly_scope: true,
         });
         Ok(Flow::Jump(definition.entry))
     }
@@ -1068,19 +1684,29 @@ impl Interpreter {
             return Err(program_error(line, "mismatched RETURN and ENDPROC"));
         }
         self.returns.pop();
+        if frame.local_readonly_scope {
+            self.restore_local_readonly_scope();
+        }
         self.restore_variables(frame.saved_variables);
         Ok(Flow::Jump(frame.address))
+    }
+
+    fn restore_local_readonly_scope(&mut self) {
+        if let Some(scope) = self.local_readonly_scopes.pop() {
+            self.restore_variables(scope.into_iter().collect());
+        }
     }
 
     fn evaluate_arguments(
         &mut self,
         arguments: &[Expr],
         line: u16,
-        task: &Task,
+        task: &mut Task,
+        dispatcher: &mut SwiDispatcher,
     ) -> Result<Vec<Value>, RuntimeError> {
         arguments
             .iter()
-            .map(|argument| self.evaluate(argument, line, task))
+            .map(|argument| self.evaluate(argument, line, task, dispatcher))
             .collect()
     }
 
@@ -1119,16 +1745,64 @@ impl Interpreter {
         }
     }
 
-    fn function_expression(
+    fn function_body(
         &self,
         definition: &super::parser::Definition,
         name: &str,
         line: u16,
-    ) -> Result<Expr, RuntimeError> {
+    ) -> Result<(Vec<(String, super::parser::SystemType, Expr)>, Expr), RuntimeError> {
+        let mut local_readonly = Vec::new();
         for instruction in self.program.instructions.iter().skip(definition.entry) {
             match &instruction.statement {
-                Statement::FunctionReturn(expression) => return Ok(expression.clone()),
+                Statement::LocalReadOnly {
+                    name,
+                    value_type,
+                    value,
+                } if self.program.options.mode == crate::configure::BasicLanguageMode::Basic64 => {
+                    local_readonly.push((name.clone(), value_type.clone(), value.clone()));
+                }
+                Statement::NoOp => {}
+                Statement::Assign(target, _) => {
+                    let target_name = match target {
+                        LValue::Variable(name)
+                        | LValue::ArrayElement(name, _)
+                        | LValue::StringSlice(name, _, _)
+                        | LValue::RecordField(name, _) => Some(name.as_str()),
+                        LValue::RecordPath(path) => path.first().map(String::as_str),
+                        LValue::Memory(_, _)
+                        | LValue::MemoryByteAt(_, _)
+                        | LValue::MemoryOffset(_, _, _)
+                        | LValue::MemoryString(_) => None,
+                    };
+                    if let Some((local_name, _, _)) = local_readonly.iter().find(|(name, _, _)| {
+                        target_name.is_some_and(|target| target.eq_ignore_ascii_case(name))
+                    }) {
+                        return Err(program_error(
+                            instruction.line_number,
+                            format!("{local_name} is a read-only local binding"),
+                        ));
+                    }
+                    if self.program.options.mode == crate::configure::BasicLanguageMode::Basic64 {
+                        return Err(program_error(
+                            instruction.line_number,
+                            format!(
+                                "FN {name} supports only LET READONLY declarations and an expression result"
+                            ),
+                        ));
+                    }
+                }
+                Statement::FunctionReturn(expression) => {
+                    return Ok((local_readonly, expression.clone()));
+                }
                 Statement::DefineFunction(_, _) | Statement::DefineProcedure(_, _) => break,
+                _ if self.program.options.mode == crate::configure::BasicLanguageMode::Basic64 => {
+                    return Err(program_error(
+                        instruction.line_number,
+                        format!(
+                            "FN {name} supports only LET READONLY declarations and an expression result"
+                        ),
+                    ));
+                }
                 _ => {}
             }
         }
@@ -1147,14 +1821,43 @@ impl Interpreter {
         address: usize,
         line: u16,
         task: &mut Task,
+        dispatcher: &mut SwiDispatcher,
     ) -> Result<Flow, RuntimeError> {
-        let start_value = self.evaluate(start, line, task)?.number(line)?;
-        let end_value = self.evaluate(end, line, task)?.number(line)?;
+        let start_value = self.evaluate(start, line, task, dispatcher)?;
+        let end_value = self.evaluate(end, line, task, dispatcher)?;
         let step_value = match step {
-            Some(expression) => self.evaluate(expression, line, task)?.number(line)?,
-            None => 1.0,
+            Some(expression) => self.evaluate(expression, line, task, dispatcher)?,
+            None if exact_integer(&start_value).is_some()
+                && exact_integer(&end_value).is_some() =>
+            {
+                Value::Integer(1)
+            }
+            None => Value::Number(1.0),
         };
-        if step_value == 0.0 {
+        let exact_start_end = exact_integer_pair(&start_value, &end_value, line)?;
+        let exact_start_step = exact_integer_pair(&start_value, &step_value, line)?;
+        let exact_end_step = exact_integer_pair(&end_value, &step_value, line)?;
+        let exact_loop = if let (
+            Some((start_number, end_number, start_end_kind)),
+            Some((_, step_number, start_step_kind)),
+            Some((_, _, end_step_kind)),
+        ) = (exact_start_end, exact_start_step, exact_end_step)
+        {
+            if start_end_kind != start_step_kind || start_end_kind != end_step_kind {
+                return Err(program_error(
+                    line,
+                    "FOR bounds and STEP use incompatible 64-bit integer types",
+                ));
+            }
+            Some((start_number, end_number, step_number))
+        } else {
+            None
+        };
+        if let Some((_, _, step_number)) = exact_loop {
+            if step_number == 0 {
+                return Err(program_error(line, "FOR STEP cannot be zero"));
+            }
+        } else if step_value.number(line)? == 0.0 {
             return Err(program_error(line, "FOR STEP cannot be zero"));
         }
         let next_address = self
@@ -1162,12 +1865,19 @@ impl Interpreter {
             .get(&address)
             .copied()
             .ok_or_else(|| program_error(line, "FOR has no matching NEXT"))?;
-        self.set_variable(variable, Value::Number(start_value), line)?;
+        self.set_variable(variable, start_value.clone(), line)?;
 
-        let enters_loop = if step_value > 0.0 {
-            start_value <= end_value
+        let enters_loop = if let Some((start, end, step)) = exact_loop {
+            if step > 0 { start <= end } else { start >= end }
         } else {
-            start_value >= end_value
+            let start = start_value.number(line)?;
+            let end = end_value.number(line)?;
+            let step = step_value.number(line)?;
+            if step > 0.0 {
+                start <= end
+            } else {
+                start >= end
+            }
         };
         if !enters_loop {
             return Ok(Flow::Jump(next_address + 1));
@@ -1175,8 +1885,16 @@ impl Interpreter {
 
         self.for_loops.push(ForFrame {
             variable: variable.to_owned(),
-            limit: end_value,
-            step: step_value,
+            limit: if exact_loop.is_some() {
+                end_value
+            } else {
+                Value::Number(end_value.number(line)?)
+            },
+            step: if exact_loop.is_some() {
+                step_value
+            } else {
+                Value::Number(step_value.number(line)?)
+            },
             body_address: address + 1,
             next_address,
         });
@@ -1200,17 +1918,42 @@ impl Interpreter {
         }
 
         let variable = frame.variable.clone();
-        let step = frame.step;
-        let limit = frame.limit;
+        let step = frame.step.clone();
+        let limit = frame.limit.clone();
         let body_address = frame.body_address;
-        let current = self.get_variable(&variable).number(line)?;
-        let next_value = current + step;
-        self.set_variable(&variable, Value::Number(next_value), line)?;
-        let continues = if step > 0.0 {
-            next_value <= limit
+        let current = self.get_variable(&variable);
+        let exact = exact_integer_pair(&current, &step, line)?;
+        let (next_value, continues) = if let Some((current, step, kind)) = exact {
+            let next = current
+                .checked_add(step)
+                .ok_or_else(|| program_error(line, "FOR counter arithmetic overflowed"))?;
+            let value = exact_integer_result(kind, next, line)?;
+            let (_, limit, _) = exact_integer_pair(&value, &limit, line)?
+                .ok_or_else(|| program_error(line, "FOR counter changed numeric type"))?;
+            let step_is_positive = step > 0;
+            (
+                value,
+                if step_is_positive {
+                    next <= limit
+                } else {
+                    next >= limit
+                },
+            )
         } else {
-            next_value >= limit
+            let current = current.number(line)?;
+            let step = step.number(line)?;
+            let limit = limit.number(line)?;
+            let next = current + step;
+            (
+                Value::Number(next),
+                if step > 0.0 {
+                    next <= limit
+                } else {
+                    next >= limit
+                },
+            )
         };
+        self.set_variable(&variable, next_value, line)?;
         if continues {
             Ok(Flow::Jump(body_address))
         } else {
@@ -1224,6 +1967,7 @@ impl Interpreter {
         declaration: &DimDeclaration,
         line: u16,
         task: &mut Task,
+        dispatcher: &mut SwiDispatcher,
     ) -> Result<(), RuntimeError> {
         if declaration.dimensions.is_empty() {
             self.variables
@@ -1232,7 +1976,9 @@ impl Interpreter {
         }
         let mut length = 1_usize;
         for dimension in &declaration.dimensions {
-            let upper_bound = self.evaluate(dimension, line, task)?.number(line)?;
+            let upper_bound = self
+                .evaluate(dimension, line, task, dispatcher)?
+                .number(line)?;
             if upper_bound < 0.0 || upper_bound > 1_000_000.0 {
                 return Err(program_error(
                     line,
@@ -1283,18 +2029,27 @@ impl Interpreter {
         &mut self,
         expression: &Expr,
         line: u16,
-        task: &Task,
+        task: &mut Task,
+        dispatcher: &mut SwiDispatcher,
     ) -> Result<Value, RuntimeError> {
         self.interpreted_expression_count = self.interpreted_expression_count.saturating_add(1);
         match expression {
             Expr::Number(value) => Ok(Value::Number(*value)),
+            Expr::Integer(value)
+                if self.program.options.mode == crate::configure::BasicLanguageMode::Basic64 =>
+            {
+                Ok(Value::Integer(*value))
+            }
+            // Classic and Hybrid retain the historic floating BASIC number
+            // model. Exact integral literals are a BASIC64-only facility.
+            Expr::Integer(value) => Ok(Value::Number(*value as f64)),
             Expr::String(value) => Ok(Value::String(value.clone())),
             Expr::Variable(name) if name == "TIME" => {
                 Ok(Value::Number(f64::from(self.clock.read() as u32 as i32)))
             }
             Expr::Variable(name) => Ok(self.get_variable(name)),
             Expr::ArrayElement(name, index) => {
-                let index = self.evaluate(index, line, task)?.number(line)?;
+                let index = self.evaluate(index, line, task, dispatcher)?.number(line)?;
                 let index = array_index(index, line)?;
                 let Some(array) = self.arrays.get(name) else {
                     return Err(program_error(
@@ -1307,40 +2062,228 @@ impl Interpreter {
                 })
             }
             Expr::Unary(operator, operand) => {
-                let operand = self.evaluate(operand, line, task)?.number(line)?;
+                let operand = self.evaluate(operand, line, task, dispatcher)?;
+                if let Some((value, kind)) = exact_integer(&operand) {
+                    let result = match operator {
+                        UnaryOp::Plus => value,
+                        UnaryOp::Minus => value
+                            .checked_neg()
+                            .ok_or_else(|| program_error(line, "integer negation overflowed"))?,
+                        UnaryOp::Not => match kind {
+                            ExactIntegerKind::Unsigned64 => i128::from(!(value as u64)),
+                            ExactIntegerKind::Signed64 => i128::from(!(value as i64)),
+                            ExactIntegerKind::Literal => !value,
+                        },
+                    };
+                    return exact_integer_result(kind, result, line);
+                }
+                let operand = operand.number(line)?;
                 let value = match operator {
                     UnaryOp::Plus => operand,
                     UnaryOp::Minus => -operand,
-                    UnaryOp::Not => f64::from(!(operand as i32)),
+                    UnaryOp::Not => f64::from(!self.basic_bitwise_i32(operand)),
                 };
                 Ok(Value::Number(value))
             }
             Expr::Binary(left, operator, right) => {
-                let left = self.evaluate(left, line, task)?;
-                let right = self.evaluate(right, line, task)?;
-                self.evaluate_binary(left, *operator, right, line)
+                let left = self.evaluate(left, line, task, dispatcher)?;
+                let right = self.evaluate(right, line, task, dispatcher)?;
+                self.evaluate_binary(left, *operator, right, line, task.id)
             }
-            Expr::Builtin(token, arguments) => self.evaluate_builtin(*token, arguments, line, task),
+            Expr::Builtin(token, arguments) => {
+                self.evaluate_builtin(*token, arguments, line, task, dispatcher)
+            }
             Expr::UserFunction(name, arguments) => {
+                let values = self.evaluate_arguments(arguments, line, task, dispatcher)?;
                 let Some(definition) = self.program.functions.get(name).cloned() else {
-                    return Err(program_error(line, format!("unknown function FN {name}")));
+                    if !values.is_empty() {
+                        return Err(program_error(line, format!("unknown function FN {name}")));
+                    }
+                    return match self.program.system_types.get(name) {
+                        Some(super::parser::SystemTypeDefinition::Record { .. }) => {
+                            default_for_system_type(
+                                &super::parser::SystemType::Record(name.clone()),
+                                &self.program.system_types,
+                                line,
+                                task.id,
+                            )
+                        }
+                        Some(
+                            super::parser::SystemTypeDefinition::Enum { .. }
+                            | super::parser::SystemTypeDefinition::Flags { .. },
+                        ) => Err(program_error(line, "enum and flag values use Type.Member")),
+                        Some(super::parser::SystemTypeDefinition::Handle) => Err(program_error(
+                            line,
+                            "opaque handles can only come from a typed capability result",
+                        )),
+                        Some(super::parser::SystemTypeDefinition::Error { .. }) => {
+                            Err(program_error(
+                                line,
+                                "structured errors can only be produced by THROW or a failing service",
+                            ))
+                        }
+                        None => Err(program_error(line, format!("unknown function FN {name}"))),
+                    };
                 };
-                let values = self.evaluate_arguments(arguments, line, task)?;
                 if values.len() != definition.parameters.len() {
                     return Err(program_error(
                         line,
                         format!("FN {name} argument count mismatch"),
                     ));
                 }
-                let expression = self.function_expression(&definition, name, line)?;
+                let values = if let Some(types) = self.program.typed_parameters.get(name) {
+                    normalize_system_arguments(types, values, line, task.id)?
+                } else {
+                    values
+                };
+                let (local_readonly, expression) = self.function_body(&definition, name, line)?;
                 let saved = self.bind_parameters(&definition.parameters, values, line)?;
-                let result = self.evaluate(&expression, line, task);
+                self.local_readonly_scopes.push(HashMap::new());
+                let result = (|| {
+                    for (local_name, local_type, initializer) in local_readonly {
+                        let value = self.evaluate(&initializer, line, task, dispatcher)?;
+                        let value = normalize_system_arguments(
+                            std::slice::from_ref(&local_type),
+                            vec![value],
+                            line,
+                            task.id,
+                        )?
+                        .into_iter()
+                        .next()
+                        .expect("one read-only local value");
+                        let previous = self.variables.insert(local_name.clone(), value);
+                        self.local_readonly_scopes
+                            .last_mut()
+                            .expect("function read-only scope was just created")
+                            .insert(local_name, previous);
+                    }
+                    self.evaluate(&expression, line, task, dispatcher)
+                })();
+                self.restore_local_readonly_scope();
                 self.restore_variables(saved.clone());
-                result
+                let value = match result {
+                    Ok(value) => value,
+                    Err(RuntimeError::Structured {
+                        type_name,
+                        code,
+                        message,
+                    }) => {
+                        let Some(expected) = self.program.throws_types.get(name) else {
+                            return Err(program_error(
+                                line,
+                                format!(
+                                    "FN {name} raised {type_name} without a THROWS declaration"
+                                ),
+                            ));
+                        };
+                        if !expected.eq_ignore_ascii_case(&type_name) {
+                            return Err(program_error(
+                                line,
+                                format!(
+                                    "FN {name} declared THROWS {expected} but raised {type_name}"
+                                ),
+                            ));
+                        }
+                        return Err(RuntimeError::Structured {
+                            type_name,
+                            code,
+                            message,
+                        });
+                    }
+                    Err(error) => {
+                        if let Some(expected) = self.program.throws_types.get(name) {
+                            let code = match &error {
+                                RuntimeError::EndOfInput => 3,
+                                RuntimeError::InvalidSwi(_) => 2,
+                                RuntimeError::Memory(_) => 5,
+                                RuntimeError::Io(_) => 4,
+                                RuntimeError::Program(_) => 1,
+                                RuntimeError::Structured { .. } => unreachable!(),
+                            };
+                            return Err(RuntimeError::Structured {
+                                type_name: expected.clone(),
+                                code,
+                                message: error.to_string(),
+                            });
+                        }
+                        return Err(error);
+                    }
+                };
+                if let Some(result_type) = self.program.typed_results.get(name) {
+                    Ok(normalize_system_arguments(
+                        std::slice::from_ref(result_type),
+                        vec![value],
+                        line,
+                        task.id,
+                    )?
+                    .pop()
+                    .expect("one typed function result"))
+                } else {
+                    Ok(value)
+                }
+            }
+            Expr::ImportedFunction {
+                module,
+                name,
+                arguments,
+            } => {
+                let values = self.evaluate_arguments(arguments, line, task, dispatcher)?;
+                let symbol = format!("FN:{}", name.to_ascii_uppercase());
+                let (provider_id, resolved_symbol, provider) =
+                    dispatcher.resolve_imported_basic64_symbol(&module, &symbol)?;
+                if !resolved_symbol.starts_with("FN:") {
+                    return Err(program_error(
+                        line,
+                        format!("{}.{name} is a procedure, not a function", module),
+                    ));
+                }
+                provider
+                    .invoke_imported_symbol(
+                        provider_id,
+                        &resolved_symbol,
+                        values,
+                        true,
+                        task,
+                        dispatcher,
+                    )?
+                    .ok_or_else(|| program_error(line, "imported function returned no result"))
             }
             Expr::MemoryRead(width, address) => {
-                let address = self.evaluate(address, line, task)?.number(line)?;
+                let address = self.address_value(address, line, task, dispatcher)?;
                 self.read_memory(*width, address, line, task)
+            }
+            Expr::Member(base, field) => {
+                if let Expr::Variable(type_name) = base.as_ref() {
+                    match self.program.system_types.get(type_name) {
+                        Some(super::parser::SystemTypeDefinition::Enum { members, .. }) => {
+                            let value = members.get(field).ok_or_else(|| {
+                                program_error(
+                                    line,
+                                    format!("unknown enum member {type_name}.{field}"),
+                                )
+                            })?;
+                            return Ok(Value::Enum {
+                                type_name: type_name.clone(),
+                                value: *value,
+                            });
+                        }
+                        Some(super::parser::SystemTypeDefinition::Flags { members, .. }) => {
+                            let value = members.get(field).ok_or_else(|| {
+                                program_error(
+                                    line,
+                                    format!("unknown flag member {type_name}.{field}"),
+                                )
+                            })?;
+                            return Ok(Value::Flags {
+                                type_name: type_name.clone(),
+                                value: *value as u64,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+                self.evaluate(base, line, task, dispatcher)?
+                    .record_field(field, line)
             }
         }
     }
@@ -1360,7 +2303,185 @@ impl Interpreter {
         operator: BinaryOp,
         right: Value,
         line: u16,
+        task_id: u64,
     ) -> Result<Value, RuntimeError> {
+        if let Some((left_exact, right_exact, kind)) = exact_integer_pair(&left, &right, line)? {
+            if matches!(
+                operator,
+                BinaryOp::Equal
+                    | BinaryOp::NotEqual
+                    | BinaryOp::Less
+                    | BinaryOp::LessEqual
+                    | BinaryOp::Greater
+                    | BinaryOp::GreaterEqual
+            ) {
+                let result = match operator {
+                    BinaryOp::Equal => left_exact == right_exact,
+                    BinaryOp::NotEqual => left_exact != right_exact,
+                    BinaryOp::Less => left_exact < right_exact,
+                    BinaryOp::LessEqual => left_exact <= right_exact,
+                    BinaryOp::Greater => left_exact > right_exact,
+                    BinaryOp::GreaterEqual => left_exact >= right_exact,
+                    _ => unreachable!(),
+                };
+                return Ok(Value::Number(if result { 1.0 } else { 0.0 }));
+            }
+            let result = match operator {
+                BinaryOp::Add => left_exact.checked_add(right_exact),
+                BinaryOp::Subtract => left_exact.checked_sub(right_exact),
+                BinaryOp::Multiply => left_exact.checked_mul(right_exact),
+                BinaryOp::IntegerDivide => {
+                    if right_exact == 0 {
+                        return Err(program_error(line, "integer division by zero"));
+                    }
+                    left_exact.checked_div(right_exact)
+                }
+                BinaryOp::Modulo => {
+                    if right_exact == 0 {
+                        return Err(program_error(line, "MOD by zero"));
+                    }
+                    left_exact.checked_rem(right_exact)
+                }
+                BinaryOp::And => Some(match kind {
+                    ExactIntegerKind::Unsigned64 => {
+                        i128::from((left_exact as u64) & (right_exact as u64))
+                    }
+                    ExactIntegerKind::Signed64 => {
+                        i128::from((left_exact as i64) & (right_exact as i64))
+                    }
+                    ExactIntegerKind::Literal => left_exact & right_exact,
+                }),
+                BinaryOp::Or => Some(match kind {
+                    ExactIntegerKind::Unsigned64 => {
+                        i128::from((left_exact as u64) | (right_exact as u64))
+                    }
+                    ExactIntegerKind::Signed64 => {
+                        i128::from((left_exact as i64) | (right_exact as i64))
+                    }
+                    ExactIntegerKind::Literal => left_exact | right_exact,
+                }),
+                BinaryOp::ShiftLeft => {
+                    let shift = u32::try_from(right_exact)
+                        .map_err(|_| program_error(line, "shift count must be nonnegative"))?;
+                    Some(match kind {
+                        ExactIntegerKind::Unsigned64 => {
+                            i128::from((left_exact as u64).wrapping_shl(shift & 63))
+                        }
+                        ExactIntegerKind::Signed64 => {
+                            i128::from((left_exact as i64).wrapping_shl(shift & 63))
+                        }
+                        ExactIntegerKind::Literal => left_exact.wrapping_shl(shift),
+                    })
+                }
+                BinaryOp::Divide | BinaryOp::Power => None,
+                BinaryOp::Equal
+                | BinaryOp::NotEqual
+                | BinaryOp::Less
+                | BinaryOp::LessEqual
+                | BinaryOp::Greater
+                | BinaryOp::GreaterEqual => unreachable!(),
+            };
+            if let Some(result) = result {
+                return exact_integer_result(kind, result, line);
+            }
+            if kind != ExactIntegerKind::Literal
+                && matches!(operator, BinaryOp::Divide | BinaryOp::Power)
+            {
+                return Err(program_error(
+                    line,
+                    "floating arithmetic on a 64-bit integer requires an explicit conversion",
+                ));
+            }
+        } else if matches!(
+            (&left, &right),
+            (Value::Int64(_) | Value::UInt64(_), Value::Number(_))
+                | (Value::Number(_), Value::Int64(_) | Value::UInt64(_))
+        ) {
+            return Err(program_error(
+                line,
+                "mixing 64-bit integers with floating values requires an explicit conversion",
+            ));
+        }
+        if matches!(operator, BinaryOp::Or | BinaryOp::And)
+            && let (
+                Value::Flags {
+                    type_name: left_type,
+                    value: left_value,
+                },
+                Value::Flags {
+                    type_name: right_type,
+                    value: right_value,
+                },
+            ) = (&left, &right)
+        {
+            if left_type != right_type {
+                return Err(program_error(
+                    line,
+                    "bitwise flag operations require values of the same FLAGS type",
+                ));
+            }
+            return Ok(Value::Flags {
+                type_name: left_type.clone(),
+                value: if operator == BinaryOp::Or {
+                    left_value | right_value
+                } else {
+                    left_value & right_value
+                },
+            });
+        }
+        if let Value::LogicalAddress { owner_task, raw } = &left
+            && matches!(operator, BinaryOp::Add | BinaryOp::Subtract)
+            && let Some(offset) = address_offset_value(&right, line)?
+        {
+            if *owner_task != task_id {
+                return Err(program_error(
+                    line,
+                    "logical address belongs to a different caller task",
+                ));
+            }
+            let signed_offset = if operator == BinaryOp::Add {
+                offset
+            } else {
+                offset
+                    .checked_neg()
+                    .ok_or_else(|| program_error(line, "logical address arithmetic overflowed"))?
+            };
+            let next = i64::from(*raw)
+                .checked_add(signed_offset)
+                .filter(|value| (0..=i64::from(u32::MAX)).contains(value))
+                .ok_or_else(|| program_error(line, "logical address arithmetic overflowed"))?;
+            return Ok(Value::LogicalAddress {
+                owner_task: *owner_task,
+                raw: next as u32,
+            });
+        }
+        if let (
+            Value::LogicalAddress {
+                owner_task: left_owner,
+                raw: left_raw,
+            },
+            BinaryOp::Subtract,
+            Value::LogicalAddress {
+                owner_task: right_owner,
+                raw: right_raw,
+            },
+        ) = (&left, operator, &right)
+        {
+            if left_owner != right_owner {
+                return Err(program_error(
+                    line,
+                    "logical addresses belong to different caller tasks",
+                ));
+            }
+            if *left_owner != task_id {
+                return Err(program_error(
+                    line,
+                    "logical address belongs to a different caller task",
+                ));
+            }
+            return Ok(Value::Number(f64::from(*left_raw) - f64::from(*right_raw)));
+        }
+        let (left, right) = coerce_exact_literal_with_float(left, right, line)?;
         if operator == BinaryOp::Add {
             if let (Value::String(left), Value::String(right)) = (&left, &right) {
                 let mut joined = left.clone();
@@ -1382,6 +2503,36 @@ impl Interpreter {
                 (Value::Number(left), Value::Number(right)) => {
                     left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
                 }
+                (
+                    Value::LogicalAddress {
+                        owner_task: left_owner,
+                        raw: left,
+                    },
+                    Value::LogicalAddress {
+                        owner_task: right_owner,
+                        raw: right,
+                    },
+                ) if left_owner == right_owner && *left_owner == task_id => left.cmp(right),
+                (
+                    Value::Enum {
+                        type_name: left_type,
+                        value: left,
+                    },
+                    Value::Enum {
+                        type_name: right_type,
+                        value: right,
+                    },
+                ) if left_type == right_type => left.cmp(right),
+                (
+                    Value::Flags {
+                        type_name: left_type,
+                        value: left,
+                    },
+                    Value::Flags {
+                        type_name: right_type,
+                        value: right,
+                    },
+                ) if left_type == right_type => left.cmp(right),
                 _ => return Err(program_error(line, "cannot compare a number with a string")),
             };
             let result = match operator {
@@ -1431,9 +2582,14 @@ impl Interpreter {
                 )
             }
             BinaryOp::Power => left.powf(right),
-            BinaryOp::And => f64::from((left as i32) & (right as i32)),
-            BinaryOp::Or => f64::from((left as i32) | (right as i32)),
-            BinaryOp::ShiftLeft => f64::from((left as i32).wrapping_shl((right as u32) & 31)),
+            BinaryOp::And => {
+                f64::from(self.basic_bitwise_i32(left) & self.basic_bitwise_i32(right))
+            }
+            BinaryOp::Or => f64::from(self.basic_bitwise_i32(left) | self.basic_bitwise_i32(right)),
+            BinaryOp::ShiftLeft => f64::from(
+                self.basic_bitwise_i32(left)
+                    .wrapping_shl((right as u32) & 31),
+            ),
             BinaryOp::Equal
             | BinaryOp::NotEqual
             | BinaryOp::Less
@@ -1444,16 +2600,28 @@ impl Interpreter {
         Ok(Value::Number(value))
     }
 
+    fn basic_bitwise_i32(&self, value: f64) -> i32 {
+        if self.program.options.mode == crate::configure::BasicLanguageMode::Basic64
+            && (0.0..=f64::from(u32::MAX)).contains(&value)
+            && value.fract() == 0.0
+        {
+            value as u32 as i32
+        } else {
+            value as i32
+        }
+    }
+
     fn evaluate_builtin(
         &mut self,
         token: u8,
         arguments: &[Expr],
         line: u16,
-        task: &Task,
+        task: &mut Task,
+        dispatcher: &mut SwiDispatcher,
     ) -> Result<Value, RuntimeError> {
         let mut values = Vec::with_capacity(arguments.len());
         for argument in arguments {
-            values.push(self.evaluate(argument, line, task)?);
+            values.push(self.evaluate(argument, line, task, dispatcher)?);
         }
         let one_number = || -> Result<f64, RuntimeError> {
             if values.len() != 1 {
@@ -1478,10 +2646,34 @@ impl Interpreter {
                         .map_or(-1.0, f64::from),
                 ))
             }
-            0x94 => Ok(Value::Number(one_number()?.abs())),
+            0x94 => {
+                if values.len() != 1 {
+                    return Err(program_error(line, "ABS expects one argument"));
+                }
+                match &values[0] {
+                    Value::Integer(value) => value
+                        .checked_abs()
+                        .map(Value::Integer)
+                        .ok_or_else(|| program_error(line, "ABS integer overflowed")),
+                    Value::Int64(value) => value
+                        .checked_abs()
+                        .map(Value::Int64)
+                        .ok_or_else(|| program_error(line, "ABS INT64 overflowed")),
+                    Value::UInt64(_) => Ok(values[0].clone()),
+                    value => Ok(Value::Number(value.number(line)?.abs())),
+                }
+            }
             0x9B => Ok(Value::Number(one_number()?.cos())),
             0xB5 => Ok(Value::Number(one_number()?.sin())),
-            0xA8 => Ok(Value::Number(one_number()?.floor())),
+            0xA8 => {
+                if values.len() != 1 {
+                    return Err(program_error(line, "INT expects one argument"));
+                }
+                match &values[0] {
+                    Value::Integer(_) | Value::Int64(_) | Value::UInt64(_) => Ok(values[0].clone()),
+                    value => Ok(Value::Number(value.number(line)?.floor())),
+                }
+            }
             0xA9 => {
                 if values.len() != 1 {
                     return Err(program_error(line, "LEN expects one argument"));
@@ -1592,7 +2784,12 @@ impl Interpreter {
                     text[text.len().saturating_sub(count)..].to_vec(),
                 ))
             }
-            0xC3 => Ok(Value::String(format_number(one_number()?).into_bytes())),
+            0xC3 => {
+                if values.len() != 1 {
+                    return Err(program_error(line, "STR$ expects one argument"));
+                }
+                Ok(Value::String(values[0].number_string(line)?))
+            }
             0xC4 => {
                 require_argument_count(&values, 2, line, "STRING$")?;
                 let count = bounded_string_length(values[0].number(line)?, line)?;
@@ -1620,6 +2817,15 @@ impl Interpreter {
     }
 
     fn set_variable(&mut self, name: &str, value: Value, line: u16) -> Result<(), RuntimeError> {
+        self.ensure_binding_writable(name, line)?;
+        let value = if let Some(kind) = self.program.module_state_types.get(name) {
+            normalize_system_arguments(std::slice::from_ref(kind), vec![value], line, 0)?
+                .into_iter()
+                .next()
+                .expect("one module-state value")
+        } else {
+            value
+        };
         if name == "TIME" {
             self.clock
                 .set(value.number(line)?.trunc() as i32 as u32 as u64);
@@ -1628,22 +2834,111 @@ impl Interpreter {
         let value = if name.ends_with('$') {
             match value {
                 Value::String(_) => value,
-                Value::Number(_) => {
+                _ => {
                     return Err(program_error(
                         line,
                         format!("{name} requires a string value"),
                     ));
                 }
             }
-        } else {
-            let number = value.number(line)?;
-            Value::Number(if name.ends_with('%') {
-                f64::from(number.trunc() as i32)
+        } else if name.ends_with('%') {
+            // A register with an opaque-handle contract is represented in the
+            // same BASIC register variable (R0%), but remains nominally typed.
+            // Preserve that value only when the destination already carries
+            // the same handle type; ordinary numeric variables cannot absorb
+            // a handle or record value.
+            if let Some(Value::Handle {
+                type_name: expected,
+                ..
+            }) = self.variables.get(name)
+            {
+                match value {
+                    Value::Handle { type_name, raw }
+                        if type_name.eq_ignore_ascii_case(expected) =>
+                    {
+                        Value::Handle { type_name, raw }
+                    }
+                    _ => {
+                        return Err(program_error(
+                            line,
+                            format!("{name} requires opaque handle {expected}"),
+                        ));
+                    }
+                }
+            } else if let Some(Value::LogicalAddress { owner_task, .. }) = self.variables.get(name)
+            {
+                match value {
+                    Value::LogicalAddress {
+                        owner_task: actual_owner,
+                        raw,
+                    } if actual_owner == *owner_task => Value::LogicalAddress {
+                        owner_task: actual_owner,
+                        raw,
+                    },
+                    Value::Number(number)
+                        if (0.0..=f64::from(u32::MAX)).contains(&number)
+                            && number.fract() == 0.0 =>
+                    {
+                        Value::LogicalAddress {
+                            owner_task: *owner_task,
+                            raw: number as u32,
+                        }
+                    }
+                    _ => {
+                        return Err(program_error(
+                            line,
+                            format!("{name} requires a caller-scoped ADDRESS32"),
+                        ));
+                    }
+                }
+            } else if matches!(value, Value::LogicalAddress { .. })
+                && self.program.options.mode == crate::configure::BasicLanguageMode::Basic64
+            {
+                value
+            } else if matches!(
+                value,
+                Value::Integer(_) | Value::UInt64(_) | Value::Int64(_)
+            ) && self.program.options.mode == crate::configure::BasicLanguageMode::Basic64
+            {
+                value
             } else {
-                number
-            })
+                let number = value.number(line)?;
+                Value::Number(f64::from(number.trunc() as i32))
+            }
+        } else if matches!(value, Value::Number(_)) {
+            Value::Number(value.number(line)?)
+        } else if self.program.options.mode == crate::configure::BasicLanguageMode::Basic64 {
+            value
+        } else {
+            return Err(program_error(
+                line,
+                "legacy BASIC variables only accept numeric or string values",
+            ));
         };
         self.variables.insert(name.to_owned(), value);
+        if self.readonly_bindings.contains(name) {
+            self.readonly_initialized.insert(name.to_owned());
+        }
+        Ok(())
+    }
+
+    fn ensure_binding_writable(&self, name: &str, line: u16) -> Result<(), RuntimeError> {
+        if self
+            .local_readonly_scopes
+            .iter()
+            .any(|scope| scope.contains_key(name))
+        {
+            return Err(program_error(
+                line,
+                format!("{name} is a read-only local binding"),
+            ));
+        }
+        if self.readonly_bindings.contains(name) && self.readonly_initialized.contains(name) {
+            return Err(program_error(
+                line,
+                format!("{name} is a read-only module binding"),
+            ));
+        }
         Ok(())
     }
 
@@ -1653,11 +2948,31 @@ impl Interpreter {
         value: Value,
         line: u16,
         task: &mut Task,
+        dispatcher: &mut SwiDispatcher,
     ) -> Result<(), RuntimeError> {
         match target {
             LValue::Variable(name) => self.set_variable(name, value, line),
+            LValue::RecordField(record_name, field_name) => {
+                self.ensure_binding_writable(record_name, line)?;
+                self.assign_record_path(
+                    &[record_name.clone(), field_name.clone()],
+                    value,
+                    line,
+                    task.id,
+                )
+            }
+            LValue::RecordPath(path) => {
+                if let Some(name) = path.first() {
+                    self.ensure_binding_writable(name, line)?;
+                }
+                self.assign_record_path(path, value, line, task.id)
+            }
             LValue::ArrayElement(name, index) => {
-                let index = array_index(self.evaluate(index, line, task)?.number(line)?, line)?;
+                self.ensure_binding_writable(name, line)?;
+                let index = array_index(
+                    self.evaluate(index, line, task, dispatcher)?.number(line)?,
+                    line,
+                )?;
                 let Some(array) = self.arrays.get_mut(name) else {
                     return Err(program_error(
                         line,
@@ -1674,23 +2989,29 @@ impl Interpreter {
                 Ok(())
             }
             LValue::Memory(width, address) => {
-                let address = self.address_value(address, line, task)?;
+                let address = self.address_value(address, line, task, dispatcher)?;
                 self.write_memory(*width, address, value, line, task)
             }
             LValue::MemoryByteAt(base, offset) => {
-                let base = self.evaluate(base, line, task)?.number(line)?;
-                let offset = self.evaluate(offset, line, task)?.number(line)?;
-                let address = checked_guest_address(base + offset, line)?;
+                let base_value = self.evaluate(base, line, task, dispatcher)?;
+                let base = self.guest_address(base_value, line, task)?;
+                let offset = self
+                    .evaluate(offset, line, task, dispatcher)?
+                    .number(line)?;
+                let address = checked_guest_address(f64::from(base) + offset, line)?;
                 self.write_memory(MemoryWidth::Byte, address, value, line, task)
             }
             LValue::MemoryOffset(width, base, offset) => {
-                let base = self.evaluate(base, line, task)?.number(line)?;
-                let offset = self.evaluate(offset, line, task)?.number(line)?;
-                let address = checked_guest_address(base + offset, line)?;
+                let base_value = self.evaluate(base, line, task, dispatcher)?;
+                let base = self.guest_address(base_value, line, task)?;
+                let offset = self
+                    .evaluate(offset, line, task, dispatcher)?
+                    .number(line)?;
+                let address = checked_guest_address(f64::from(base) + offset, line)?;
                 self.write_memory(*width, address, value, line, task)
             }
             LValue::MemoryString(address) => {
-                let address = self.address_value(address, line, task)?;
+                let address = self.address_value(address, line, task, dispatcher)?;
                 let bytes = value.string(line)?;
                 if bytes.len() > 4096 {
                     return Err(program_error(line, "indirect string exceeds 4096 bytes"));
@@ -1706,9 +3027,13 @@ impl Interpreter {
                 Ok(())
             }
             LValue::StringSlice(name, start, length) => {
-                let start = self.evaluate(start, line, task)?.number(line)?;
-                let length =
-                    bounded_string_length(self.evaluate(length, line, task)?.number(line)?, line)?;
+                self.ensure_binding_writable(name, line)?;
+                let start = self.evaluate(start, line, task, dispatcher)?.number(line)?;
+                let length = bounded_string_length(
+                    self.evaluate(length, line, task, dispatcher)?
+                        .number(line)?,
+                    line,
+                )?;
                 let replacement = value.string(line)?.to_vec();
                 let start = start.trunc().max(1.0) as usize - 1;
                 let Some(Value::String(target)) = self.variables.get_mut(name) else {
@@ -1730,19 +3055,117 @@ impl Interpreter {
         &mut self,
         expression: &Expr,
         line: u16,
-        task: &Task,
+        task: &mut Task,
+        dispatcher: &mut SwiDispatcher,
     ) -> Result<u32, RuntimeError> {
-        checked_guest_address(self.evaluate(expression, line, task)?.number(line)?, line)
+        let value = self.evaluate(expression, line, task, dispatcher)?;
+        self.guest_address(value, line, task)
+    }
+
+    fn guest_address(&self, value: Value, line: u16, task: &Task) -> Result<u32, RuntimeError> {
+        match value {
+            Value::LogicalAddress { owner_task, raw } if owner_task == task.id => Ok(raw),
+            Value::LogicalAddress { .. } => Err(program_error(
+                line,
+                "logical address belongs to a different caller task",
+            )),
+            Value::Number(number) => checked_guest_address(number, line),
+            _ => Err(program_error(
+                line,
+                "expected a caller-scoped logical address",
+            )),
+        }
+    }
+
+    fn assign_record_path(
+        &mut self,
+        path: &[String],
+        value: Value,
+        line: u16,
+        task_id: u64,
+    ) -> Result<(), RuntimeError> {
+        if path.len() < 2 {
+            return Err(program_error(line, "record assignment requires a field"));
+        }
+        let mut type_name = match self.variables.get(&path[0]) {
+            Some(Value::Record { type_name, .. }) | Some(Value::Error { type_name, .. }) => {
+                type_name.clone()
+            }
+            _ => {
+                return Err(program_error(
+                    line,
+                    format!("{} is not an initialized record", path[0]),
+                ));
+            }
+        };
+        let mut readonly = false;
+        let mut declared_type = None;
+        for (index, field_name) in path.iter().enumerate().skip(1) {
+            let schema = self.program.system_types.get(&type_name).ok_or_else(|| {
+                program_error(line, format!("record type {type_name} is missing"))
+            })?;
+            let fields = match schema {
+                super::parser::SystemTypeDefinition::Record { fields }
+                | super::parser::SystemTypeDefinition::Error { fields } => fields,
+                _ => {
+                    return Err(program_error(
+                        line,
+                        format!("{type_name} has no record fields"),
+                    ));
+                }
+            };
+            let field = fields
+                .iter()
+                .find(|field| field.name == *field_name)
+                .ok_or_else(|| {
+                    program_error(line, format!("unknown field {type_name}.{field_name}"))
+                })?;
+            if index + 1 == path.len() {
+                readonly = field.read_only;
+                declared_type = Some(field.value_type.clone());
+            } else {
+                type_name = match &field.value_type {
+                    super::parser::SystemType::Record(name)
+                    | super::parser::SystemType::Error(name) => name.clone(),
+                    _ => {
+                        return Err(program_error(
+                            line,
+                            format!("{} is not a nested record", field.name),
+                        ));
+                    }
+                };
+            }
+        }
+        if readonly {
+            return Err(program_error(
+                line,
+                format!("{} is read-only", path.join(".")),
+            ));
+        }
+        let value = normalize_system_arguments(
+            std::slice::from_ref(&declared_type.expect("path includes a final field")),
+            vec![value],
+            line,
+            task_id,
+        )?
+        .pop()
+        .expect("one record field value");
+        let Some(root) = self.variables.get_mut(&path[0]) else {
+            return Err(program_error(
+                line,
+                format!("{} is not initialized", path[0]),
+            ));
+        };
+        set_nested_record_field(root, &path[1..], value, line)
     }
 
     fn read_memory(
         &self,
         width: MemoryWidth,
-        address: f64,
+        address: u32,
         line: u16,
         task: &Task,
     ) -> Result<Value, RuntimeError> {
-        let address = checked_guest_address(address, line)?;
         let value =
             match width {
                 MemoryWidth::Byte => u32::from(task.memory.read_byte(address)?),
@@ -1833,23 +3256,44 @@ impl Interpreter {
         for item in items {
             match item {
                 PrintItem::Value(expression) => {
-                    let value = self.evaluate(expression, line, task)?;
+                    let value = self.evaluate(expression, line, task, dispatcher)?;
                     let bytes = match value {
                         Value::String(value) => value,
                         Value::Number(value) => {
                             format_print_number(value, self.print_format).into_bytes()
                         }
+                        Value::Integer(value) => value.to_string().into_bytes(),
+                        Value::UInt64(value) => value.to_string().into_bytes(),
+                        Value::Int64(value) => value.to_string().into_bytes(),
+                        Value::Enum { value, .. } => format!("{value}").into_bytes(),
+                        Value::Flags { value, .. } => format!("{value}").into_bytes(),
+                        Value::Record { type_name, .. } => format!("<{type_name}>").into_bytes(),
+                        Value::Handle { type_name, .. } => {
+                            format!("<HANDLE {type_name}>").into_bytes()
+                        }
+                        Value::LogicalAddress { raw, .. } => {
+                            format!("<ADDRESS32 &{raw:08X}>").into_bytes()
+                        }
+                        Value::Error { message, .. } => message,
                     };
                     self.emit(&bytes, task, dispatcher)?;
                 }
                 PrintItem::Spaces(expression) => {
-                    let count = self.evaluate(expression, line, task)?.number(line)?;
+                    let count = self
+                        .evaluate(expression, line, task, dispatcher)?
+                        .number(line)?;
                     let count = bounded_string_length(count, line)?;
                     self.emit(&vec![b' '; count], task, dispatcher)?;
                 }
                 PrintItem::Tab(x, y) => {
-                    let x = self.evaluate(x, line, task)?.number(line)?.trunc() as u8;
-                    let y = self.evaluate(y, line, task)?.number(line)?.trunc() as u8;
+                    let x = self
+                        .evaluate(x, line, task, dispatcher)?
+                        .number(line)?
+                        .trunc() as u8;
+                    let y = self
+                        .evaluate(y, line, task, dispatcher)?
+                        .number(line)?
+                        .trunc() as u8;
                     dispatcher.write_via_os_write_c(task, &[31, x, y])?;
                     self.print_column = usize::from(x);
                 }
@@ -1902,6 +3346,715 @@ impl Interpreter {
     }
 }
 
+pub(super) fn invoke_system_definition(
+    mut program: ParsedProgram,
+    definition_name: &str,
+    module_id: crate::trellis::ModuleId,
+    contract: &crate::trellis::SwiContract,
+    workspace: &ModuleWorkspace,
+    persistent_state: &std::collections::BTreeMap<String, super::parser::SystemType>,
+    task: &mut Task,
+    dispatcher: &mut SwiDispatcher,
+    context: &mut SwiContext,
+) -> Result<(), RuntimeError> {
+    let definition_name = definition_name.to_ascii_uppercase();
+    if !program.procedures.contains_key(&definition_name) {
+        return Err(RuntimeError::Program(format!(
+            "BASIC64 module definition PROC {definition_name} is missing"
+        )));
+    }
+    for definition in program.procedures.values_mut() {
+        definition.entry += 2;
+    }
+    for definition in program.functions.values_mut() {
+        definition.entry += 2;
+    }
+    for address in program.line_entries.values_mut() {
+        *address += 2;
+    }
+    program.instructions.insert(
+        0,
+        super::parser::LocatedStatement {
+            line_number: 0,
+            statement: Statement::ProcedureCall(definition_name, Vec::new()),
+        },
+    );
+    program.instructions.insert(
+        1,
+        super::parser::LocatedStatement {
+            line_number: 0,
+            statement: Statement::End,
+        },
+    );
+
+    let mut interpreter = Interpreter::new(program);
+    let state = workspace
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    interpreter.variables.extend(
+        state
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone())),
+    );
+    let initialized_readonly = interpreter
+        .readonly_bindings
+        .iter()
+        .filter(|name| state.contains_key(*name))
+        .cloned()
+        .collect::<Vec<_>>();
+    interpreter
+        .readonly_initialized
+        .extend(initialized_readonly);
+    drop(state);
+    for (name, kind) in persistent_state {
+        if !interpreter.variables.contains_key(name) {
+            let value = match kind {
+                super::parser::SystemType::Handle(type_name) => Value::Handle {
+                    type_name: type_name.clone(),
+                    raw: 0,
+                },
+                _ => default_for_system_type(kind, &interpreter.program.system_types, 0, task.id)?,
+            };
+            interpreter.variables.insert(name.clone(), value);
+        }
+    }
+    for (index, value) in context.registers.into_iter().enumerate() {
+        let kind = contract
+            .registers
+            .iter()
+            .find(|register| usize::from(register.register) == index)
+            .map(|register| &register.kind);
+        let value = match kind {
+            Some(crate::trellis::RegisterKind::OpaqueHandle { type_name }) => Value::Handle {
+                type_name: type_name.to_ascii_uppercase(),
+                raw: value,
+            },
+            Some(crate::trellis::RegisterKind::LogicalAddress { .. }) => Value::LogicalAddress {
+                owner_task: task.id,
+                raw: value,
+            },
+            Some(crate::trellis::RegisterKind::Signed { .. }) => {
+                Value::Number(f64::from(value as i32))
+            }
+            _ => Value::Number(f64::from(value)),
+        };
+        interpreter.variables.insert(format!("R{index}%"), value);
+    }
+    interpreter.variables.insert(
+        "PC%".into(),
+        Value::LogicalAddress {
+            owner_task: task.id,
+            raw: context.pc,
+        },
+    );
+    interpreter.variables.insert(
+        "CARRY%".into(),
+        Value::Number(f64::from(u8::from(context.carry))),
+    );
+
+    dispatcher.with_module_execution(module_id, |dispatcher| interpreter.run(task, dispatcher))?;
+
+    let names = persistent_state.keys().cloned().collect::<Vec<_>>();
+    let values = names
+        .iter()
+        .map(|name| {
+            interpreter
+                .variables
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| default_value(name))
+        })
+        .collect::<Vec<_>>();
+    validate_system_arguments(
+        &persistent_state.values().cloned().collect::<Vec<_>>(),
+        &values,
+        0,
+    )?;
+    workspace
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .extend(names.into_iter().zip(values));
+
+    for register in &contract.registers {
+        if matches!(
+            register.direction,
+            crate::trellis::ArgumentDirection::Out | crate::trellis::ArgumentDirection::InOut
+        ) {
+            let value = interpreter.get_variable(&format!("R{}%", register.register));
+            context.registers[usize::from(register.register)] =
+                value_to_contract_register(&value, &register.kind, task.id, 0)?;
+        }
+    }
+    if matches!(
+        contract.program_counter,
+        Some(crate::trellis::ArgumentDirection::Out | crate::trellis::ArgumentDirection::InOut)
+    ) {
+        context.pc = match interpreter.get_variable("PC%") {
+            Value::LogicalAddress { owner_task, raw } if owner_task == task.id => raw,
+            Value::LogicalAddress { .. } => {
+                return Err(program_error(
+                    0,
+                    "program counter belongs to a different caller task",
+                ));
+            }
+            Value::Number(number)
+                if (0.0..=f64::from(u32::MAX)).contains(&number) && number.fract() == 0.0 =>
+            {
+                number as u32
+            }
+            _ => {
+                return Err(program_error(
+                    0,
+                    "program counter must remain a checked 32-bit address",
+                ));
+            }
+        };
+    }
+    if matches!(
+        contract.carry,
+        Some(crate::trellis::ArgumentDirection::Out | crate::trellis::ArgumentDirection::InOut)
+    ) {
+        context.carry = interpreter.get_variable("CARRY%").number(0)? != 0.0;
+    }
+    Ok(())
+}
+
+pub(crate) fn invoke_imported_system_symbol(
+    mut program: ParsedProgram,
+    name: &str,
+    function: bool,
+    values: Vec<Value>,
+    module_id: crate::trellis::ModuleId,
+    workspace: &ModuleWorkspace,
+    persistent_state: &std::collections::BTreeMap<String, super::parser::SystemType>,
+    task: &mut Task,
+    dispatcher: &mut SwiDispatcher,
+) -> Result<Option<Value>, RuntimeError> {
+    let name = name.to_ascii_uppercase();
+    let parameters = if function {
+        program.functions.get(&name)
+    } else {
+        program.procedures.get(&name)
+    }
+    .ok_or_else(|| program_error(0, format!("imported symbol {name} is not defined")))?
+    .parameters
+    .clone();
+    if values.len() != parameters.len() {
+        return Err(program_error(
+            0,
+            format!("imported symbol {name} argument count mismatch"),
+        ));
+    }
+    if function && !program.typed_results.contains_key(&name) {
+        return Err(program_error(
+            0,
+            format!("imported FN {name} has no declared result type"),
+        ));
+    }
+    for definition in program.procedures.values_mut() {
+        definition.entry += 2;
+    }
+    for definition in program.functions.values_mut() {
+        definition.entry += 2;
+    }
+    for address in program.line_entries.values_mut() {
+        *address += 2;
+    }
+    let argument_names = (0..values.len())
+        .map(|index| format!("__TRELLIS_IMPORTED_ARGUMENT_{index}"))
+        .collect::<Vec<_>>();
+    let invocation = if function {
+        let result_name = "__TRELLIS_IMPORTED_RESULT";
+        let arguments = argument_names.iter().cloned().map(Expr::Variable).collect();
+        Statement::Assign(
+            LValue::Variable(result_name.into()),
+            Expr::UserFunction(name, arguments),
+        )
+    } else {
+        Statement::ProcedureCall(
+            name,
+            argument_names.iter().cloned().map(Expr::Variable).collect(),
+        )
+    };
+    program.instructions.insert(
+        0,
+        super::parser::LocatedStatement {
+            line_number: 0,
+            statement: invocation,
+        },
+    );
+    program.instructions.insert(
+        1,
+        super::parser::LocatedStatement {
+            line_number: 0,
+            statement: Statement::End,
+        },
+    );
+
+    let mut interpreter = Interpreter::new(program);
+    for (name, value) in argument_names.into_iter().zip(values) {
+        interpreter.variables.insert(name, value);
+    }
+    let state = workspace
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    interpreter.variables.extend(
+        state
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone())),
+    );
+    interpreter.readonly_initialized.extend(
+        interpreter
+            .readonly_bindings
+            .iter()
+            .filter(|name| state.contains_key(*name))
+            .cloned(),
+    );
+    drop(state);
+    for (name, kind) in persistent_state {
+        if !interpreter.variables.contains_key(name) {
+            let value = match kind {
+                super::parser::SystemType::Handle(type_name) => Value::Handle {
+                    type_name: type_name.clone(),
+                    raw: 0,
+                },
+                _ => default_for_system_type(kind, &interpreter.program.system_types, 0, task.id)?,
+            };
+            interpreter.variables.insert(name.clone(), value);
+        }
+    }
+    dispatcher.with_module_execution(module_id, |dispatcher| interpreter.run(task, dispatcher))?;
+    let names = persistent_state.keys().cloned().collect::<Vec<_>>();
+    let state_values = names
+        .iter()
+        .map(|name| {
+            interpreter
+                .variables
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| default_value(name))
+        })
+        .collect::<Vec<_>>();
+    validate_system_arguments(
+        &persistent_state.values().cloned().collect::<Vec<_>>(),
+        &state_values,
+        0,
+    )?;
+    workspace
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .extend(names.into_iter().zip(state_values));
+    Ok(function.then(|| {
+        interpreter
+            .variables
+            .get("__TRELLIS_IMPORTED_RESULT")
+            .cloned()
+            .unwrap_or_else(|| default_value("__TRELLIS_IMPORTED_RESULT"))
+    }))
+}
+
+fn validate_system_arguments(
+    types: &[super::parser::SystemType],
+    values: &[Value],
+    line: u16,
+) -> Result<(), RuntimeError> {
+    if types.len() != values.len() {
+        return Err(program_error(
+            line,
+            "typed procedure parameter count mismatch",
+        ));
+    }
+    for (kind, value) in types.iter().zip(values) {
+        match (kind, value) {
+            (super::parser::SystemType::String, Value::String(_)) => {}
+            (super::parser::SystemType::Record(expected), Value::Record { type_name, .. })
+                if expected == type_name => {}
+            (super::parser::SystemType::Enum(expected), Value::Enum { type_name, .. })
+                if expected == type_name => {}
+            (super::parser::SystemType::Flags(expected), Value::Flags { type_name, .. })
+                if expected == type_name => {}
+            (super::parser::SystemType::Handle(expected), Value::Handle { type_name, .. })
+                if expected == type_name => {}
+            (super::parser::SystemType::Error(expected), Value::Error { type_name, .. })
+                if expected == type_name => {}
+            (super::parser::SystemType::Byte, Value::Number(number))
+                if (0.0..=255.0).contains(number) && number.fract() == 0.0 => {}
+            (super::parser::SystemType::UInt16, Value::Number(number))
+                if (0.0..=f64::from(u16::MAX)).contains(number) && number.fract() == 0.0 => {}
+            (super::parser::SystemType::UInt32, Value::Number(number))
+                if (0.0..=f64::from(u32::MAX)).contains(number) && number.fract() == 0.0 => {}
+            (super::parser::SystemType::Int32, Value::Number(number))
+                if (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(number)
+                    && number.fract() == 0.0 => {}
+            (super::parser::SystemType::Byte, Value::Integer(number))
+                if (0..=i128::from(u8::MAX)).contains(number) => {}
+            (super::parser::SystemType::UInt16, Value::Integer(number))
+                if (0..=i128::from(u16::MAX)).contains(number) => {}
+            (super::parser::SystemType::UInt32, Value::Integer(number))
+                if (0..=i128::from(u32::MAX)).contains(number) => {}
+            (super::parser::SystemType::Int32, Value::Integer(number))
+                if (i128::from(i32::MIN)..=i128::from(i32::MAX)).contains(number) => {}
+            (super::parser::SystemType::UInt64, Value::Integer(number))
+                if (0..=i128::from(u64::MAX)).contains(number) => {}
+            (super::parser::SystemType::Int64, Value::Integer(number))
+                if (i128::from(i64::MIN)..=i128::from(i64::MAX)).contains(number) => {}
+            (super::parser::SystemType::UInt64, Value::UInt64(_)) => {}
+            (super::parser::SystemType::Int64, Value::Int64(_)) => {}
+            (super::parser::SystemType::UInt64, Value::Number(number))
+                if (0.0..=9_007_199_254_740_992.0).contains(number) && number.fract() == 0.0 => {}
+            (super::parser::SystemType::Int64, Value::Number(number))
+                if (-9_007_199_254_740_992.0..=9_007_199_254_740_992.0).contains(number)
+                    && number.fract() == 0.0 => {}
+            (super::parser::SystemType::UInt64, Value::Number(number))
+                if (0.0..=9_007_199_254_740_992.0).contains(number) && number.fract() == 0.0 => {}
+            (super::parser::SystemType::Int64, Value::Number(number))
+                if (-9_007_199_254_740_992.0..=9_007_199_254_740_992.0).contains(number)
+                    && number.fract() == 0.0 => {}
+            (super::parser::SystemType::Address32, Value::Number(number))
+                if (0.0..=f64::from(u32::MAX)).contains(number) && number.fract() == 0.0 => {}
+            (super::parser::SystemType::Address32, Value::LogicalAddress { .. }) => {}
+            _ => {
+                return Err(program_error(
+                    line,
+                    format!("argument does not satisfy declared System Profile type {kind:?}"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalize_system_arguments(
+    types: &[super::parser::SystemType],
+    values: Vec<Value>,
+    line: u16,
+    task_id: u64,
+) -> Result<Vec<Value>, RuntimeError> {
+    if types.len() != values.len() {
+        return Err(program_error(
+            line,
+            "typed procedure parameter count mismatch",
+        ));
+    }
+    types
+        .iter()
+        .zip(values)
+        .map(|(kind, value)| match (kind, value) {
+            (super::parser::SystemType::UInt64, Value::Integer(number))
+                if (0..=i128::from(u64::MAX)).contains(&number) =>
+            {
+                Ok(Value::UInt64(number as u64))
+            }
+            (super::parser::SystemType::Int64, Value::Integer(number))
+                if (i128::from(i64::MIN)..=i128::from(i64::MAX)).contains(&number) =>
+            {
+                Ok(Value::Int64(number as i64))
+            }
+            (super::parser::SystemType::UInt64, value @ Value::UInt64(_))
+            | (super::parser::SystemType::Int64, value @ Value::Int64(_)) => Ok(value),
+            (super::parser::SystemType::UInt64, Value::Number(number))
+                if (0.0..=9_007_199_254_740_992.0).contains(&number) && number.fract() == 0.0 =>
+            {
+                Ok(Value::UInt64(number as u64))
+            }
+            (super::parser::SystemType::Int64, Value::Number(number))
+                if (-9_007_199_254_740_992.0..=9_007_199_254_740_992.0).contains(&number)
+                    && number.fract() == 0.0 =>
+            {
+                Ok(Value::Int64(number as i64))
+            }
+            (super::parser::SystemType::Byte, Value::Integer(number))
+                if (0..=i128::from(u8::MAX)).contains(&number) =>
+            {
+                Ok(Value::Number(number as f64))
+            }
+            (super::parser::SystemType::UInt16, Value::Integer(number))
+                if (0..=i128::from(u16::MAX)).contains(&number) =>
+            {
+                Ok(Value::Number(number as f64))
+            }
+            (super::parser::SystemType::UInt32, Value::Integer(number))
+                if (0..=i128::from(u32::MAX)).contains(&number) =>
+            {
+                Ok(Value::Number(number as f64))
+            }
+            (super::parser::SystemType::Int32, Value::Integer(number))
+                if (i128::from(i32::MIN)..=i128::from(i32::MAX)).contains(&number) =>
+            {
+                Ok(Value::Number(number as f64))
+            }
+            (super::parser::SystemType::Address32, Value::Number(number))
+                if (0.0..=f64::from(u32::MAX)).contains(&number) && number.fract() == 0.0 =>
+            {
+                Ok(Value::LogicalAddress {
+                    owner_task: task_id,
+                    raw: number as u32,
+                })
+            }
+            (super::parser::SystemType::Address32, Value::LogicalAddress { owner_task, raw })
+                if owner_task == task_id =>
+            {
+                Ok(Value::LogicalAddress { owner_task, raw })
+            }
+            (super::parser::SystemType::Address32, Value::LogicalAddress { .. }) => Err(
+                program_error(line, "logical address belongs to a different caller task"),
+            ),
+            (kind, value) => {
+                validate_system_arguments(
+                    std::slice::from_ref(kind),
+                    std::slice::from_ref(&value),
+                    line,
+                )?;
+                Ok(value)
+            }
+        })
+        .collect()
+}
+
+fn value_to_primitive_register(
+    value: &Value,
+    kind: &crate::trellis::RegisterKind,
+    task_id: u64,
+    line: u16,
+) -> Result<u32, RuntimeError> {
+    match kind {
+        crate::trellis::RegisterKind::OpaqueHandle { type_name } => match value {
+            Value::Handle {
+                type_name: actual,
+                raw,
+            } if actual.eq_ignore_ascii_case(type_name) => Ok(*raw),
+            _ => Err(program_error(
+                line,
+                format!("primitive requires opaque handle {type_name}"),
+            )),
+        },
+        crate::trellis::RegisterKind::Unsigned { bits } if *bits < 32 => {
+            let number = value.number(line)?;
+            if !(0.0..(1_u32 << bits) as f64).contains(&number) || number.fract() != 0.0 {
+                return Err(program_error(
+                    line,
+                    format!("primitive argument violates U{bits}"),
+                ));
+            }
+            Ok(number as u32)
+        }
+        crate::trellis::RegisterKind::Unsigned { .. } => {
+            let number = value.number(line)?;
+            if !(0.0..=f64::from(u32::MAX)).contains(&number) || number.fract() != 0.0 {
+                return Err(program_error(line, "primitive argument is not a UINT32"));
+            }
+            Ok(number as u32)
+        }
+        crate::trellis::RegisterKind::LogicalAddress { bits: 32 } => match value {
+            Value::LogicalAddress { owner_task, raw } if *owner_task == task_id => Ok(*raw),
+            Value::LogicalAddress { .. } => Err(program_error(
+                line,
+                "logical address belongs to a different caller task",
+            )),
+            _ => Err(program_error(
+                line,
+                "primitive requires a caller-scoped ADDRESS32",
+            )),
+        },
+        crate::trellis::RegisterKind::LogicalAddress { bits } => match value {
+            Value::LogicalAddress { owner_task, raw }
+                if *owner_task == task_id && u64::from(*raw) < (1_u64 << bits) =>
+            {
+                Ok(*raw)
+            }
+            Value::LogicalAddress { owner_task, .. } if *owner_task != task_id => Err(
+                program_error(line, "logical address belongs to a different caller task"),
+            ),
+            _ => Err(program_error(
+                line,
+                format!("primitive requires ADDRESS{bits}"),
+            )),
+        },
+        crate::trellis::RegisterKind::Signed { bits } if *bits < 32 => {
+            let number = value.number(line)?;
+            let bound = 2_f64.powi(i32::from(*bits) - 1);
+            if !(-bound..bound).contains(&number) || number.fract() != 0.0 {
+                return Err(program_error(
+                    line,
+                    format!("primitive argument violates S{bits}"),
+                ));
+            }
+            Ok(number as i32 as u32)
+        }
+        crate::trellis::RegisterKind::Signed { .. } => {
+            let number = value.number(line)?;
+            if !(f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&number)
+                || number.fract() != 0.0
+            {
+                return Err(program_error(line, "primitive argument is not an INT32"));
+            }
+            Ok(number as i32 as u32)
+        }
+    }
+}
+
+fn value_to_contract_register(
+    value: &Value,
+    kind: &crate::trellis::RegisterKind,
+    task_id: u64,
+    line: u16,
+) -> Result<u32, RuntimeError> {
+    value_to_primitive_register(value, kind, task_id, line)
+}
+
+fn default_for_system_type(
+    kind: &super::parser::SystemType,
+    definitions: &std::collections::BTreeMap<String, super::parser::SystemTypeDefinition>,
+    line: u16,
+    task_id: u64,
+) -> Result<Value, RuntimeError> {
+    use super::parser::{SystemType, SystemTypeDefinition};
+    Ok(match kind {
+        SystemType::String => Value::String(Vec::new()),
+        SystemType::Enum(type_name) => {
+            let Some(SystemTypeDefinition::Enum { members, .. }) = definitions.get(type_name)
+            else {
+                return Err(program_error(
+                    line,
+                    format!("enum type {type_name} is missing"),
+                ));
+            };
+            let value = members
+                .values()
+                .copied()
+                .find(|value| *value == 0)
+                .or_else(|| members.values().next().copied())
+                .unwrap_or(0);
+            Value::Enum {
+                type_name: type_name.clone(),
+                value,
+            }
+        }
+        SystemType::Flags(type_name) => Value::Flags {
+            type_name: type_name.clone(),
+            value: 0,
+        },
+        SystemType::Record(type_name) => {
+            let Some(SystemTypeDefinition::Record { fields: schema }) = definitions.get(type_name)
+            else {
+                return Err(program_error(
+                    line,
+                    format!("record type {type_name} is missing"),
+                ));
+            };
+            let mut fields = HashMap::new();
+            let mut readonly_fields = std::collections::HashSet::new();
+            for field in schema {
+                fields.insert(
+                    field.name.clone(),
+                    default_for_system_type(&field.value_type, definitions, line, task_id)?,
+                );
+                if field.read_only {
+                    readonly_fields.insert(field.name.clone());
+                }
+            }
+            Value::Record {
+                type_name: type_name.clone(),
+                fields,
+                readonly_fields,
+            }
+        }
+        SystemType::Handle(type_name) => Value::Handle {
+            type_name: type_name.clone(),
+            raw: 0,
+        },
+        SystemType::Error(type_name) => {
+            let Some(SystemTypeDefinition::Error { fields: schema }) = definitions.get(type_name)
+            else {
+                return Err(program_error(
+                    line,
+                    format!("error type {type_name} is missing"),
+                ));
+            };
+            let mut fields = HashMap::new();
+            let mut readonly_fields = std::collections::HashSet::new();
+            for field in schema {
+                let value = match field.name.as_str() {
+                    "CODE" => Value::Number(0.0),
+                    "MESSAGE" => Value::String(Vec::new()),
+                    _ => default_for_system_type(&field.value_type, definitions, line, task_id)?,
+                };
+                fields.insert(field.name.clone(), value);
+                if field.read_only {
+                    readonly_fields.insert(field.name.clone());
+                }
+            }
+            Value::Error {
+                type_name: type_name.clone(),
+                code: 0,
+                message: Vec::new(),
+                fields,
+                readonly_fields,
+            }
+        }
+        SystemType::Byte | SystemType::UInt16 | SystemType::UInt32 | SystemType::Int32 => {
+            Value::Number(0.0)
+        }
+        SystemType::UInt64 => Value::UInt64(0),
+        SystemType::Int64 => Value::Int64(0),
+        SystemType::Address32 => Value::LogicalAddress {
+            owner_task: task_id,
+            raw: 0,
+        },
+    })
+}
+
+fn set_nested_record_field(
+    record: &mut Value,
+    path: &[String],
+    value: Value,
+    line: u16,
+) -> Result<(), RuntimeError> {
+    let (fields, readonly_fields) = match record {
+        Value::Record {
+            fields,
+            readonly_fields,
+            ..
+        }
+        | Value::Error {
+            fields,
+            readonly_fields,
+            ..
+        } => (fields, readonly_fields),
+        _ => {
+            return Err(program_error(
+                line,
+                "nested assignment target is not a record",
+            ));
+        }
+    };
+    if path.len() == 1 {
+        if readonly_fields.contains(&path[0]) {
+            return Err(program_error(
+                line,
+                format!("{}.{} is read-only", record_type_name(record), path[0]),
+            ));
+        }
+        fields.insert(path[0].clone(), value);
+        return Ok(());
+    }
+    let next = fields
+        .get_mut(&path[0])
+        .ok_or_else(|| program_error(line, format!("unknown field {}", path[0])))?;
+    set_nested_record_field(next, &path[1..], value, line)
+}
+
+fn record_type_name(value: &Value) -> &str {
+    match value {
+        Value::Record { type_name, .. } | Value::Error { type_name, .. } => type_name,
+        _ => "<non-record>",
+    }
+}
+
 fn match_for_loops(program: &ParsedProgram) -> HashMap<usize, usize> {
     let mut stack = Vec::new();
     let mut matches = HashMap::new();
@@ -1917,6 +4070,39 @@ fn match_for_loops(program: &ParsedProgram) -> HashMap<usize, usize> {
         }
     }
     matches
+}
+
+fn match_try_regions(program: &ParsedProgram) -> HashMap<usize, TryRegion> {
+    let mut stack: Vec<(usize, Option<(usize, String, String)>)> = Vec::new();
+    let mut regions = HashMap::new();
+    for (address, instruction) in program.instructions.iter().enumerate() {
+        match &instruction.statement {
+            Statement::Try => stack.push((address, None)),
+            Statement::Catch {
+                error_name,
+                error_type,
+            } => {
+                if let Some((_, catch)) = stack.last_mut() {
+                    *catch = Some((address, error_name.clone(), error_type.clone()));
+                }
+            }
+            Statement::EndTry => {
+                if let Some((start, Some((catch_address, error_name, error_type)))) = stack.pop() {
+                    regions.insert(
+                        start,
+                        TryRegion {
+                            catch_address,
+                            end_address: address,
+                            error_name,
+                            error_type,
+                        },
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    regions
 }
 
 fn match_if_blocks(program: &ParsedProgram) -> HashMap<usize, usize> {
@@ -1948,7 +4134,16 @@ fn coerce_for_variable(name: &str, value: Value, line: u16) -> Result<Value, Run
     if name.ends_with('$') {
         match value {
             string @ Value::String(_) => Ok(string),
-            Value::Number(_) => Err(program_error(
+            Value::Number(_)
+            | Value::Integer(_)
+            | Value::UInt64(_)
+            | Value::Int64(_)
+            | Value::Enum { .. }
+            | Value::Flags { .. }
+            | Value::Record { .. }
+            | Value::Handle { .. }
+            | Value::LogicalAddress { .. }
+            | Value::Error { .. } => Err(program_error(
                 line,
                 format!("{name} requires a string value"),
             )),
@@ -1981,6 +4176,33 @@ fn checked_guest_address(number: f64, line: u16) -> Result<u32, RuntimeError> {
         ));
     }
     Ok(number.trunc() as u32)
+}
+
+fn integral_address_offset(number: f64, line: u16) -> Result<i64, RuntimeError> {
+    if !number.is_finite()
+        || number.fract() != 0.0
+        || !(-f64::from(u32::MAX)..=f64::from(u32::MAX)).contains(&number)
+    {
+        return Err(program_error(
+            line,
+            "ADDRESS32 arithmetic requires an integral 32-bit offset",
+        ));
+    }
+    Ok(number as i64)
+}
+
+fn address_offset_value(value: &Value, line: u16) -> Result<Option<i64>, RuntimeError> {
+    match value {
+        Value::Number(number) => integral_address_offset(*number, line).map(Some),
+        Value::Integer(number) => i64::try_from(*number)
+            .map(Some)
+            .map_err(|_| program_error(line, "logical address offset exceeds signed 64-bit range")),
+        Value::Int64(number) => Ok(Some(*number)),
+        Value::UInt64(number) => i64::try_from(*number)
+            .map(Some)
+            .map_err(|_| program_error(line, "logical address offset exceeds signed 64-bit range")),
+        _ => Ok(None),
+    }
 }
 
 fn bounded_string_length(number: f64, line: u16) -> Result<usize, RuntimeError> {
@@ -2089,4 +4311,29 @@ fn require_argument_count(
 
 fn program_error(line: u16, message: impl AsRef<str>) -> RuntimeError {
     RuntimeError::Program(format!("line {line}: {}", message.as_ref()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Interpreter, Value};
+
+    use crate::{host::HostConsole, memory::Task, swi::SwiDispatcher};
+
+    #[test]
+    fn classic_and_hybrid_integer_literals_keep_the_floating_number_model() {
+        for mode in ["CLASSIC", "HYBRID"] {
+            let source = format!("REM @BASIC64 MODE={mode}\nVALUE = 9007199254740993\n");
+            let parsed = crate::basic_compat::parser::parse_source(&source).unwrap();
+            let mut interpreter = Interpreter::new(parsed);
+            let mut dispatcher = SwiDispatcher::new(HostConsole::stdio());
+            interpreter
+                .run(&mut Task::new(910), &mut dispatcher)
+                .unwrap();
+
+            assert!(matches!(
+                interpreter.get_variable("VALUE"),
+                Value::Number(value) if value == 9_007_199_254_740_992.0
+            ));
+        }
+    }
 }

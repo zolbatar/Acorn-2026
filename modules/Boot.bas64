@@ -1,0 +1,16 @@
+REM @BASIC64 MODE=BASIC64
+REM @SYSTEM_PROFILE 0.1
+REM @MODULE Boot 1.0.0
+REM @CAPABILITY StartupPolicy
+REM @IMPORT Host.Configuration.ReadStartupLanguage StartupPolicy
+REM @IMPORT Host.Boot.RequestMos StartupPolicy
+REM @IMPORT Host.Boot.RequestDesktop StartupPolicy
+REM @LIFECYCLE START Start
+REM @PRIVATE PROC Start
+REM @STATE STARTUPLANGUAGE% UINT32
+
+DEF PROC Start
+    PRIMITIVE Host.Configuration.ReadStartupLanguage TO STARTUPLANGUAGE%
+    IF STARTUPLANGUAGE% = 3 THEN PRIMITIVE Host.Boot.RequestDesktop
+    IF STARTUPLANGUAGE% = 0 THEN PRIMITIVE Host.Boot.RequestMos
+ENDPROC

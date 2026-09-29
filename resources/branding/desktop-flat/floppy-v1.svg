@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" shape-rendering="crispEdges">
+  <title>Floppy drive</title>
+  <rect x="128" y="344" width="768" height="350" rx="16" fill="#303030"/>
+  <rect x="143" y="359" width="738" height="265" rx="8" fill="#d7d7d7"/>
+  <rect x="185" y="452" width="580" height="64" rx="6" fill="#303030"/>
+  <rect x="198" y="464" width="554" height="38" rx="4" fill="#f2c900"/>
+  <rect x="789" y="453" width="62" height="60" rx="6" fill="#303030"/>
+  <rect x="803" y="467" width="34" height="32" rx="4" fill="#e92023"/>
+  <rect x="184" y="645" width="27" height="27" rx="4" fill="#e7e7e7"/>
+  <rect x="230" y="645" width="27" height="27" rx="4" fill="#e7e7e7"/>
+</svg>

@@ -263,6 +263,10 @@ pub(super) struct JitProgram {
 
 impl JitProgram {
     pub(super) fn compile(program: &ParsedProgram) -> Result<Option<Self>, String> {
+        super::system_ir::PortableSystemIr::native_boundary_for_program(
+            program,
+            super::system_ir::SystemIrBackend::HybridJit,
+        )?;
         let compile_started = Instant::now();
         let compile_mandelbrot_procedure = has_compatible_mandelbrot_procedure(program);
         let mandelbrot_inline_region = find_mandelbrot_inline_region(program);
@@ -3223,4 +3227,39 @@ fn call_numeric_helper<M: Module>(
     let function = module.declare_func_in_func(*function, builder.func);
     let call = builder.ins().call(function, arguments);
     Ok(builder.inst_results(call)[0])
+}
+
+#[cfg(test)]
+mod system_profile_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn hybrid_jit_rejects_new_typed_parameters_and_explains_interpreter_fallback() {
+        let mut program = ParsedProgram::default();
+        program
+            .typed_parameters
+            .insert("ENTRY".into(), vec![parser::SystemType::Byte]);
+        let error = match JitProgram::compile(&program) {
+            Ok(_) => panic!("System Profile typed definitions must not enter the old JIT"),
+            Err(error) => error,
+        };
+        assert!(error.contains("typed definitions"));
+        assert!(error.contains("interpreter-only"));
+
+        let mut basic64 = ParsedProgram::default();
+        basic64.options.mode = crate::configure::BasicLanguageMode::Basic64;
+        basic64.instructions.push(parser::LocatedStatement {
+            line_number: 10,
+            statement: Statement::Assign(
+                LValue::Variable("VALUE".into()),
+                Expr::Integer(9_007_199_254_740_993),
+            ),
+        });
+        let error = match JitProgram::compile(&basic64) {
+            Ok(_) => panic!("BASIC64 integer operations must not be lowered as f64"),
+            Err(error) => error,
+        };
+        assert!(error.contains("BASIC64 System Profile typed assignment"));
+        assert!(error.contains("interpreter-only"));
+    }
 }

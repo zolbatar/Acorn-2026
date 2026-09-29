@@ -1,0 +1,165 @@
+REM @BASIC64 MODE=BASIC64
+REM @SYSTEM_PROFILE 0.1
+REM @MODULE Console 1.0.0
+REM @CAPABILITY ConsoleOutput
+REM @CAPABILITY ConsoleInput
+REM @CAPABILITY RuntimeErrors
+REM @CAPABILITY GraphicsVduStream
+REM @IMPORT Host.Graphics.AcceptByte GraphicsVduStream
+REM @IMPORT Host.Console.WriteByte ConsoleOutput
+REM @IMPORT Host.Console.ReadByteStatus ConsoleInput
+REM @IMPORT Host.Console.SoftwareEcho ConsoleInput
+REM @IMPORT Host.Runtime.MissingTerminator RuntimeErrors
+REM @IMPORT Host.Runtime.EndOfInput RuntimeErrors
+REM @STATE STARTCOUNT% UINT32
+REM @STATE QUIESCECOUNT% UINT32
+REM @STATE FINALISECOUNT% UINT32
+REM @LIFECYCLE START Start
+REM @LIFECYCLE QUIESCE Quiesce
+REM @LIFECYCLE FINALISE Finalise
+REM @SWI OS_ReadLine &0E ReadLine REGISTERS=R0:U32:INOUT|R1:U32:INOUT|R2:BYTE:IN|R3:BYTE:IN|R4:BYTE:IN;MEMORY=R0:WRITE:4096;CARRY=OUT;BLOCKING=TRUE
+REM @SWI OS_WriteC &00 WriteC REGISTERS=R0:U32:IN
+REM @SWI OS_WriteS &01 WriteS PC=INOUT;MEMORY=PC:READ:4096
+REM @SWI OS_Write0 &02 Write0 REGISTERS=R0:ADDRESS32:INOUT;MEMORY=R0:READ:4096
+REM @SWI OS_NewLine &03 NewLine
+REM @SWI OS_ReadC &04 ReadC REGISTERS=R0:BYTE:OUT;CARRY=OUT;BLOCKING=TRUE
+REM @REPLACE IMMEDIATE
+REM @PRIVATE PROC Start
+REM @PRIVATE PROC Quiesce
+REM @PRIVATE PROC Finalise
+REM @PRIVATE PROC EmitByte
+REM @PRIVATE PROC WriteSFrom
+REM @PRIVATE PROC Write0From
+
+DEF PROC Start
+    STARTCOUNT% = STARTCOUNT% + 1
+ENDPROC
+
+DEF PROC Quiesce
+    QUIESCECOUNT% = QUIESCECOUNT% + 1
+ENDPROC
+
+DEF PROC Finalise
+    FINALISECOUNT% = FINALISECOUNT% + 1
+ENDPROC
+
+DEF PROC WriteC
+    PROC EmitByte(R0% AND &FF)
+ENDPROC
+
+DEF PROC WriteS
+    PROC WriteSFrom(PC%)
+ENDPROC
+
+DEF PROC WriteSFrom(address AS ADDRESS32)
+    START% = address
+    BYTE% = 0
+    COUNT% = 0
+    REPEAT
+        IF COUNT% = 4096 THEN PRIMITIVE Host.Runtime.MissingTerminator, START%
+        BYTE% = ?address
+        address = address + 1
+        IF BYTE% <> 0 THEN COUNT% = COUNT% + 1: PROC EmitByte(BYTE%)
+    UNTIL BYTE% = 0
+    PC% = START% + INT((address - START% + 3) / 4) * 4
+ENDPROC
+
+DEF PROC Write0
+    PROC Write0From(R0%)
+ENDPROC
+
+DEF PROC Write0From(address AS ADDRESS32)
+    START% = address
+    BYTE% = 0
+    COUNT% = 0
+    REPEAT
+        IF COUNT% = 4096 THEN PRIMITIVE Host.Runtime.MissingTerminator, START%
+        BYTE% = ?address
+        address = address + 1
+        IF BYTE% <> 0 THEN COUNT% = COUNT% + 1: PROC EmitByte(BYTE%)
+    UNTIL BYTE% = 0
+    R0% = address
+ENDPROC
+
+DEF PROC NewLine
+    PROC EmitByte(10)
+    PROC EmitByte(13)
+ENDPROC
+
+DEF PROC ReadC
+    PRIMITIVE Host.Console.ReadByteStatus TO R0%, EOF%
+    IF EOF% THEN PRIMITIVE Host.Runtime.EndOfInput
+    CARRY% = 0
+    IF R0% = 27 THEN CARRY% = 1
+ENDPROC
+
+DEF PROC ReadLine
+    BUFFER% = R0% AND &3FFFFFFF
+    MAXIMUM% = R1%
+    LOWEST% = R2%
+    IF LOWEST% > 255 THEN LOWEST% = 255
+    HIGHEST% = R3%
+    IF HIGHEST% > 255 THEN HIGHEST% = 255
+    PRIMITIVE Host.Console.SoftwareEcho TO SOFTWAREECHO%
+    ECHOONLY% = R0% AND &80000000
+    ECHOR4% = R0% AND &40000000
+    ECHOBYTE% = R4% AND &FF
+    NBYTES% = 0
+    CARRY% = 0
+    REPEAT
+        PRIMITIVE Host.Console.ReadByteStatus TO BYTE%, EOF%
+        IF EOF% AND NBYTES% = 0 THEN PRIMITIVE Host.Runtime.EndOfInput
+        IF EOF% = 0 THEN
+            IF BYTE% = 13 OR BYTE% = 10 THEN
+                IF SOFTWAREECHO% THEN PROC InputNewLine
+            ENDIF
+            IF BYTE% = 27 THEN CARRY% = 1
+            IF BYTE% = 27 AND SOFTWAREECHO% THEN PROC InputNewLine
+            IF BYTE% = 4 AND NBYTES% = 0 THEN PRIMITIVE Host.Runtime.EndOfInput
+            IF (BYTE% = 8 OR BYTE% = 127) AND NBYTES% > 0 THEN
+                NBYTES% = NBYTES% - 1
+                ?(BUFFER% + NBYTES%) = 0
+                IF SOFTWAREECHO% THEN PROC EraseInputByte
+            ENDIF
+            IF BYTE% <> 13 AND BYTE% <> 10 AND BYTE% <> 27 AND BYTE% <> 8 AND BYTE% <> 127 AND (BYTE% <> 4 OR NBYTES% > 0) THEN
+                ACCEPTED% = BYTE% >= LOWEST% AND BYTE% <= HIGHEST%
+                FULL% = ACCEPTED% AND NBYTES% >= MAXIMUM%
+                ECHOINSERTED% = ACCEPTED% AND NBYTES% < MAXIMUM%
+                IF ECHOINSERTED% THEN
+                    ?(BUFFER% + NBYTES%) = BYTE%
+                    NBYTES% = NBYTES% + 1
+                ENDIF
+                IF SOFTWAREECHO% AND (ECHOINSERTED% OR ECHOONLY% = 0) THEN PROC EchoInputByte
+                IF FULL% AND SOFTWAREECHO% THEN PROC Bell
+            ENDIF
+        ENDIF
+    UNTIL EOF% OR BYTE% = 13 OR BYTE% = 10 OR BYTE% = 27
+    R0% = 0
+    R1% = NBYTES%
+    R2% = 0
+    R3% = 0
+ENDPROC
+
+DEF PROC InputNewLine
+    SYS "OS_NEWLINE"
+ENDPROC
+
+DEF PROC EchoInputByte
+    IF ECHOR4% THEN BYTE% = ECHOBYTE%
+    SYS "OS_WRITEC", BYTE%
+ENDPROC
+
+DEF PROC EraseInputByte
+    SYS "OS_WRITEC", 8
+    SYS "OS_WRITEC", 32
+    SYS "OS_WRITEC", 8
+ENDPROC
+
+DEF PROC Bell
+    SYS "OS_WRITEC", 7
+ENDPROC
+
+DEF PROC EmitByte(byteValue% AS BYTE)
+    PRIMITIVE Host.Graphics.AcceptByte, byteValue% AND &FF TO OUTPUT%, ACCEPTED%
+    IF ACCEPTED% THEN PRIMITIVE Host.Console.WriteByte, OUTPUT%
+ENDPROC

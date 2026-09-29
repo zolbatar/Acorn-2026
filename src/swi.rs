@@ -1,4 +1,9 @@
 use crate::{
+    basic_compat::system_profile::SystemModule,
+    boot::{
+        BootCapsule, BootFailure, BootStage, RUNTIME_ABI_VERSION, embedded_capsule_bytes,
+        parse_recovery_action, RecoveryAction,
+    },
     configure::{BasicConfiguration, BasicEngine, ConfigureStore, StartupLanguage},
     display::{DesktopResolution, DisplayColour, DisplaySettings},
     error::RuntimeError,
@@ -8,9 +13,14 @@ use crate::{
     graphics::{GraphicsProfile, GraphicsService, GraphicsSnapshot, GraphicsWindow},
     host::HostConsole,
     memory::{GUEST_MEMORY_BASE, Task},
+    trellis::{
+        CapabilityName, DefinitionId, DependencyFingerprint, DerivedTargetCache, InvocationBackend,
+        ModuleId, ModuleManagementAuthority, ModuleRegistry, ModuleState, RegisterKind,
+        ResourceRight,
+    },
 };
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     io::{Read, Seek, SeekFrom, Write},
     sync::mpsc::Sender,
     time::{Duration, Instant},
@@ -20,6 +30,20 @@ use std::sync::Arc;
 
 mod mos;
 pub(crate) use mos::MosClock;
+
+fn same_export_contracts(
+    left: &[crate::trellis::SwiExport],
+    right: &[crate::trellis::SwiExport],
+) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|export| {
+            right.iter().any(|candidate| {
+                candidate.number == export.number
+                    && candidate.name.eq_ignore_ascii_case(&export.name)
+                    && candidate.contract == export.contract
+            })
+        })
+}
 
 use crate::wimp::{
     WIMP_CLOSE_DOWN, WIMP_CLOSE_WINDOW, WIMP_CREATE_ICON, WIMP_CREATE_ICON_EX, WIMP_CREATE_MENU,
@@ -90,6 +114,24 @@ pub enum DisplayEvent {
     RuntimeExited,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SwiDispatchRoute {
+    ModuleOwned {
+        number: u32,
+        name: String,
+        module: String,
+        definition: String,
+        generation: u64,
+        backend: InvocationBackend,
+    },
+    TransitionalRust {
+        number: u32,
+    },
+    TransitionalNamed {
+        name: String,
+    },
+}
+
 const R0: usize = 0;
 const R1: usize = 1;
 const R2: usize = 2;
@@ -112,6 +154,45 @@ const MAX_STRING_BYTES: usize = 4096;
 const OUTPUT_BUFFER: u32 = GUEST_MEMORY_BASE + 0x1000;
 const CLI_STRING_BUFFER: u32 = GUEST_MEMORY_BASE + 0x3000;
 const HELP_TEXT: &[u8] = b"Acorn-2026 MOS commands:\n\r  Commands can be abbreviated with a final dot (for example, *CA. and *CONF.); *. is a shortcut for *CAT.\n\r  *CAT [dir]             Catalogue a directory.\n\r  *DIR [dir]             Select the current directory.\n\r  *CDIR <dir>            Create a directory.\n\r  *DELETE <file>         Delete a file.\n\r  *RENAME <old> <new>    Rename a file or directory.\n\r  *FILETYPE <file> <id>  Set a RISC OS file type.\n\r  *TYPE <file>           Display a text file.\n\r  *DISC [name]           Read or set the volume name.\n\r  *HOSTFS                Select the HostFS filing system.\n\r  *CONFIGURE <option> <value> Save a BASIC or startup preference.\n\r  *CONFIGURE Language 0  Open the MOS prompt on load.\n\r  *CONFIGURE Language 3  Open the desktop on load.\n\r  *CONFIGURE DEFAULTS    Restore configuration defaults.\n\r  *STATUS [option]       Show saved configuration.\n\r  *BASIC <file>          Load and run BASIC with saved preferences.\n\r  DESKTOP                Start the hosted Wimp desktop.\n\r  RUN <file>             Run a BASIC source or tokenised file.\n\r  BASICLOAD <file>       Load a tokenised BASIC program.\n\r  BASICRUN               Run the loaded program.\n\r  BASICJIT [file]        Run with experimental native hot regions.\n\r  BASICJIT STRICT [file] Compile and run supported code without fallback.\n\r  HELP                   Show this help.\n\r  QUIT                   Exit the runtime.";
+
+fn validate_boot_grants(
+    module_name: &str,
+    grants: &BTreeSet<CapabilityName>,
+) -> Result<(), String> {
+    let permitted = if module_name.eq_ignore_ascii_case("Console") {
+        [
+            "ConsoleInput",
+            "ConsoleOutput",
+            "RuntimeErrors",
+            "GraphicsVduStream",
+        ]
+        .as_slice()
+    } else if module_name.eq_ignore_ascii_case("Boot") {
+        ["StartupPolicy"].as_slice()
+    } else {
+        [].as_slice()
+    };
+    for grant in grants {
+        if !permitted
+            .iter()
+            .any(|name| grant.as_str().eq_ignore_ascii_case(name))
+        {
+            return Err(format!(
+                "host boot policy does not grant {} to module {module_name}",
+                grant.as_str()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn read_capsule_abi(bytes: &[u8]) -> Option<u32> {
+    if bytes.len() < 14 {
+        None
+    } else {
+        Some(u32::from_be_bytes(bytes[10..14].try_into().ok()?))
+    }
+}
 
 fn work_area_to_graphics_clip(
     work: WorkArea,
@@ -169,6 +250,13 @@ pub struct SwiContext {
     pub carry: bool,
 }
 
+struct ManagedResourceHandle {
+    type_name: String,
+    owner_task: u64,
+    rights: BTreeSet<ResourceRight>,
+    bytes: Vec<u8>,
+}
+
 pub struct SwiDispatcher {
     mos: mos::MosState,
     configure: ConfigureStore,
@@ -186,11 +274,507 @@ pub struct SwiDispatcher {
     display_batch_active: bool,
     last_display_batch_publish: Option<Instant>,
     last_inkey_poll: Instant,
+    active_module: Option<ModuleId>,
+    module_registry: ModuleRegistry,
+    module_management_authority: ModuleManagementAuthority,
+    module_programs: HashMap<DefinitionId, Arc<SystemModule>>,
+    resource_handles: HashMap<u32, ManagedResourceHandle>,
+    next_resource_handle: u32,
+    derived_targets: DerivedTargetCache<Vec<u8>>,
+    last_dispatch_route: Option<SwiDispatchRoute>,
+    module_dispatch_count: u64,
+    transitional_dispatch_count: u64,
+    startup_target: Option<BootStartupTarget>,
+    boot_failure: Option<BootFailure>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BootStartupTarget {
+    MosPrompt,
+    Desktop,
+}
+
+/// Trusted host-side control plane for loading and replacing BASIC64 system
+/// definitions. It is deliberately not exposed as a guest SWI or BASIC value.
+pub struct Basic64ModuleManager<'a> {
+    dispatcher: &'a mut SwiDispatcher,
+    authority: ModuleManagementAuthority,
+}
+
+impl Basic64ModuleManager<'_> {
+    pub fn replace_swi_definition(
+        &mut self,
+        number: u32,
+        source: &str,
+        source_path: &str,
+    ) -> Result<crate::trellis::GenerationId, RuntimeError> {
+        self.dispatcher
+            .replace_basic64_swi(&self.authority, number, source, source_path)
+    }
+
+    pub fn quiesce(&mut self, module_name: &str, task: &mut Task) -> Result<(), RuntimeError> {
+        self.dispatcher
+            .quiesce_basic64_module(&self.authority, module_name, task)
+    }
+
+    pub fn retire(&mut self, module_name: &str, task: &mut Task) -> Result<(), RuntimeError> {
+        self.dispatcher
+            .retire_basic64_module(&self.authority, module_name, task)
+    }
 }
 
 impl SwiDispatcher {
     pub fn new(console: HostConsole) -> Self {
         Self::with_display_events(console, None, 1, None)
+    }
+
+    pub(crate) fn call_module_primitive(
+        &mut self,
+        name: &str,
+        task: &mut Task,
+        context: &mut SwiContext,
+    ) -> Result<(), RuntimeError> {
+        self.invoke_module_primitive(name, task, context)
+    }
+
+    pub(crate) fn module_primitive_signature(
+        &self,
+        name: &str,
+    ) -> Result<crate::trellis::PrimitiveDescriptor, RuntimeError> {
+        let module_id = self.active_module.ok_or_else(|| {
+            RuntimeError::Program(format!(
+                "primitive {name} was inspected outside a BASIC64 module invocation"
+            ))
+        })?;
+        self.module_registry
+            .authorized_primitive(module_id, name)
+            .map_err(|error| RuntimeError::Program(error.to_string()))
+    }
+
+    /// Trusted host-side registration path for managed byte resources. The
+    /// returned value is an opaque guest identity, never a host pointer.
+    pub(crate) fn register_resource_buffer(
+        &mut self,
+        type_name: &str,
+        owner_task: u64,
+        bytes: Vec<u8>,
+        rights: impl IntoIterator<Item = ResourceRight>,
+    ) -> Result<u32, RuntimeError> {
+        let handle = self.next_resource_handle;
+        self.next_resource_handle = handle
+            .checked_add(1)
+            .ok_or_else(|| RuntimeError::Program("resource handle space exhausted".into()))?;
+        self.resource_handles.insert(
+            handle,
+            ManagedResourceHandle {
+                type_name: type_name.to_ascii_uppercase(),
+                owner_task,
+                rights: rights.into_iter().collect(),
+                bytes,
+            },
+        );
+        Ok(handle)
+    }
+
+    fn validate_resource_handle_access(
+        &self,
+        handle: u32,
+        type_name: &str,
+        task_id: u64,
+        right: ResourceRight,
+    ) -> Result<(), RuntimeError> {
+        let resource = self.resource_handles.get(&handle).ok_or_else(|| {
+            RuntimeError::Program("opaque resource handle is not registered".into())
+        })?;
+        if !resource.type_name.eq_ignore_ascii_case(type_name) {
+            return Err(RuntimeError::Program(format!(
+                "resource handle has type {}, expected {type_name}",
+                resource.type_name
+            )));
+        }
+        if resource.owner_task != task_id {
+            return Err(RuntimeError::Program(
+                "resource handle belongs to a different caller task".into(),
+            ));
+        }
+        if !resource.rights.contains(&right) {
+            return Err(RuntimeError::Program(format!(
+                "resource handle lacks {right:?} authority"
+            )));
+        }
+        Ok(())
+    }
+
+    fn read_resource_byte(
+        &self,
+        handle: u32,
+        type_name: &str,
+        task_id: u64,
+        offset: u32,
+    ) -> Result<u8, RuntimeError> {
+        self.validate_resource_handle_access(handle, type_name, task_id, ResourceRight::Read)?;
+        self.resource_handles[&handle]
+            .bytes
+            .get(offset as usize)
+            .copied()
+            .ok_or_else(|| RuntimeError::Program("resource offset is out of range".into()))
+    }
+
+    pub(crate) fn resolve_imported_basic64_symbol(
+        &self,
+        provider_name: &str,
+        symbol: &str,
+    ) -> Result<(ModuleId, String, Arc<SystemModule>), RuntimeError> {
+        let caller_id = self.active_module.ok_or_else(|| {
+            RuntimeError::Program(
+                "qualified module symbol was invoked outside a BASIC64 module".into(),
+            )
+        })?;
+        let caller = self
+            .module_registry
+            .module(caller_id)
+            .ok_or_else(|| RuntimeError::Program("calling module has been unloaded".into()))?;
+        if !caller.manifest.symbol_imports.iter().any(|import| {
+            import.module.eq_ignore_ascii_case(provider_name)
+                && import.symbol.eq_ignore_ascii_case(symbol)
+        }) {
+            return Err(RuntimeError::Program(format!(
+                "module {} has no linked import for {}.{}",
+                caller.manifest.name, provider_name, symbol
+            )));
+        }
+        let provider = self
+            .module_registry
+            .module_named(provider_name)
+            .ok_or_else(|| RuntimeError::Program(format!("unknown module {provider_name}")))?;
+        if provider.state != ModuleState::Active {
+            return Err(RuntimeError::Program(format!(
+                "imported module {} is not active",
+                provider.manifest.name
+            )));
+        }
+        if !provider
+            .manifest
+            .symbol_exports
+            .iter()
+            .any(|export| export.eq_ignore_ascii_case(symbol))
+        {
+            return Err(RuntimeError::Program(format!(
+                "module {} does not export {symbol}",
+                provider.manifest.name
+            )));
+        }
+        let definition = provider.definitions.get(symbol).ok_or_else(|| {
+            RuntimeError::Program(format!(
+                "module {} has no definition for {symbol}",
+                provider.manifest.name
+            ))
+        })?;
+        let source = self
+            .module_programs
+            .get(&definition.id)
+            .cloned()
+            .ok_or_else(|| {
+                RuntimeError::Program(format!(
+                    "exported symbol {provider_name}.{symbol} has no retained BASIC64 source"
+                ))
+            })?;
+        Ok((provider.id, symbol.to_owned(), source))
+    }
+
+    pub(crate) fn with_module_execution<T>(
+        &mut self,
+        module: ModuleId,
+        execute: impl FnOnce(&mut Self) -> Result<T, RuntimeError>,
+    ) -> Result<T, RuntimeError> {
+        let previous = self.active_module.replace(module);
+        let result = execute(self);
+        self.active_module = previous;
+        result
+    }
+
+    pub fn last_dispatch_route(&self) -> Option<&SwiDispatchRoute> {
+        self.last_dispatch_route.as_ref()
+    }
+
+    pub fn module_dispatch_count(&self) -> u64 {
+        self.module_dispatch_count
+    }
+
+    pub fn transitional_dispatch_count(&self) -> u64 {
+        self.transitional_dispatch_count
+    }
+
+    pub fn module_registry(&self) -> &ModuleRegistry {
+        &self.module_registry
+    }
+
+    /// Borrows a dispatcher into the trusted, host-side module management
+    /// surface. BASIC code has no path to construct or request this manager.
+    pub fn basic64_module_manager(&mut self) -> Basic64ModuleManager<'_> {
+        Basic64ModuleManager {
+            authority: self.module_management_authority.clone(),
+            dispatcher: self,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn module_management_authority(&self) -> &ModuleManagementAuthority {
+        &self.module_management_authority
+    }
+
+    fn check_module_management_authority(
+        &self,
+        authority: &ModuleManagementAuthority,
+    ) -> Result<(), RuntimeError> {
+        if self
+            .module_registry
+            .accepts_module_management_authority(&self.module_management_authority, authority)
+        {
+            Ok(())
+        } else {
+            Err(RuntimeError::Program(
+                "module operation requires this dispatcher’s module-management authority".into(),
+            ))
+        }
+    }
+
+    /// Internal module-manager lifecycle path. No guest SWI exposes this
+    /// authority; the token is issued only to trusted Rust management code.
+    pub fn quiesce_basic64_module(
+        &mut self,
+        authority: &ModuleManagementAuthority,
+        module_name: &str,
+        task: &mut Task,
+    ) -> Result<(), RuntimeError> {
+        self.check_module_management_authority(authority)?;
+        let record = self
+            .module_registry
+            .module_named(module_name)
+            .ok_or_else(|| RuntimeError::Program(format!("unknown module {module_name}")))?;
+        let module_id = record.id;
+        let source_path = record.manifest.source_path.as_str();
+        let source_hash = record.manifest.source_hash.as_str();
+        let program = self
+            .module_programs
+            .values()
+            .find(|program| {
+                program.manifest.name.eq_ignore_ascii_case(module_name)
+                    && program.manifest.source_path == source_path
+                    && program.manifest.source_hash == source_hash
+            })
+            .cloned()
+            .ok_or_else(|| RuntimeError::Program("module has no retained BASIC64 source".into()))?;
+        self.module_registry
+            .quiesce_module(module_id)
+            .map_err(|error| RuntimeError::Program(error.to_string()))?;
+        let active_calls = match self.module_registry.module_active_call_count(module_id) {
+            Ok(active_calls) => active_calls,
+            Err(error) => {
+                let _ = self.module_registry.rollback_module_quiesce(module_id);
+                return Err(RuntimeError::Program(error.to_string()));
+            }
+        };
+        if active_calls != 0 {
+            self.module_registry
+                .rollback_module_quiesce(module_id)
+                .map_err(|error| RuntimeError::Program(error.to_string()))?;
+            return Err(RuntimeError::Program(format!(
+                "module {module_name} still has {active_calls} active call(s)"
+            )));
+        }
+        if let Err(error) = program.invoke_lifecycle_transactional("QUIESCE", module_id, task, self)
+        {
+            self.module_registry
+                .rollback_module_quiesce(module_id)
+                .map_err(|rollback| {
+                    RuntimeError::Program(format!(
+                        "quiesce failed: {error}; restoring active state also failed: {rollback}"
+                    ))
+                })?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Runs Finalise only after all active SWI generations have drained, then
+    /// releases the module's exports and retained workspace.
+    pub fn retire_basic64_module(
+        &mut self,
+        authority: &ModuleManagementAuthority,
+        module_name: &str,
+        task: &mut Task,
+    ) -> Result<(), RuntimeError> {
+        self.check_module_management_authority(authority)?;
+        let record = self
+            .module_registry
+            .module_named(module_name)
+            .ok_or_else(|| RuntimeError::Program(format!("unknown module {module_name}")))?;
+        if record.state != ModuleState::Quiescing {
+            return Err(RuntimeError::Program(format!(
+                "module {module_name} must be quiesced before Finalise"
+            )));
+        }
+        let module_id = record.id;
+        let program_ids = self
+            .module_programs
+            .iter()
+            .filter_map(|(definition_id, program)| {
+                program
+                    .manifest
+                    .name
+                    .eq_ignore_ascii_case(module_name)
+                    .then_some(*definition_id)
+            })
+            .collect::<Vec<_>>();
+        let source_path = record.manifest.source_path.as_str();
+        let source_hash = record.manifest.source_hash.as_str();
+        let program = program_ids
+            .iter()
+            .filter_map(|definition_id| self.module_programs.get(definition_id))
+            .find(|program| {
+                program.manifest.source_path == source_path
+                    && program.manifest.source_hash == source_hash
+            })
+            .cloned()
+            .ok_or_else(|| RuntimeError::Program("module has no retained BASIC64 source".into()))?;
+        let active_calls = self
+            .module_registry
+            .module_active_call_count(module_id)
+            .map_err(|error| RuntimeError::Program(error.to_string()))?;
+        if active_calls != 0 {
+            return Err(RuntimeError::Program(format!(
+                "module {module_name} still has {active_calls} active call(s)"
+            )));
+        }
+        program.invoke_lifecycle_transactional("FINALISE", module_id, task, self)?;
+        self.module_registry
+            .retire_module(module_id)
+            .map_err(|error| RuntimeError::Program(error.to_string()))?;
+        for definition_id in program_ids {
+            self.module_programs.remove(&definition_id);
+        }
+        Ok(())
+    }
+
+    /// Replaces one published BASIC64 definition while preserving its SWI
+    /// entry-cell identity and public register/memory contract.
+    pub fn replace_basic64_swi(
+        &mut self,
+        authority: &ModuleManagementAuthority,
+        number: u32,
+        source: &str,
+        source_path: impl Into<String>,
+    ) -> Result<crate::trellis::GenerationId, RuntimeError> {
+        self.check_module_management_authority(authority)?;
+        let source_path = source_path.into();
+        let owner = self
+            .module_registry
+            .swi_module_name(number)
+            .ok_or_else(|| RuntimeError::InvalidSwi(number))?
+            .to_owned();
+        let existing_contract = self
+            .module_registry
+            .swi_contract(number)
+            .cloned()
+            .ok_or_else(|| RuntimeError::InvalidSwi(number))?;
+        let mut module =
+            SystemModule::parse(source, source_path, &self.module_registry.allocator())?;
+        if !module.manifest.name.eq_ignore_ascii_case(&owner) {
+            return Err(RuntimeError::Program(format!(
+                "replacement module {} does not own SWI {owner}",
+                module.manifest.name
+            )));
+        }
+        let current_module = self
+            .module_registry
+            .module_named(&owner)
+            .ok_or_else(|| RuntimeError::Program(format!("owning module {owner} disappeared")))?;
+        let old_manifest = current_module.manifest.clone();
+        let old_definition = self
+            .module_registry
+            .current_swi_definition(number)
+            .ok_or_else(|| RuntimeError::InvalidSwi(number))?;
+        let old_program = self
+            .module_programs
+            .get(&old_definition.id)
+            .cloned()
+            .ok_or_else(|| {
+                RuntimeError::Program("active definition has no retained module source".into())
+            })?;
+        if module.manifest.version != old_manifest.version
+            || module.manifest.language_profile != old_manifest.language_profile
+            || module.manifest.target_profile != old_manifest.target_profile
+            || module.manifest.dependencies != old_manifest.dependencies
+            || module.manifest.symbol_imports != old_manifest.symbol_imports
+            || module.manifest.primitive_imports != old_manifest.primitive_imports
+            || module.manifest.requested_capabilities != old_manifest.requested_capabilities
+            || module.manifest.lifecycle != old_manifest.lifecycle
+            || module.manifest.replacement_policy != old_manifest.replacement_policy
+            || module.manifest.symbol_exports != old_manifest.symbol_exports
+            || !same_export_contracts(&module.manifest.exports, &old_manifest.exports)
+        {
+            return Err(RuntimeError::Program(
+                "replacement changes module version, dependencies, capabilities, lifecycle, policy, or the public export set".into(),
+            ));
+        }
+        module.inherit_workspace(&old_program)?;
+        module.validate_primitive_shapes(&self.module_registry.primitives)?;
+        let export = module
+            .manifest
+            .exports
+            .iter()
+            .find(|export| export.number == number)
+            .ok_or_else(|| {
+                RuntimeError::Program(format!(
+                    "replacement module {} does not export SWI &{number:X}",
+                    module.manifest.name
+                ))
+            })?;
+        if export.contract != existing_contract {
+            return Err(RuntimeError::Program(
+                "replacement changes the published SWI contract".into(),
+            ));
+        }
+        let mut replacement = module
+            .definitions
+            .get(&export.definition_name)
+            .cloned()
+            .ok_or_else(|| {
+                RuntimeError::Program(format!(
+                    "replacement has no BASIC64 definition {}",
+                    export.definition_name
+                ))
+            })?;
+        let generation = self
+            .module_registry
+            .replace_swi_definition(number, &existing_contract, replacement.clone())
+            .map_err(|error| RuntimeError::Program(error.to_string()))?;
+        self.derived_targets
+            .invalidate_definition(old_definition.id);
+        self.derived_targets.invalidate_dependency(
+            &owner,
+            &DependencyFingerprint {
+                module: owner.to_owned(),
+                version: module.manifest.version,
+                source_path: module.manifest.source_path.clone(),
+                source_hash: module.manifest.source_hash.clone(),
+                language_profile: module.manifest.language_profile.clone(),
+                target_profile: module.manifest.target_profile.clone(),
+            },
+        );
+        replacement.module = self
+            .module_registry
+            .module_named(&owner)
+            .map(|module| module.id)
+            .ok_or_else(|| {
+                RuntimeError::Program(format!(
+                    "owning module {owner} disappeared during replacement"
+                ))
+            })?;
+        self.module_programs
+            .insert(replacement.id, Arc::new(module));
+        Ok(generation)
     }
 
     pub fn windowed(console: HostConsole, display_events: Sender<DisplayEvent>) -> Self {
@@ -222,7 +806,9 @@ impl SwiDispatcher {
         display_task_id: u64,
         wimp: Option<Arc<WimpServer>>,
     ) -> Self {
-        Self {
+        let module_registry = ModuleRegistry::new();
+        let module_management_authority = module_registry.issue_module_management_authority();
+        let mut dispatcher = Self {
             mos: mos::MosState::default(),
             configure: ConfigureStore::default(),
             console,
@@ -239,7 +825,447 @@ impl SwiDispatcher {
             display_batch_active: false,
             last_display_batch_publish: None,
             last_inkey_poll: Instant::now(),
+            active_module: None,
+            module_registry,
+            module_management_authority,
+            module_programs: HashMap::new(),
+            resource_handles: HashMap::new(),
+            next_resource_handle: 1,
+            derived_targets: DerivedTargetCache::default(),
+            last_dispatch_route: None,
+            module_dispatch_count: 0,
+            transitional_dispatch_count: 0,
+            startup_target: None,
+            boot_failure: None,
+        };
+        if let Some(path) = std::env::var_os("ACORN_BOOT_CAPSULE") {
+            let path = std::path::PathBuf::from(path);
+            let display_path = path.display().to_string();
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    if let Err(failure) = dispatcher.bootstrap_capsule(&bytes) {
+                        dispatcher.boot_failure = Some(failure);
+                    }
+                }
+                Err(error) => {
+                    dispatcher.reset_boot_registry();
+                    dispatcher.boot_failure = Some(BootFailure::host_capsule_read(
+                        &display_path,
+                        error,
+                    ));
+                }
+            }
+        } else {
+            match embedded_capsule_bytes() {
+                Ok(bytes) => {
+                    if let Err(failure) = dispatcher.bootstrap_capsule(bytes) {
+                        dispatcher.boot_failure = Some(failure);
+                    }
+                }
+                Err(error) => {
+                    dispatcher.reset_boot_registry();
+                    dispatcher.boot_failure = Some(BootFailure::from_capsule(
+                        BootStage::CapsuleBuild,
+                        error,
+                    ));
+                }
+            }
         }
+        dispatcher
+    }
+
+    fn reset_boot_registry(&mut self) {
+        self.module_registry = ModuleRegistry::new();
+        self.module_management_authority = self.module_registry.issue_module_management_authority();
+        self.module_programs.clear();
+        self.active_module = None;
+        self.startup_target = None;
+        self.register_boot_primitives();
+    }
+
+    fn register_boot_primitives(&mut self) {
+        let byte = RegisterKind::Unsigned { bits: 8 };
+        let boolean = RegisterKind::Unsigned { bits: 1 };
+        let status = RegisterKind::Unsigned { bits: 32 };
+        self.module_registry
+            .primitives
+            .register(
+                "Host.Resource.ReadByte",
+                CapabilityName::new("ResourceRead").expect("static capability is valid"),
+                vec![
+                    RegisterKind::OpaqueHandle {
+                        type_name: "BufferHandle".into(),
+                    },
+                    RegisterKind::Unsigned { bits: 32 },
+                ],
+                vec![byte.clone()],
+                false,
+                true,
+                Vec::new(),
+                "InvalidHandleOrRange",
+            )
+            .expect("embedded resource primitive names are unique");
+        self.module_registry
+            .primitives
+            .require_resource_right("Host.Resource.ReadByte", 0, ResourceRight::Read)
+            .expect("resource byte reads declare read authority");
+        self.module_registry
+            .primitives
+            .register(
+                "Host.Graphics.AcceptByte",
+                CapabilityName::new("GraphicsVduStream").expect("static capability is valid"),
+                vec![byte.clone()],
+                vec![byte.clone(), boolean.clone()],
+                false,
+                true,
+                Vec::new(),
+                "RuntimeResult",
+            )
+            .expect("embedded Console primitive names are unique");
+        self.module_registry
+            .primitives
+            .register(
+                "Host.Console.ReadByteStatus",
+                CapabilityName::new("ConsoleInput").expect("static capability is valid"),
+                Vec::new(),
+                vec![byte.clone(), status],
+                true,
+                false,
+                Vec::new(),
+                "RuntimeResult<ByteOrEndOfInput>",
+            )
+            .expect("embedded Console primitive names are unique");
+        self.module_registry
+            .primitives
+            .register(
+                "Host.Console.SoftwareEcho",
+                CapabilityName::new("ConsoleInput").expect("static capability is valid"),
+                Vec::new(),
+                vec![boolean.clone()],
+                false,
+                true,
+                Vec::new(),
+                "Boolean",
+            )
+            .expect("embedded Console primitive names are unique");
+        self.module_registry
+            .primitives
+            .register(
+                "Host.Console.WriteByte",
+                CapabilityName::new("ConsoleOutput").expect("static capability is valid"),
+                vec![byte.clone()],
+                Vec::new(),
+                false,
+                true,
+                Vec::new(),
+                "RuntimeResult",
+            )
+            .expect("embedded Console primitive names are unique");
+        self.module_registry
+            .primitives
+            .register(
+                "Host.Runtime.EndOfInput",
+                CapabilityName::new("RuntimeErrors").expect("static capability is valid"),
+                Vec::new(),
+                Vec::new(),
+                false,
+                true,
+                Vec::new(),
+                "RuntimeError::EndOfInput",
+            )
+            .expect("embedded Console primitive names are unique");
+        self.module_registry
+            .primitives
+            .register(
+                "Host.Runtime.MissingTerminator",
+                CapabilityName::new("RuntimeErrors").expect("static capability is valid"),
+                vec![RegisterKind::LogicalAddress { bits: 32 }],
+                Vec::new(),
+                false,
+                true,
+                Vec::new(),
+                "RuntimeError::MissingNullTerminator",
+            )
+            .expect("embedded Console primitive names are unique");
+        self.module_registry
+            .primitives
+            .register(
+                "Host.Configuration.ReadStartupLanguage",
+                CapabilityName::new("StartupPolicy").expect("static capability is valid"),
+                Vec::new(),
+                vec![RegisterKind::Unsigned { bits: 32 }],
+                false,
+                true,
+                Vec::new(),
+                "RuntimeResult<StartupLanguage>",
+            )
+            .expect("embedded Boot primitive names are unique");
+        self.module_registry
+            .primitives
+            .register(
+                "Host.Boot.RequestMos",
+                CapabilityName::new("StartupPolicy").expect("static capability is valid"),
+                Vec::new(),
+                Vec::new(),
+                false,
+                true,
+                Vec::new(),
+                "RuntimeResult",
+            )
+            .expect("embedded Boot primitive names are unique");
+        self.module_registry
+            .primitives
+            .register(
+                "Host.Boot.RequestDesktop",
+                CapabilityName::new("StartupPolicy").expect("static capability is valid"),
+                Vec::new(),
+                Vec::new(),
+                false,
+                true,
+                Vec::new(),
+                "RuntimeResult",
+            )
+            .expect("embedded Boot primitive names are unique");
+    }
+
+    fn bootstrap_capsule(&mut self, bytes: &[u8]) -> Result<(), BootFailure> {
+        self.reset_boot_registry();
+        let result = self.bootstrap_capsule_inner(bytes);
+        if result.is_err() {
+            // Capsule publication is an initial-namespace transaction. If any
+            // start hook fails, discard every foundation export and workspace
+            // before exposing the restricted native recovery surface.
+            self.reset_boot_registry();
+        } else {
+            self.boot_failure = None;
+        }
+        result
+    }
+
+    fn bootstrap_capsule_inner(&mut self, bytes: &[u8]) -> Result<(), BootFailure> {
+        let capsule = BootCapsule::decode(bytes, RUNTIME_ABI_VERSION).map_err(|error| {
+            let mut failure = BootFailure::from_capsule(BootStage::CapsuleValidation, error);
+            failure.capsule_abi = read_capsule_abi(bytes);
+            failure.diagnostic_log.push(format!(
+                "capsule byte length: {}",
+                bytes.len()
+            ));
+            failure
+        })?;
+        for required in ["Console", "Boot"] {
+            if !capsule
+                .modules
+                .iter()
+                .any(|module| module.manifest.name.eq_ignore_ascii_case(required))
+            {
+                let mut failure = BootFailure::from_capsule(
+                    BootStage::ModuleValidation,
+                    format!("boot capsule is missing required {required} foundation module"),
+                );
+                failure.module = Some(required.into());
+                failure.capsule_abi = Some(capsule.runtime_abi);
+                return Err(failure);
+            }
+        }
+        if self.module_registry.registered_swi_count() != 0 {
+            return Err(BootFailure::from_capsule(
+                BootStage::Publication,
+                "initial SWI table was not empty before capsule linking",
+            ));
+        }
+
+        let ids_by_name = self.link_capsule_unpublished(&capsule)?;
+
+        let module_ids = capsule
+            .modules
+            .iter()
+            .map(|module| ids_by_name[&module.manifest.name.to_ascii_lowercase()])
+            .collect::<Vec<_>>();
+        self.module_registry
+            .publish_modules(&module_ids)
+            .map_err(|error| {
+                let mut failure = BootFailure::from_capsule(BootStage::Publication, error);
+                failure.capsule_abi = Some(capsule.runtime_abi);
+                failure
+            })?;
+
+        for index in capsule.start_order() {
+            let module_record = &capsule.modules[index];
+            let module_id = ids_by_name[&module_record.manifest.name.to_ascii_lowercase()];
+            self.module_registry
+                .begin_module_start(module_id)
+                .map_err(|error| {
+                    let mut failure = BootFailure::from_capsule(BootStage::Start, error);
+                    failure.module = Some(module_record.manifest.name.clone());
+                    failure.capsule_abi = Some(capsule.runtime_abi);
+                    failure
+                })?;
+            let module = self
+                .module_programs
+                .values()
+                .find(|module| {
+                    module
+                        .manifest
+                        .name
+                        .eq_ignore_ascii_case(&module_record.manifest.name)
+                })
+                .cloned()
+                .expect("boot module has a retained source program");
+            if let Err(error) = module.invoke_lifecycle_transactional(
+                "START",
+                module_id,
+                &mut Task::new(0),
+                self,
+            ) {
+                let mut failure = BootFailure::from_runtime(
+                    BootStage::Start,
+                    Some(module_record.manifest.name.clone()),
+                    module_record.manifest.lifecycle.start.clone(),
+                    &error,
+                    Some(capsule.runtime_abi),
+                );
+                failure.diagnostic_log.push(format!(
+                    "module exports: {}",
+                    module_record
+                        .manifest
+                        .exports
+                        .iter()
+                        .map(|export| format!("{} (&{:X})", export.name, export.number))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                return Err(failure);
+            }
+            self.module_registry
+                .complete_module_start(module_id)
+                .map_err(|error| {
+                    let mut failure = BootFailure::from_capsule(BootStage::Start, error);
+                    failure.module = Some(module_record.manifest.name.clone());
+                    failure.definition = module_record.manifest.lifecycle.start.clone();
+                    failure.capsule_abi = Some(capsule.runtime_abi);
+                    failure
+            })?;
+        }
+        if self.startup_target.is_none() {
+            let mut failure = BootFailure::from_capsule(
+                BootStage::Start,
+                "Boot.Start did not request either the MOS command environment or desktop",
+            );
+            failure.module = Some("Boot".into());
+            failure.definition = capsule
+                .modules
+                .iter()
+                .find(|module| module.manifest.name.eq_ignore_ascii_case("Boot"))
+                .and_then(|module| module.manifest.lifecycle.start.clone());
+            failure.capsule_abi = Some(capsule.runtime_abi);
+            return Err(failure);
+        }
+        Ok(())
+    }
+
+    fn link_capsule_unpublished(
+        &mut self,
+        capsule: &BootCapsule,
+    ) -> Result<HashMap<String, ModuleId>, BootFailure> {
+        if self.module_registry.registered_swi_count() != 0 {
+            return Err(BootFailure::from_capsule(
+                BootStage::Publication,
+                "native loader requires an empty public SWI table",
+            ));
+        }
+        let allocator = self.module_registry.allocator();
+        let mut ids_by_name = HashMap::new();
+        for module_record in &capsule.modules {
+            let module = SystemModule::parse(
+                &module_record.source,
+                module_record.source_path.clone(),
+                &allocator,
+            )
+            .map_err(|error| {
+                let mut failure = BootFailure::from_capsule(BootStage::ModuleValidation, error);
+                failure.module = Some(module_record.manifest.name.clone());
+                failure.capsule_abi = Some(capsule.runtime_abi);
+                failure
+            })?;
+            if module.manifest != module_record.manifest {
+                let mut failure = BootFailure::from_capsule(
+                    BootStage::ModuleValidation,
+                    "source-derived manifest differs from capsule manifest",
+                );
+                failure.module = Some(module_record.manifest.name.clone());
+                failure.capsule_abi = Some(capsule.runtime_abi);
+                return Err(failure);
+            }
+            module
+                .validate_primitive_shapes(&self.module_registry.primitives)
+                .map_err(|error| {
+                    let mut failure = BootFailure::from_runtime(
+                        BootStage::ModuleValidation,
+                        Some(module_record.manifest.name.clone()),
+                        None,
+                        &error,
+                        Some(capsule.runtime_abi),
+                    );
+                    failure.diagnostic_log.push(format!(
+                        "source: {}",
+                        module_record.source_path
+                    ));
+                    failure
+                })?;
+
+            // Grants in a capsule are still constrained by the host's reviewed
+            // boot policy; a selected capsule cannot invent authority.
+            validate_boot_grants(module_record.manifest.name.as_str(), &module_record.grants)
+                .map_err(|message| {
+                    let mut failure = BootFailure::from_capsule(BootStage::ModuleValidation, message);
+                    failure.module = Some(module_record.manifest.name.clone());
+                    failure.capsule_abi = Some(capsule.runtime_abi);
+                    failure
+                })?;
+            let module_id = self
+                .module_registry
+                .stage_module(module.manifest.clone(), module.definitions.clone())
+                .map_err(|error| {
+                    let mut failure = BootFailure::from_capsule(BootStage::ModuleValidation, error);
+                    failure.module = Some(module_record.manifest.name.clone());
+                    failure.capsule_abi = Some(capsule.runtime_abi);
+                    failure
+                })?;
+            ids_by_name.insert(module.manifest.name.to_ascii_lowercase(), module_id);
+            for definition in self
+                .module_registry
+                .module(module_id)
+                .expect("staged boot module exists")
+                .definitions
+                .values()
+            {
+                self.module_programs
+                    .insert(definition.id, Arc::new(module.clone()));
+            }
+        }
+
+        for module_record in &capsule.modules {
+            let module_id = ids_by_name[&module_record.manifest.name.to_ascii_lowercase()];
+            self.module_registry
+                .link_module(module_id, module_record.grants.clone())
+                .map_err(|error| {
+                    let mut failure = BootFailure::from_capsule(BootStage::Linking, error);
+                    failure.module = Some(module_record.manifest.name.clone());
+                    failure.capsule_abi = Some(capsule.runtime_abi);
+                    failure.diagnostic_log.push(format!(
+                        "primitive imports: {}",
+                        module_record
+                            .manifest
+                            .primitive_imports
+                            .iter()
+                            .map(|import| import.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                    failure
+                })?;
+        }
+        Ok(ids_by_name)
     }
 
     pub fn quit_requested(&self) -> bool {
@@ -305,11 +1331,141 @@ impl SwiDispatcher {
             .map_err(RuntimeError::Program)
     }
 
-    pub(crate) fn desktop_is_configured_for_startup(&self) -> Result<bool, RuntimeError> {
-        if self.desktop_service.is_none() {
+    pub(crate) fn desktop_is_configured_for_startup(&self) -> bool {
+        self.desktop_service.is_some()
+            && self.startup_target == Some(BootStartupTarget::Desktop)
+    }
+
+    pub(crate) fn has_boot_failure(&self) -> bool {
+        self.boot_failure.is_some()
+    }
+
+    /// Runs the restricted native recovery interface before any public SWI is
+    /// made available to the task. The only host-file operation is an
+    /// operator-selected capsule read; no normal guest path or CLI exists here.
+    pub(crate) fn recover_boot(&mut self) -> Result<bool, RuntimeError> {
+        while let Some(failure) = self.boot_failure.clone() {
+            self.native_recovery_write(b"Trellis native recovery\n\r")?;
+            self.native_recovery_write(failure.summary().as_bytes())?;
+            self.native_recovery_write(b"\n\r")?;
+            for line in &failure.diagnostic_log {
+                self.native_recovery_write(b"  ")?;
+                self.native_recovery_write(line.as_bytes())?;
+                self.native_recovery_write(b"\n\r")?;
+            }
+            self.native_recovery_write(
+                b"R retry embedded capsule; A <path> select alternate capsule; Q exit\n\r> ",
+            )?;
+            let Some(input) = self.native_recovery_read_line()? else {
+                return Ok(false);
+            };
+            let action = parse_recovery_action(&input);
+            let attempt = match action {
+                RecoveryAction::Exit => return Ok(false),
+                RecoveryAction::RetryEmbedded => match embedded_capsule_bytes() {
+                    Ok(bytes) => self.bootstrap_capsule(bytes),
+                    Err(error) => Err(BootFailure::from_capsule(BootStage::CapsuleBuild, error)),
+                },
+                RecoveryAction::SelectCapsule(path) if path.is_empty() => {
+                    self.native_recovery_write(b"alternate capsule path: ")?;
+                    let Some(path) = self.native_recovery_read_line()? else {
+                        return Ok(false);
+                    };
+                    self.try_alternate_capsule(path.trim())
+                }
+                RecoveryAction::SelectCapsule(path) => self.try_alternate_capsule(path.trim()),
+                RecoveryAction::Invalid => {
+                    self.native_recovery_write(
+                        b"Recovery accepts only R, A <capsule path>, or Q.\n\r",
+                    )?;
+                    continue;
+                }
+            };
+            match attempt {
+                Ok(()) => {
+                    self.boot_failure = None;
+                    return Ok(true);
+                }
+                Err(failure) => {
+                    self.boot_failure = Some(failure);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn try_alternate_capsule(&mut self, path: &str) -> Result<(), BootFailure> {
+        if path.is_empty() || path.len() > 4096 {
+            return Err(BootFailure::host_capsule_read(
+                path,
+                "capsule path must contain 1–4096 bytes",
+            ));
+        }
+        let bytes = std::fs::read(path)
+            .map_err(|error| BootFailure::host_capsule_read(path, error))?;
+        self.bootstrap_capsule(&bytes)
+    }
+
+    fn native_recovery_write(&mut self, bytes: &[u8]) -> Result<(), RuntimeError> {
+        for byte in bytes {
+            self.console.write_byte(*byte)?;
+            if self.display_events.is_some() {
+                self.publish_display_event(DisplayEvent::WriteByte {
+                    task_id: self.display_task_id,
+                    window_handle: None,
+                    byte: *byte,
+                });
+            }
+        }
+        self.console.flush().map_err(RuntimeError::from)
+    }
+
+    fn native_recovery_read_line(&mut self) -> Result<Option<String>, RuntimeError> {
+        let mut bytes = Vec::new();
+        loop {
+            let Some(byte) = self.console.read_byte()? else {
+                return if bytes.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+                };
+            };
+            match byte {
+                b'\r' | b'\n' => {
+                    self.native_recovery_write(b"\n\r")?;
+                    return Ok(Some(String::from_utf8_lossy(&bytes).into_owned()));
+                }
+                8 | 127 => {
+                    if bytes.pop().is_some() {
+                        self.native_recovery_write(b"\x08 \x08")?;
+                    }
+                }
+                byte if byte.is_ascii_graphic() || byte == b' ' => {
+                    if bytes.len() == 4096 {
+                        self.native_recovery_write(b"\x07")?;
+                    } else {
+                        bytes.push(byte);
+                        self.native_recovery_write(&[byte])?;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Materializes the startup request selected by the BASIC64 Boot module.
+    /// Rust does not read or interpret the saved Language value here.
+    pub(crate) fn enter_boot_startup(&mut self) -> Result<bool, RuntimeError> {
+        if self.startup_target != Some(BootStartupTarget::Desktop) {
             return Ok(false);
         }
-        Ok(self.load_basic_configuration()?.startup_language == StartupLanguage::Desktop)
+        if self.desktop_service.is_none() {
+            // --stdio deliberately remains the MOS recovery interface, even
+            // when a saved graphical startup preference is present.
+            return Ok(false);
+        }
+        self.begin_desktop()?;
+        Ok(true)
     }
 
     fn effective_configure_store(&self) -> ConfigureStore {
@@ -322,6 +1478,33 @@ impl SwiDispatcher {
     #[cfg(test)]
     pub(crate) fn set_configure_store_for_test(&mut self, configure: ConfigureStore) {
         self.configure = configure;
+        let Some(record) = self.module_registry.module_named("Boot") else {
+            return;
+        };
+        let module_id = record.id;
+        let source_path = record.manifest.source_path.clone();
+        let source_hash = record.manifest.source_hash.clone();
+        let Some(program) = self.module_programs.values().find(|program| {
+            program.manifest.name.eq_ignore_ascii_case("Boot")
+                && program.manifest.source_path == source_path
+                && program.manifest.source_hash == source_hash
+        }).cloned() else {
+            return;
+        };
+        if let Err(error) = program.invoke_lifecycle_transactional(
+            "START",
+            module_id,
+            &mut Task::new(0),
+            self,
+        ) {
+            self.boot_failure = Some(BootFailure::from_runtime(
+                BootStage::Start,
+                Some("Boot".into()),
+                Some("START".into()),
+                &error,
+                Some(RUNTIME_ABI_VERSION),
+            ));
+        }
     }
 
     #[cfg(test)]
@@ -412,18 +1595,248 @@ impl SwiDispatcher {
         Ok(())
     }
 
+    fn dispatch_module_owned_swi(
+        &mut self,
+        number: u32,
+        task: &mut Task,
+        context: &mut SwiContext,
+    ) -> Option<Result<(), RuntimeError>> {
+        let (ownership, definition) = match self.module_registry.acquire_swi(number) {
+            Some(acquired) => acquired,
+            None if self.module_registry.swi_entry_id(number).is_some() => {
+                return Some(Err(RuntimeError::Program(format!(
+                    "SWI &{number:X} is published but its owning module is not active"
+                ))));
+            }
+            None => return None,
+        };
+        let invocation = match self
+            .module_registry
+            .invocation_plan(number, InvocationBackend::Interpreter)
+        {
+            Ok(plan)
+                if plan.identity.definition == definition.id
+                    && plan.identity.generation == ownership.generation =>
+            {
+                plan
+            }
+            Ok(_) => {
+                return Some(Err(RuntimeError::Program(
+                    "interpreter target identity no longer matches the acquired definition generation".into(),
+                )));
+            }
+            Err(error) => return Some(Err(RuntimeError::Program(error.to_string()))),
+        };
+        self.module_dispatch_count = self.module_dispatch_count.saturating_add(1);
+        self.last_dispatch_route = Some(SwiDispatchRoute::ModuleOwned {
+            number,
+            name: ownership.name.clone(),
+            module: ownership.module_name.clone(),
+            definition: ownership.definition_name.clone(),
+            generation: ownership.generation_number,
+            backend: invocation.backend,
+        });
+        let Some(module) = self.module_programs.get(&definition.id).cloned() else {
+            return Some(Err(RuntimeError::Program(format!(
+                "module definition {} has no retained BASIC64 source",
+                definition.id
+            ))));
+        };
+        let result = module.invoke(
+            ownership.module,
+            &definition,
+            &ownership.contract,
+            task,
+            self,
+            context,
+        );
+        self.last_dispatch_route = Some(SwiDispatchRoute::ModuleOwned {
+            number,
+            name: ownership.name,
+            module: ownership.module_name,
+            definition: ownership.definition_name,
+            generation: ownership.generation_number,
+            backend: invocation.backend,
+        });
+        Some(result)
+    }
+
+    fn record_transitional_numeric_dispatch(&mut self, number: u32) {
+        self.transitional_dispatch_count = self.transitional_dispatch_count.saturating_add(1);
+        self.last_dispatch_route = Some(SwiDispatchRoute::TransitionalRust { number });
+    }
+
+    fn invoke_module_primitive(
+        &mut self,
+        name: &str,
+        task: &mut Task,
+        context: &mut SwiContext,
+    ) -> Result<(), RuntimeError> {
+        let module_id = self.active_module.ok_or_else(|| {
+            RuntimeError::Program(format!(
+                "primitive {name} was called outside a BASIC64 module invocation"
+            ))
+        })?;
+        let descriptor = self
+            .module_registry
+            .authorized_primitive(module_id, name)
+            .map_err(|error| RuntimeError::Program(error.to_string()))?;
+        if descriptor.arguments.len() > 10 {
+            return Err(RuntimeError::Program(format!(
+                "primitive {name} exceeds the checked register argument limit"
+            )));
+        }
+        for (index, kind) in descriptor.arguments.iter().enumerate() {
+            let value = context.registers[index];
+            let valid = match kind {
+                RegisterKind::Unsigned { bits } if *bits < 32 => value < (1_u32 << bits),
+                RegisterKind::Unsigned { .. } | RegisterKind::LogicalAddress { .. } => true,
+                RegisterKind::Signed { bits: 32 } => true,
+                RegisterKind::Signed { bits } if *bits < 32 => {
+                    let signed = value as i32;
+                    let bound = 1_i32 << (*bits - 1);
+                    (-bound..bound).contains(&signed)
+                }
+                RegisterKind::Signed { .. } => true,
+                RegisterKind::OpaqueHandle { type_name } => {
+                    let index = u8::try_from(index).unwrap_or(u8::MAX);
+                    let requirement = descriptor
+                        .resource_requirements
+                        .iter()
+                        .find(|requirement| requirement.argument_register == index)
+                        .ok_or_else(|| {
+                            RuntimeError::Program(format!(
+                                "primitive {name} has no resource-right contract for R{index}"
+                            ))
+                        })?;
+                    if !requirement.type_name.eq_ignore_ascii_case(type_name) {
+                        return Err(RuntimeError::Program(format!(
+                            "primitive {name} has inconsistent resource handle type metadata"
+                        )));
+                    }
+                    self.validate_resource_handle_access(
+                        value,
+                        type_name,
+                        task.id,
+                        requirement.right,
+                    )?;
+                    true
+                }
+            };
+            if !valid {
+                return Err(RuntimeError::Program(format!(
+                    "primitive {name} argument R{index} violates {kind:?}"
+                )));
+            }
+        }
+        match name.to_ascii_uppercase().as_str() {
+            "HOST.GRAPHICS.ACCEPTBYTE" => self.vdu_accept_byte(context),
+            "HOST.CONSOLE.WRITEBYTE" => {
+                self.console.write_byte(context.registers[R0] as u8)?;
+                self.console.flush().map_err(RuntimeError::from)
+            }
+            "HOST.CONSOLE.READBYTESTATUS" => self.console_read_byte_status(context),
+            "HOST.CONSOLE.SOFTWAREECHO" => {
+                context.registers[R0] = u32::from(self.console.software_echo());
+                Ok(())
+            }
+            "HOST.CONFIGURATION.READSTARTUPLANGUAGE" => {
+                let configuration = self.load_basic_configuration()?;
+                context.registers[R0] = match configuration.startup_language {
+                    StartupLanguage::Mos => 0,
+                    StartupLanguage::Desktop => 3,
+                };
+                Ok(())
+            }
+            "HOST.BOOT.REQUESTMOS" => {
+                self.startup_target = Some(BootStartupTarget::MosPrompt);
+                Ok(())
+            }
+            "HOST.BOOT.REQUESTDESKTOP" => {
+                self.startup_target = Some(BootStartupTarget::Desktop);
+                Ok(())
+            }
+            "HOST.RESOURCE.READBYTE" => {
+                context.registers[R0] = u32::from(self.read_resource_byte(
+                    context.registers[R0],
+                    "BufferHandle",
+                    task.id,
+                    context.registers[R1],
+                )?);
+                Ok(())
+            }
+            "HOST.RUNTIME.MISSINGTERMINATOR" => {
+                Err(crate::memory::MemoryError::MissingNullTerminator(context.registers[R0]).into())
+            }
+            "HOST.RUNTIME.ENDOFINPUT" => Err(RuntimeError::EndOfInput),
+            _ => Err(RuntimeError::Program(format!(
+                "primitive {name} has no host implementation"
+            ))),
+        }
+    }
+
+    fn vdu_accept_byte(&mut self, context: &mut SwiContext) -> Result<(), RuntimeError> {
+        let character = context.registers[R0] as u8;
+        if let Some(mode) = self.current_graphics().mode_after_vdu_byte(character) {
+            self.ensure_graphics_pixel_budget(
+                self.active_graphics_window,
+                u64::from(mode.pixel_width) * u64::from(mode.pixel_height),
+            )?;
+        }
+        let previous_mode = self.current_graphics().snapshot().mode;
+        let output_byte = self.current_graphics_mut().write_byte(character)?;
+        let mode_changed = self.current_graphics().snapshot().mode != previous_mode;
+        if mode_changed {
+            self.publish_snapshot(self.current_graphics().snapshot().clone());
+        } else if !self.display_batch_active || output_byte.is_some() {
+            self.publish_display_event(DisplayEvent::WriteByte {
+                task_id: self.display_task_id,
+                window_handle: self.active_graphics_window,
+                byte: character,
+            });
+        } else {
+            self.publish_snapshot(self.current_graphics().snapshot().clone());
+        }
+        context.registers[R0] = u32::from(output_byte.unwrap_or_default());
+        context.registers[R1] = u32::from(output_byte.is_some());
+        Ok(())
+    }
+
+    fn console_read_byte_status(&mut self, context: &mut SwiContext) -> Result<(), RuntimeError> {
+        let byte = match self.mos.input.pop_front() {
+            Some(byte) => Some(byte),
+            None => self.console.read_byte()?,
+        };
+        if let Some(byte) = byte {
+            context.registers[R0] = u32::from(byte);
+            context.registers[R1] = 0;
+            context.carry = byte == 0x1B;
+        } else {
+            context.registers[R0] = 0;
+            context.registers[R1] = 1;
+            context.carry = false;
+        }
+        Ok(())
+    }
+
     pub(crate) fn dispatch_named_swi(
         &mut self,
         name: &str,
         task: &mut Task,
         context: &mut SwiContext,
     ) -> Result<(), RuntimeError> {
-        match name {
+        if let Some(number) = self.module_registry.swi_number(name) {
+            return self.dispatch(number, task, context);
+        }
+        let result = match name {
             "OS_BYTE" => self.dispatch(OS_BYTE, task, context),
             "OS_WORD" => self.dispatch(OS_WORD, task, context),
             "OS_WRITEC" => self.dispatch(OS_WRITE_C, task, context),
+            "OS_WRITES" => self.dispatch(OS_WRITE_S, task, context),
+            "OS_WRITE0" => self.dispatch(OS_WRITE_0, task, context),
             "OS_NEWLINE" => self.dispatch(OS_NEW_LINE, task, context),
             "OS_READC" => self.dispatch(OS_READ_C, task, context),
+            "OS_READLINE" => self.dispatch(OS_READ_LINE, task, context),
             "OS_READPOINT" => self.dispatch(OS_READ_POINT, task, context),
             "OS_CLI" => self.dispatch(OS_CLI, task, context),
             "OS_FILE" => self.os_file(task, context),
@@ -473,7 +1886,13 @@ impl SwiDispatcher {
             _ => Err(RuntimeError::Program(format!(
                 "named SWI {name} is not available in the hosted profile"
             ))),
+        };
+        if !matches!(&result, Err(RuntimeError::InvalidSwi(_))) {
+            self.transitional_dispatch_count = self.transitional_dispatch_count.saturating_add(1);
+            self.last_dispatch_route =
+                Some(SwiDispatchRoute::TransitionalNamed { name: name.into() });
         }
+        result
     }
 
     pub fn dispatch(
@@ -482,6 +1901,9 @@ impl SwiDispatcher {
         task: &mut Task,
         context: &mut SwiContext,
     ) -> Result<(), RuntimeError> {
+        if let Some(result) = self.dispatch_module_owned_swi(number, task, context) {
+            return result;
+        }
         if matches!(
             number,
             WIMP_INITIALISE
@@ -504,9 +1926,10 @@ impl SwiDispatcher {
                 | WIMP_CLOSE_DOWN
                 | WIMP_START_TASK
         ) {
+            self.record_transitional_numeric_dispatch(number);
             return self.dispatch_wimp(number, task, context);
         }
-        match number {
+        let result = match number {
             OS_WRITE_C => {
                 let character = context.registers[R0] as u8;
                 if let Some(mode) = self.current_graphics().mode_after_vdu_byte(character) {
@@ -585,7 +2008,11 @@ impl SwiDispatcher {
                 Ok(())
             }
             other => Err(RuntimeError::InvalidSwi(other)),
+        };
+        if !matches!(&result, Err(RuntimeError::InvalidSwi(_))) {
+            self.record_transitional_numeric_dispatch(number);
         }
+        result
     }
 
     fn dispatch_wimp(
@@ -2258,25 +3685,7 @@ impl SwiDispatcher {
                 self.write_inline(task, b"Syntax: DESKTOP")?;
                 return self.write_new_line(task);
             }
-            let Some(wimp) = self.desktop_service.as_ref().cloned() else {
-                return Err(RuntimeError::Program(
-                    "DESKTOP requires the windowed host; restart without --stdio".into(),
-                ));
-            };
-
-            // Validate the saved preference at the desktop boundary, then
-            // make the same store available to BASIC tasks started by Wimp.
-            let configuration = self.load_basic_configuration()?;
-            self.desktop_service = None;
-            wimp.set_configure_store(self.configure.clone(), configuration.display);
-
-            self.desktop_requested = true;
-            self.wimp = Some(Arc::clone(&wimp));
-            self.publish_display_event(DisplayEvent::DesktopStarted);
-            // Keep the MOS/BASIC caller suspended at the command boundary while
-            // the shared Wimp desktop owns the hosted display.
-            wimp.wait_until_stopped()?;
-            Ok(())
+            self.begin_desktop()
         } else if cli_command_matches(verb, "FX")
             && arguments
                 .chars()
@@ -2291,6 +3700,28 @@ impl SwiDispatcher {
             self.write_inline(task, b"Bad command")?;
             self.write_new_line(task)
         }
+    }
+
+    fn begin_desktop(&mut self) -> Result<(), RuntimeError> {
+        let Some(wimp) = self.desktop_service.as_ref().cloned() else {
+            return Err(RuntimeError::Program(
+                "DESKTOP requires the windowed host; restart without --stdio".into(),
+            ));
+        };
+
+        // The BASIC64 Boot module decides whether this mechanism is requested;
+        // the host only binds the Wimp instance and transfers display ownership.
+        let configuration = self.load_basic_configuration()?;
+        self.desktop_service = None;
+        wimp.set_configure_store(self.configure.clone(), configuration.display);
+
+        self.desktop_requested = true;
+        self.wimp = Some(Arc::clone(&wimp));
+        self.publish_display_event(DisplayEvent::DesktopStarted);
+        // Keep the MOS/BASIC caller suspended at the command boundary while
+        // the shared Wimp desktop owns the hosted display.
+        wimp.wait_until_stopped()?;
+        Ok(())
     }
 
     fn execute_configure_command(
@@ -2649,11 +4080,193 @@ fn log_jit_report(command: &str, report: crate::basic_compat::JitExecutionReport
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::mpsc;
 
     use crate::display::{DesktopResolution, DisplayColour, DisplaySettings};
 
     use super::*;
+
+    #[test]
+    fn native_boot_linker_reaches_linked_unpublished_modules_from_empty_table() {
+        let (_input_sender, input_receiver) = mpsc::channel();
+        let (display_sender, _display_receiver) = mpsc::channel();
+        let mut dispatcher =
+            SwiDispatcher::windowed(HostConsole::windowed(input_receiver), display_sender);
+        let capsule = BootCapsule::decode(
+            embedded_capsule_bytes().unwrap(),
+            RUNTIME_ABI_VERSION,
+        )
+        .unwrap();
+        dispatcher.reset_boot_registry();
+        assert_eq!(dispatcher.module_registry.registered_swi_count(), 0);
+        let ids = dispatcher.link_capsule_unpublished(&capsule).unwrap();
+        assert_eq!(dispatcher.module_registry.registered_swi_count(), 0);
+        assert_eq!(ids.len(), capsule.modules.len());
+        for module in &capsule.modules {
+            let record = dispatcher
+                .module_registry
+                .module_named(&module.manifest.name)
+                .unwrap();
+            assert_eq!(record.state, ModuleState::Linked);
+        }
+    }
+
+    #[test]
+    fn basic64_boot_module_owns_command_vs_desktop_startup_selection() {
+        let (_input_sender, input_receiver) = mpsc::channel();
+        let (display_sender, _display_receiver) = mpsc::channel();
+        let (updates, _update_receiver) = mpsc::channel();
+        let wimp = WimpServer::new(updates);
+        let mut dispatcher = SwiDispatcher::windowed_with_desktop(
+            HostConsole::windowed(input_receiver),
+            display_sender,
+            wimp,
+        );
+        let path = std::env::temp_dir().join(format!(
+            "acorn-boot-policy-{}.configure",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let configure = ConfigureStore::with_path(&path);
+
+        configure.set("Language", "0").unwrap();
+        dispatcher.set_configure_store_for_test(configure.clone());
+        assert_eq!(dispatcher.startup_target, Some(BootStartupTarget::MosPrompt));
+        assert!(!dispatcher.desktop_is_configured_for_startup());
+
+        configure.set("Language", "3").unwrap();
+        dispatcher.set_configure_store_for_test(configure.clone());
+        assert_eq!(dispatcher.startup_target, Some(BootStartupTarget::Desktop));
+        assert!(dispatcher.desktop_is_configured_for_startup());
+
+        configure.set("Language", "0").unwrap();
+        dispatcher.set_configure_store_for_test(configure);
+        assert_eq!(dispatcher.startup_target, Some(BootStartupTarget::MosPrompt));
+        assert!(!dispatcher.desktop_is_configured_for_startup());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_foundation_start_rolls_back_the_complete_public_namespace() {
+        let console = "REM @BASIC64 MODE=BASIC64\nREM @SYSTEM_PROFILE 0.1\nREM @MODULE Console 1.0.0\nREM @SWI Test_Console &501 Entry\nDEF PROC Entry\nENDPROC\n";
+        let alpha = "REM @BASIC64 MODE=BASIC64\nREM @SYSTEM_PROFILE 0.1\nREM @MODULE Alpha 1.0.0\nREM @LIFECYCLE START Start\nREM @SWI Test_Alpha &500 Entry\nREM @PRIVATE PROC Start\nDEF PROC Start\nENDPROC\nDEF PROC Entry\nENDPROC\n";
+        let beta = "REM @BASIC64 MODE=BASIC64\nREM @SYSTEM_PROFILE 0.1\nREM @MODULE Beta 1.0.0\nREM @LIFECYCLE START Start\nREM @PRIVATE PROC Start\nDEF PROC Start\nSYS \"NoSuchStartupSwi\"\nENDPROC\n";
+        let bytes = BootCapsule::build(
+            RUNTIME_ABI_VERSION,
+            &[
+                crate::boot::BootModuleInput {
+                    source_path: "modules/Console.bas64",
+                    source: console,
+                    grants: &[],
+                },
+                crate::boot::BootModuleInput {
+                    source_path: "modules/Alpha.bas64",
+                    source: alpha,
+                    grants: &[],
+                },
+                crate::boot::BootModuleInput {
+                    source_path: "modules/Beta.bas64",
+                    source: beta,
+                    grants: &[],
+                },
+                crate::boot::BootModuleInput {
+                    source_path: "modules/Boot.bas64",
+                    source: include_str!("../modules/Boot.bas64"),
+                    grants: &["StartupPolicy"],
+                },
+            ],
+        )
+        .unwrap();
+        let (_input_sender, input_receiver) = mpsc::channel();
+        let (display_sender, _display_receiver) = mpsc::channel();
+        let mut dispatcher =
+            SwiDispatcher::windowed(HostConsole::windowed(input_receiver), display_sender);
+
+        let failure = dispatcher.bootstrap_capsule(&bytes).unwrap_err();
+
+        assert_eq!(failure.stage, BootStage::Start);
+        assert_eq!(failure.module.as_deref(), Some("Beta"));
+        assert_eq!(dispatcher.module_registry.registered_swi_count(), 0);
+        assert!(dispatcher.module_registry.module_named("Alpha").is_none());
+        assert!(dispatcher.module_registry.module_named("Beta").is_none());
+        assert!(dispatcher.module_registry.module_named("Console").is_none());
+        assert!(dispatcher.module_registry.module_named("Boot").is_none());
+        assert!(dispatcher.module_programs.is_empty());
+    }
+
+    #[test]
+    fn unresolved_primitive_import_fails_during_link_with_no_public_exports() {
+        let source = "REM @BASIC64 MODE=BASIC64\nREM @SYSTEM_PROFILE 0.1\nREM @MODULE Console 1.0.0\nREM @CAPABILITY ConsoleOutput\nREM @IMPORT Host.Console.MissingPrimitive ConsoleOutput\nREM @SWI Test_Console &510 Entry\nDEF PROC Entry\nENDPROC\n";
+        let bytes = BootCapsule::build(
+            RUNTIME_ABI_VERSION,
+            &[
+                crate::boot::BootModuleInput {
+                    source_path: "modules/Console.bas64",
+                    source,
+                    grants: &["ConsoleOutput"],
+                },
+                crate::boot::BootModuleInput {
+                    source_path: "modules/Boot.bas64",
+                    source: include_str!("../modules/Boot.bas64"),
+                    grants: &["StartupPolicy"],
+                },
+            ],
+        )
+        .unwrap();
+        let (_input_sender, input_receiver) = mpsc::channel();
+        let (display_sender, _display_receiver) = mpsc::channel();
+        let mut dispatcher =
+            SwiDispatcher::windowed(HostConsole::windowed(input_receiver), display_sender);
+
+        let failure = dispatcher.bootstrap_capsule(&bytes).unwrap_err();
+
+        assert_eq!(failure.stage, BootStage::Linking);
+        assert_eq!(failure.module.as_deref(), Some("Console"));
+        assert!(failure.cause_message.contains("not registered"));
+        assert_eq!(dispatcher.module_registry.registered_swi_count(), 0);
+    }
+
+    #[test]
+    fn native_recovery_can_select_and_retry_an_alternate_capsule_without_swis() {
+        let path = std::env::temp_dir().join(format!(
+            "acorn-boot-recovery-{}-{}.capsule",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, embedded_capsule_bytes().unwrap()).unwrap();
+        let (input_sender, input_receiver) = mpsc::channel();
+        for byte in format!("A {}\r", path.display()).bytes() {
+            input_sender.send(byte).unwrap();
+        }
+        drop(input_sender);
+        let (display_sender, display_receiver) = mpsc::channel();
+        let mut dispatcher =
+            SwiDispatcher::windowed(HostConsole::windowed(input_receiver), display_sender);
+        let corrupt = [0_u8; 32];
+        let failure = dispatcher.bootstrap_capsule(&corrupt).unwrap_err();
+        dispatcher.boot_failure = Some(failure);
+        assert_eq!(dispatcher.module_registry.registered_swi_count(), 0);
+
+        assert!(dispatcher.recover_boot().unwrap());
+
+        assert!(dispatcher.boot_failure.is_none());
+        assert_eq!(dispatcher.module_registry.registered_swi_count(), 6);
+        let recovery_output = display_receiver
+            .try_iter()
+            .filter_map(|event| match event {
+                DisplayEvent::WriteByte { byte, .. } => Some(byte),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(recovery_output
+            .windows("Trellis native recovery".len())
+            .any(|bytes| bytes == b"Trellis native recovery"));
+        assert!(recovery_output
+            .windows(b"capsule validation".len())
+            .any(|bytes| bytes == b"capsule validation"));
+        let _ = std::fs::remove_file(path);
+    }
 
     fn put_word(block: &mut [u8], offset: usize, value: u32) {
         block[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
@@ -2800,6 +4413,878 @@ mod tests {
         let mut context = SwiContext::default();
         context.registers[R0] = CLI_STRING_BUFFER;
         dispatcher.dispatch(OS_CLI, task, &mut context)
+    }
+
+    #[test]
+    fn console_swis_dispatch_through_interpreted_module_definitions() {
+        let (input_sender, input_receiver) = mpsc::channel();
+        let (display_sender, display_receiver) = mpsc::channel();
+        let mut dispatcher =
+            SwiDispatcher::windowed(HostConsole::windowed(input_receiver), display_sender);
+        let mut task = Task::new(42);
+
+        let mut write = SwiContext::default();
+        write.registers[R0] = u32::from(b'A');
+        dispatcher
+            .dispatch(OS_WRITE_C, &mut task, &mut write)
+            .unwrap();
+        assert_eq!(
+            dispatcher.last_dispatch_route(),
+            Some(&SwiDispatchRoute::ModuleOwned {
+                number: OS_WRITE_C,
+                name: "OS_WriteC".into(),
+                module: "Console".into(),
+                definition: "WRITEC".into(),
+                generation: 1,
+                backend: InvocationBackend::Interpreter,
+            })
+        );
+        assert!(matches!(
+            display_receiver.try_recv().unwrap(),
+            DisplayEvent::WriteByte { byte: b'A', .. }
+        ));
+
+        task.memory.write_bytes(0x2000, b"BASIC\0").unwrap();
+        let mut write0 = SwiContext::default();
+        write0.registers[R0] = 0x2000;
+        dispatcher
+            .dispatch(OS_WRITE_0, &mut task, &mut write0)
+            .unwrap();
+        assert_eq!(write0.registers[R0], 0x2006);
+        assert!(
+            matches!(dispatcher.last_dispatch_route(), Some(SwiDispatchRoute::ModuleOwned { name, definition, .. }) if name == "OS_Write0" && definition == "WRITE0")
+        );
+
+        task.memory.write_bytes(0x2100, b"X\0\0\0").unwrap();
+        let mut write_s = SwiContext {
+            pc: 0x2100,
+            ..SwiContext::default()
+        };
+        dispatcher
+            .dispatch(OS_WRITE_S, &mut task, &mut write_s)
+            .unwrap();
+        assert_eq!(write_s.pc, 0x2104);
+
+        let mut newline = SwiContext::default();
+        dispatcher
+            .dispatch(OS_NEW_LINE, &mut task, &mut newline)
+            .unwrap();
+        assert!(
+            matches!(dispatcher.last_dispatch_route(), Some(SwiDispatchRoute::ModuleOwned { name, .. }) if name == "OS_NewLine")
+        );
+        input_sender.send(0x1B).unwrap();
+        let mut read = SwiContext::default();
+        dispatcher
+            .dispatch(OS_READ_C, &mut task, &mut read)
+            .unwrap();
+        assert_eq!(read.registers[R0], 0x1B);
+        assert!(read.carry);
+        assert_eq!(dispatcher.module_dispatch_count(), 5);
+        assert_eq!(dispatcher.transitional_dispatch_count(), 0);
+    }
+
+    #[test]
+    fn console_string_swi_enforces_the_declared_terminator_bound() {
+        let (_input_sender, input_receiver) = mpsc::channel();
+        let (display_sender, _display_receiver) = mpsc::channel();
+        let mut dispatcher =
+            SwiDispatcher::windowed(HostConsole::windowed(input_receiver), display_sender);
+        let mut task = Task::new(44);
+        let address = 0x3000;
+        task.memory.write_bytes(address, &vec![b'X'; 4096]).unwrap();
+        let mut write0 = SwiContext::default();
+        write0.registers[R0] = address;
+
+        let error = dispatcher
+            .dispatch(OS_WRITE_0, &mut task, &mut write0)
+            .unwrap_err();
+        assert!(
+            matches!(error, RuntimeError::Memory(crate::memory::MemoryError::MissingNullTerminator(found)) if found == address)
+        );
+
+        let mut write_s = SwiContext {
+            pc: address,
+            ..SwiContext::default()
+        };
+        let error = dispatcher
+            .dispatch(OS_WRITE_S, &mut task, &mut write_s)
+            .unwrap_err();
+        assert!(
+            matches!(error, RuntimeError::Memory(crate::memory::MemoryError::MissingNullTerminator(found)) if found == address)
+        );
+    }
+
+    #[test]
+    fn os_read_line_is_a_module_definition_with_checked_caller_memory() {
+        let (input_sender, input_receiver) = mpsc::channel();
+        let (display_sender, display_receiver) = mpsc::channel();
+        let mut dispatcher =
+            SwiDispatcher::windowed(HostConsole::windowed(input_receiver), display_sender);
+        let mut task = Task::new(46);
+        let buffer = 0x5000;
+        task.memory.write_bytes(buffer, &[0; 16]).unwrap();
+        for byte in [b'a', b'b', 8, b'c', 0x1B] {
+            input_sender.send(byte).unwrap();
+        }
+        let mut context = SwiContext::default();
+        context.registers[R0] = buffer;
+        context.registers[R1] = 8;
+        context.registers[R2] = 32;
+        context.registers[R3] = 126;
+        dispatcher
+            .dispatch(OS_READ_LINE, &mut task, &mut context)
+            .unwrap();
+        assert_eq!(task.memory.read_bytes(buffer, 3).unwrap(), b"ac\0");
+        assert_eq!(context.registers[R0], 0);
+        assert_eq!(context.registers[R1], 2);
+        assert!(context.carry);
+        assert!(matches!(
+            dispatcher.last_dispatch_route(),
+            Some(SwiDispatchRoute::ModuleOwned { name, definition, .. })
+                if name == "OS_ReadLine" && definition == "READLINE"
+        ));
+        let written = display_receiver
+            .try_iter()
+            .filter_map(|event| match event {
+                DisplayEvent::WriteByte { byte, .. } => Some(byte),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(written.contains(&b'a'));
+        assert!(written.contains(&b'b'));
+        assert!(written.contains(&b'c'));
+        assert!(written.windows(3).any(|window| window == [8, b' ', 8]));
+    }
+
+    #[test]
+    fn linked_module_proc_and_fn_imports_are_executable_and_scoped() {
+        let provider_source = "REM @BASIC64 MODE=BASIC64\nREM @SYSTEM_PROFILE 0.1\nREM @MODULE Counter 1.0.0\nREM @STATE COUNT UINT64\nREM @SWI Counter_Test &700 ProviderEntry\nREM @EXPORT PROC Increment\nREM @EXPORT FN ReadCount\nDEF PROC ProviderEntry\nENDPROC\nDEF PROC Increment\n    COUNT = COUNT + 1\nENDPROC\nDEF FN ReadCount() AS UINT64\n=COUNT\n";
+        let consumer_source = "REM @BASIC64 MODE=BASIC64\nREM @SYSTEM_PROFILE 0.1\nREM @MODULE CounterClient 1.0.0\nREM @IMPORT_MODULE Counter 1.0.0\nREM @IMPORT_SYMBOL Counter PROC Increment\nREM @IMPORT_SYMBOL Counter FN ReadCount\nREM @STATE RESULT UINT64\nREM @STATE CHECK% UINT32\nREM @SWI CounterClient_Test &701 Entry\nDEF PROC Entry\n    PROC Counter.Increment\n    RESULT = FN Counter.ReadCount()\n    IF RESULT = 1 THEN CHECK% = 1\nENDPROC\n";
+        let mut dispatcher = SwiDispatcher::new(HostConsole::stdio());
+        let allocator = dispatcher.module_registry.allocator();
+        let provider =
+            SystemModule::parse(provider_source, "modules/Counter.bas64", &allocator).unwrap();
+        let provider = Arc::new(provider);
+        let provider_id = dispatcher
+            .module_registry
+            .stage_module(provider.manifest.clone(), provider.definitions.clone())
+            .unwrap();
+        for definition in dispatcher
+            .module_registry
+            .module(provider_id)
+            .unwrap()
+            .definitions
+            .values()
+        {
+            dispatcher
+                .module_programs
+                .insert(definition.id, Arc::clone(&provider));
+        }
+        dispatcher
+            .module_registry
+            .link_module(provider_id, BTreeSet::new())
+            .unwrap();
+        dispatcher
+            .module_registry
+            .publish_modules(&[provider_id])
+            .unwrap();
+        dispatcher
+            .module_registry
+            .start_module(provider_id, true)
+            .unwrap();
+
+        let consumer = SystemModule::parse(
+            consumer_source,
+            "modules/CounterClient.bas64",
+            &dispatcher.module_registry.allocator(),
+        )
+        .unwrap();
+        let consumer = Arc::new(consumer);
+        let consumer_id = dispatcher
+            .module_registry
+            .stage_module(consumer.manifest.clone(), consumer.definitions.clone())
+            .unwrap();
+        for definition in dispatcher
+            .module_registry
+            .module(consumer_id)
+            .unwrap()
+            .definitions
+            .values()
+        {
+            dispatcher
+                .module_programs
+                .insert(definition.id, Arc::clone(&consumer));
+        }
+        dispatcher
+            .module_registry
+            .link_module(consumer_id, BTreeSet::new())
+            .unwrap();
+        dispatcher
+            .module_registry
+            .publish_modules(&[consumer_id])
+            .unwrap();
+        dispatcher
+            .module_registry
+            .start_module(consumer_id, true)
+            .unwrap();
+
+        let mut task = Task::new(81);
+        dispatcher
+            .dispatch(0x701, &mut task, &mut SwiContext::default())
+            .unwrap();
+        assert_eq!(provider.test_read_workspace_number("COUNT"), Some(1.0));
+        assert_eq!(consumer.test_read_workspace_number("RESULT"), Some(1.0));
+        assert_eq!(consumer.test_read_workspace_number("CHECK%"), Some(1.0));
+    }
+
+    #[test]
+    fn opaque_resource_handles_check_identity_owner_and_rights_when_used() {
+        let source = "REM @BASIC64 MODE=BASIC64\nREM @SYSTEM_PROFILE 0.1\nREM @MODULE ResourceReader 1.0.0\nREM @CAPABILITY ResourceRead\nREM @IMPORT Host.Resource.ReadByte ResourceRead\nREM @SWI Resource_Read &702 ReadByteAt REGISTERS=R0:HANDLE<BufferHandle>:IN|R1:U32:IN|R2:U32:OUT\nHANDLE BufferHandle\nDEF PROC ReadByteAt\n    PRIMITIVE Host.Resource.ReadByte, R0%, R1% TO BYTE%\n    R2% = BYTE%\nENDPROC\n";
+        let mut dispatcher = SwiDispatcher::new(HostConsole::stdio());
+        let module = SystemModule::parse(
+            source,
+            "modules/ResourceReader.bas64",
+            &dispatcher.module_registry.allocator(),
+        )
+        .unwrap();
+        module
+            .validate_primitive_shapes(&dispatcher.module_registry.primitives)
+            .unwrap();
+        let module = Arc::new(module);
+        let module_id = dispatcher
+            .module_registry
+            .stage_module(module.manifest.clone(), module.definitions.clone())
+            .unwrap();
+        for definition in dispatcher
+            .module_registry
+            .module(module_id)
+            .unwrap()
+            .definitions
+            .values()
+        {
+            dispatcher
+                .module_programs
+                .insert(definition.id, Arc::clone(&module));
+        }
+        dispatcher
+            .module_registry
+            .link_module(
+                module_id,
+                BTreeSet::from([
+                    CapabilityName::new("ResourceRead").expect("test capability is valid")
+                ]),
+            )
+            .unwrap();
+        dispatcher
+            .module_registry
+            .publish_modules(&[module_id])
+            .unwrap();
+        dispatcher
+            .module_registry
+            .start_module(module_id, true)
+            .unwrap();
+
+        let mut task = Task::new(82);
+        let handle = dispatcher
+            .register_resource_buffer("BufferHandle", task.id, vec![0x5A], [ResourceRight::Read])
+            .unwrap();
+        let mut context = SwiContext::default();
+        context.registers[0] = handle;
+        dispatcher.dispatch(0x702, &mut task, &mut context).unwrap();
+        assert_eq!(context.registers[2], 0x5A);
+
+        let no_rights = dispatcher
+            .register_resource_buffer("BufferHandle", task.id, vec![0x2A], [])
+            .unwrap();
+        let mut denied = SwiContext::default();
+        denied.registers[0] = no_rights;
+        let error = dispatcher
+            .dispatch(0x702, &mut task, &mut denied)
+            .unwrap_err();
+        assert!(error.to_string().contains("lacks Read authority"));
+
+        let foreign = dispatcher
+            .register_resource_buffer(
+                "BufferHandle",
+                task.id + 1,
+                vec![0x2A],
+                [ResourceRight::Read],
+            )
+            .unwrap();
+        let mut wrong_owner = SwiContext::default();
+        wrong_owner.registers[0] = foreign;
+        let error = dispatcher
+            .dispatch(0x702, &mut task, &mut wrong_owner)
+            .unwrap_err();
+        assert!(error.to_string().contains("different caller task"));
+
+        let mut forged = SwiContext::default();
+        forged.registers[0] = u32::MAX;
+        let error = dispatcher
+            .dispatch(0x702, &mut task, &mut forged)
+            .unwrap_err();
+        assert!(error.to_string().contains("not registered"));
+    }
+
+    #[test]
+    fn os_read_line_preserves_eof_and_range_echo_contracts() {
+        let (input_sender, input_receiver) = mpsc::channel();
+        let (display_sender, display_receiver) = mpsc::channel();
+        let mut dispatcher =
+            SwiDispatcher::windowed(HostConsole::windowed(input_receiver), display_sender);
+        let mut task = Task::new(48);
+        let buffer = 0x5200;
+        input_sender.send(b'a').unwrap();
+        input_sender.send(b'3').unwrap();
+        input_sender.send(b'4').unwrap();
+        input_sender.send(b'5').unwrap();
+        input_sender.send(b'\r').unwrap();
+        drop(input_sender);
+        let mut context = SwiContext::default();
+        context.registers[R0] = buffer | (1 << 31);
+        context.registers[R1] = 2;
+        context.registers[R2] = u32::from(b'0');
+        context.registers[R3] = u32::from(b'9');
+        dispatcher
+            .dispatch(OS_READ_LINE, &mut task, &mut context)
+            .unwrap();
+        assert_eq!(task.memory.read_bytes(buffer, 2).unwrap(), b"34");
+        assert_eq!(context.registers[R1], 2);
+        assert!(!context.carry);
+        let output = display_receiver
+            .try_iter()
+            .filter_map(|event| match event {
+                DisplayEvent::WriteByte { byte, .. } => Some(byte),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(output.contains(&b'3'));
+        assert!(output.contains(&b'4'));
+        assert!(output.contains(&7));
+        assert!(!output.contains(&b'a'));
+        assert!(!output.contains(&b'5'));
+
+        let (eof_sender, eof_receiver) = mpsc::channel();
+        let (eof_display_sender, eof_display_receiver) = mpsc::channel();
+        let mut eof_dispatcher =
+            SwiDispatcher::windowed(HostConsole::windowed(eof_receiver), eof_display_sender);
+        let mut eof_task = Task::new(49);
+        eof_sender.send(b'x').unwrap();
+        drop(eof_sender);
+        let mut eof_context = SwiContext::default();
+        eof_context.registers[R0] = 0x5300;
+        eof_context.registers[R1] = 4;
+        eof_context.registers[R2] = 32;
+        eof_context.registers[R3] = 126;
+        eof_dispatcher
+            .dispatch(OS_READ_LINE, &mut eof_task, &mut eof_context)
+            .unwrap();
+        assert_eq!(eof_task.memory.read_byte(0x5300).unwrap(), b'x');
+        assert_eq!(eof_context.registers[R1], 1);
+        assert!(!eof_context.carry);
+        let eof_output = eof_display_receiver
+            .try_iter()
+            .filter_map(|event| match event {
+                DisplayEvent::WriteByte { byte, .. } => Some(byte),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(eof_output, [b'x']);
+    }
+
+    #[test]
+    fn os_read_line_keeps_legacy_range_clamping_and_control_d_behavior() {
+        let (range_sender, range_receiver) = mpsc::channel();
+        let (range_display_sender, _range_display_receiver) = mpsc::channel();
+        let mut range_dispatcher =
+            SwiDispatcher::windowed(HostConsole::windowed(range_receiver), range_display_sender);
+        let mut range_task = Task::new(51);
+        range_sender.send(1).unwrap();
+        range_sender.send(b'\r').unwrap();
+        let mut range_context = SwiContext::default();
+        range_context.registers[R0] = 0x5400;
+        range_context.registers[R1] = 4;
+        range_context.registers[R2] = 0x101;
+        range_context.registers[R3] = 0x1FF;
+        range_dispatcher
+            .dispatch(OS_READ_LINE, &mut range_task, &mut range_context)
+            .unwrap();
+        assert_eq!(range_context.registers[R1], 0);
+
+        let (control_sender, control_receiver) = mpsc::channel();
+        let (control_display_sender, _control_display_receiver) = mpsc::channel();
+        let mut control_dispatcher = SwiDispatcher::windowed(
+            HostConsole::windowed(control_receiver),
+            control_display_sender,
+        );
+        let mut control_task = Task::new(52);
+        control_sender.send(b'a').unwrap();
+        control_sender.send(4).unwrap();
+        control_sender.send(b'\r').unwrap();
+        let mut control_context = SwiContext::default();
+        control_context.registers[R0] = 0x5500;
+        control_context.registers[R1] = 4;
+        control_context.registers[R2] = 0;
+        control_context.registers[R3] = 255;
+        control_dispatcher
+            .dispatch(OS_READ_LINE, &mut control_task, &mut control_context)
+            .unwrap();
+        assert_eq!(control_context.registers[R1], 2);
+        assert_eq!(
+            control_task.memory.read_bytes(0x5500, 2).unwrap(),
+            [b'a', 4]
+        );
+    }
+
+    #[test]
+    fn os_read_line_substitutes_r4_for_echo_without_changing_buffered_input() {
+        let (input_sender, input_receiver) = mpsc::channel();
+        let (display_sender, display_receiver) = mpsc::channel();
+        let mut dispatcher =
+            SwiDispatcher::windowed(HostConsole::windowed(input_receiver), display_sender);
+        let mut task = Task::new(53);
+        let buffer = 0x5600;
+        input_sender.send(b'a').unwrap();
+        input_sender.send(b'\r').unwrap();
+        let mut context = SwiContext::default();
+        context.registers[R0] = buffer | READ_LINE_ECHO_R4;
+        context.registers[R1] = 4;
+        context.registers[R2] = 0;
+        context.registers[R3] = 255;
+        context.registers[R4] = u32::from(b'*');
+
+        dispatcher
+            .dispatch(OS_READ_LINE, &mut task, &mut context)
+            .unwrap();
+
+        assert_eq!(task.memory.read_byte(buffer).unwrap(), b'a');
+        assert_eq!(context.registers[R1], 1);
+        let output = display_receiver
+            .try_iter()
+            .filter_map(|event| match event {
+                DisplayEvent::WriteByte { byte, .. } => Some(byte),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(output.contains(&b'*'));
+        assert!(!output.contains(&b'a'));
+    }
+
+    #[test]
+    fn os_read_line_reports_caller_memory_boundary_failures() {
+        let (input_sender, input_receiver) = mpsc::channel();
+        let (display_sender, _display_receiver) = mpsc::channel();
+        let mut dispatcher =
+            SwiDispatcher::windowed(HostConsole::windowed(input_receiver), display_sender);
+        let mut task = Task::new(50);
+        input_sender.send(b'a').unwrap();
+        input_sender.send(b'b').unwrap();
+        let buffer = crate::memory::GUEST_MEMORY_BASE
+            + u32::try_from(crate::memory::GUEST_MEMORY_SIZE).unwrap()
+            - 1;
+        let mut context = SwiContext::default();
+        context.registers[R0] = buffer;
+        context.registers[R1] = 2;
+        context.registers[R2] = 32;
+        context.registers[R3] = 126;
+        let error = dispatcher
+            .dispatch(OS_READ_LINE, &mut task, &mut context)
+            .unwrap_err();
+        assert!(matches!(error, RuntimeError::Memory(_)));
+        assert_eq!(task.memory.read_byte(buffer).unwrap(), b'a');
+    }
+
+    #[test]
+    fn internal_module_manager_runs_console_quiesce_and_finalise_hooks() {
+        let (_input_sender, input_receiver) = mpsc::channel();
+        let mut dispatcher = SwiDispatcher::new(HostConsole::windowed(input_receiver));
+        let console = dispatcher
+            .module_programs
+            .values()
+            .next()
+            .expect("Console source retained")
+            .clone();
+        assert_eq!(console.workspace_number("STARTCOUNT%"), Some(1.0));
+        let mut task = Task::new(47);
+        dispatcher
+            .basic64_module_manager()
+            .quiesce("Console", &mut task)
+            .unwrap();
+        dispatcher
+            .basic64_module_manager()
+            .retire("Console", &mut task)
+            .unwrap();
+        assert_eq!(console.workspace_number("QUIESCECOUNT%"), Some(1.0));
+        assert_eq!(console.workspace_number("FINALISECOUNT%"), Some(1.0));
+        assert_eq!(dispatcher.module_registry().registered_swi_count(), 0);
+        assert!(
+            dispatcher
+                .module_registry()
+                .acquire_swi(OS_WRITE_C)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn failing_quiesce_restores_active_state_workspace_and_swi_admission() {
+        let (_input_sender, input_receiver) = mpsc::channel();
+        let (display_sender, display_receiver) = mpsc::channel();
+        let mut dispatcher =
+            SwiDispatcher::windowed(HostConsole::windowed(input_receiver), display_sender);
+        let original = include_str!("../modules/Console.bas64");
+        let failing = original
+            .replace(
+                "DEF PROC Start\n",
+                "ERROR LifecycleFailure\n    Code AS UINT32 READONLY\n    Message AS STRING READONLY\nEND ERROR\n\nDEF PROC Start\n",
+            )
+            .replace(
+                "DEF PROC Quiesce\n    QUIESCECOUNT% = QUIESCECOUNT% + 1\nENDPROC",
+                "DEF PROC Quiesce THROWS LifecycleFailure\n    QUIESCECOUNT% = QUIESCECOUNT% + 1\n    THROW LifecycleFailure, 99, \"quiesce denied\"\nENDPROC",
+            );
+        assert_ne!(failing, original);
+        dispatcher
+            .basic64_module_manager()
+            .replace_swi_definition(
+                OS_WRITE_C,
+                &failing,
+                "modules/Console.quiesce-failure.bas64",
+            )
+            .unwrap();
+
+        let current = dispatcher
+            .module_registry()
+            .current_swi_definition(OS_WRITE_C)
+            .unwrap();
+        let module_program = dispatcher.module_programs[&current.id].clone();
+        let mut task = Task::new(53);
+        let error = dispatcher
+            .basic64_module_manager()
+            .quiesce("Console", &mut task)
+            .unwrap_err();
+        assert!(error.to_string().contains("quiesce denied"));
+        assert_eq!(module_program.workspace_number("QUIESCECOUNT%"), Some(0.0));
+        assert_eq!(
+            dispatcher
+                .module_registry()
+                .module_named("Console")
+                .unwrap()
+                .state,
+            crate::trellis::ModuleState::Active
+        );
+        assert_eq!(dispatcher.module_registry().registered_swi_count(), 6);
+        assert!(
+            dispatcher
+                .module_registry()
+                .acquire_swi(OS_WRITE_C)
+                .is_some()
+        );
+
+        let mut context = SwiContext::default();
+        context.registers[R0] = u32::from(b'Q');
+        dispatcher
+            .dispatch(OS_WRITE_C, &mut task, &mut context)
+            .unwrap();
+        assert!(
+            display_receiver
+                .try_iter()
+                .any(|event| matches!(event, DisplayEvent::WriteByte { byte: b'Q', .. }))
+        );
+
+        dispatcher
+            .basic64_module_manager()
+            .replace_swi_definition(OS_WRITE_C, original, "modules/Console.bas64")
+            .unwrap();
+        dispatcher
+            .basic64_module_manager()
+            .quiesce("Console", &mut task)
+            .unwrap();
+        assert_eq!(module_program.workspace_number("QUIESCECOUNT%"), Some(1.0));
+    }
+
+    #[test]
+    fn failing_finalise_keeps_quiesced_module_retryable_without_partial_cleanup() {
+        let (_input_sender, input_receiver) = mpsc::channel();
+        let mut dispatcher = SwiDispatcher::new(HostConsole::windowed(input_receiver));
+        let original = include_str!("../modules/Console.bas64");
+        let failing = original
+            .replace(
+                "DEF PROC Start\n",
+                "ERROR LifecycleFailure\n    Code AS UINT32 READONLY\n    Message AS STRING READONLY\nEND ERROR\n\nDEF PROC Start\n",
+            )
+            .replace(
+                "DEF PROC Finalise\n    FINALISECOUNT% = FINALISECOUNT% + 1\nENDPROC",
+                "DEF PROC Finalise THROWS LifecycleFailure\n    FINALISECOUNT% = FINALISECOUNT% + 1\n    THROW LifecycleFailure, 99, \"finalise denied\"\nENDPROC",
+            );
+        dispatcher
+            .basic64_module_manager()
+            .replace_swi_definition(
+                OS_WRITE_C,
+                &failing,
+                "modules/Console.finalise-failure.bas64",
+            )
+            .unwrap();
+
+        let current = dispatcher
+            .module_registry()
+            .current_swi_definition(OS_WRITE_C)
+            .unwrap();
+        let module_program = dispatcher.module_programs[&current.id].clone();
+        let mut task = Task::new(54);
+        let error = dispatcher
+            .basic64_module_manager()
+            .retire("Console", &mut task)
+            .unwrap_err();
+        assert!(error.to_string().contains("must be quiesced"));
+        assert_eq!(module_program.workspace_number("FINALISECOUNT%"), Some(0.0));
+        assert_eq!(dispatcher.module_registry().registered_swi_count(), 6);
+        assert_eq!(
+            dispatcher
+                .module_registry()
+                .module_named("Console")
+                .unwrap()
+                .state,
+            ModuleState::Active
+        );
+        dispatcher
+            .basic64_module_manager()
+            .quiesce("Console", &mut task)
+            .unwrap();
+        let error = dispatcher
+            .basic64_module_manager()
+            .retire("Console", &mut task)
+            .unwrap_err();
+        assert!(error.to_string().contains("finalise denied"));
+        assert_eq!(module_program.workspace_number("FINALISECOUNT%"), Some(0.0));
+        assert_eq!(dispatcher.module_registry().registered_swi_count(), 6);
+        assert!(
+            dispatcher
+                .module_registry()
+                .acquire_swi(OS_WRITE_C)
+                .is_none()
+        );
+        assert_eq!(
+            dispatcher
+                .module_registry()
+                .module_named("Console")
+                .unwrap()
+                .state,
+            crate::trellis::ModuleState::Quiescing
+        );
+        assert!(
+            dispatcher
+                .module_programs
+                .values()
+                .any(|program| program.manifest.source_hash == module_program.manifest.source_hash)
+        );
+
+        dispatcher
+            .basic64_module_manager()
+            .replace_swi_definition(OS_WRITE_C, original, "modules/Console.bas64")
+            .unwrap();
+        dispatcher
+            .basic64_module_manager()
+            .retire("Console", &mut task)
+            .unwrap();
+        assert_eq!(module_program.workspace_number("FINALISECOUNT%"), Some(1.0));
+        assert_eq!(dispatcher.module_registry().registered_swi_count(), 0);
+        assert!(dispatcher
+            .module_programs
+            .values()
+            .all(|program| program.manifest.name.eq_ignore_ascii_case("Boot")));
+    }
+
+    #[test]
+    fn guest_primitive_invocation_is_rejected_outside_an_active_module() {
+        let (_input_sender, input_receiver) = mpsc::channel();
+        let (display_sender, _display_receiver) = mpsc::channel();
+        let mut dispatcher =
+            SwiDispatcher::windowed(HostConsole::windowed(input_receiver), display_sender);
+        let mut task = Task::new(45);
+        let mut context = SwiContext::default();
+        context.registers[R0] = u32::from(b'X');
+
+        let error = dispatcher
+            .call_module_primitive("Host.Console.WriteByte", &mut task, &mut context)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("outside a BASIC64 module invocation")
+        );
+    }
+
+    #[test]
+    fn console_definition_replacement_keeps_the_entry_cell_and_rejects_bad_contracts() {
+        let (_input_sender, input_receiver) = mpsc::channel();
+        let (display_sender, display_receiver) = mpsc::channel();
+        let mut dispatcher =
+            SwiDispatcher::windowed(HostConsole::windowed(input_receiver), display_sender);
+        let mut task = Task::new(43);
+        let (_other_sender, other_receiver) = mpsc::channel();
+        let other_dispatcher = SwiDispatcher::new(HostConsole::windowed(other_receiver));
+        let foreign_authority = other_dispatcher.module_management_authority().clone();
+        assert!(
+            dispatcher
+                .replace_basic64_swi(
+                    &foreign_authority,
+                    OS_WRITE_C,
+                    include_str!("../modules/Console.bas64"),
+                    "modules/Console.foreign.bas64",
+                )
+                .is_err()
+        );
+        let entry_id = dispatcher
+            .module_registry()
+            .swi_entry_id(OS_WRITE_C)
+            .unwrap();
+        let derived_identity = dispatcher
+            .module_registry()
+            .derived_target_identity(OS_WRITE_C)
+            .unwrap();
+        dispatcher
+            .derived_targets
+            .insert(derived_identity.clone(), Arc::new(vec![0xCA, 0xFE]));
+        let (_, old_call) = dispatcher
+            .module_registry()
+            .acquire_swi(OS_WRITE_C)
+            .unwrap();
+        let old_generation = old_call.generation_id();
+
+        let original = include_str!("../modules/Console.bas64");
+        let replacement = original.replace(
+            "    PROC EmitByte(R0% AND &FF)",
+            "    PROC EmitByte(R0% AND &FF): PROC EmitByte(33)",
+        );
+        let next_generation = dispatcher
+            .basic64_module_manager()
+            .replace_swi_definition(
+                OS_WRITE_C,
+                &replacement,
+                "modules/Console.replacement.bas64",
+            )
+            .unwrap();
+        assert!(dispatcher.derived_targets.is_empty());
+        assert!(old_call.retired());
+        assert_ne!(old_generation, next_generation);
+        let replacement_identity = dispatcher
+            .module_registry()
+            .derived_target_identity(OS_WRITE_C)
+            .unwrap();
+        let replacement_definition = dispatcher
+            .module_registry()
+            .current_swi_definition(OS_WRITE_C)
+            .unwrap();
+        assert_eq!(
+            dispatcher.module_programs[&replacement_definition.id].workspace_number("STARTCOUNT%"),
+            Some(1.0)
+        );
+        assert_ne!(
+            replacement_identity.source_hash,
+            derived_identity.source_hash
+        );
+        assert_eq!(
+            replacement_identity.source_path,
+            "modules/Console.replacement.bas64"
+        );
+        assert_eq!(
+            dispatcher
+                .module_registry()
+                .module_named("Console")
+                .unwrap()
+                .manifest
+                .source_path,
+            "modules/Console.replacement.bas64"
+        );
+        assert_eq!(
+            dispatcher.module_registry().swi_entry_id(OS_WRITE_C),
+            Some(entry_id)
+        );
+
+        let mut output = SwiContext::default();
+        output.registers[R0] = u32::from(b'B');
+        dispatcher
+            .dispatch(OS_WRITE_C, &mut task, &mut output)
+            .unwrap();
+        let emitted = display_receiver
+            .try_iter()
+            .filter_map(|event| match event {
+                DisplayEvent::WriteByte { byte, .. } => Some(byte),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(emitted, [b'B', b'!']);
+        assert!(matches!(
+            dispatcher.last_dispatch_route(),
+            Some(SwiDispatchRoute::ModuleOwned { generation: 2, .. })
+        ));
+
+        let bad_contract = replacement.replace("REGISTERS=R0:U32:IN", "REGISTERS=R0:BYTE:OUT");
+        assert!(
+            dispatcher
+                .basic64_module_manager()
+                .replace_swi_definition(OS_WRITE_C, &bad_contract, "modules/Console.bad.bas64")
+                .is_err()
+        );
+        assert!(matches!(
+            dispatcher.last_dispatch_route(),
+            Some(SwiDispatchRoute::ModuleOwned { generation: 2, .. })
+        ));
+
+        drop(old_call);
+        assert_eq!(
+            dispatcher
+                .module_registry()
+                .swi_retired_generation_count(OS_WRITE_C),
+            Some(0)
+        );
+        dispatcher
+            .basic64_module_manager()
+            .replace_swi_definition(OS_WRITE_C, original, "modules/Console.bas64")
+            .unwrap();
+        let restored_identity = dispatcher
+            .module_registry()
+            .derived_target_identity(OS_WRITE_C)
+            .unwrap();
+        let restored_definition = dispatcher
+            .module_registry()
+            .current_swi_definition(OS_WRITE_C)
+            .unwrap();
+        assert_eq!(
+            dispatcher.module_programs[&restored_definition.id].workspace_number("STARTCOUNT%"),
+            Some(1.0)
+        );
+        assert_eq!(restored_identity.source_path, "modules/Console.bas64");
+        assert_eq!(
+            dispatcher
+                .module_registry()
+                .module_named("Console")
+                .unwrap()
+                .manifest
+                .source_path,
+            "modules/Console.bas64"
+        );
+        assert_ne!(
+            restored_identity.source_hash,
+            replacement_identity.source_hash
+        );
+        assert_eq!(
+            dispatcher.module_registry().swi_entry_id(OS_WRITE_C),
+            Some(entry_id)
+        );
+        dispatcher
+            .basic64_module_manager()
+            .quiesce("Console", &mut task)
+            .unwrap();
+        dispatcher
+            .basic64_module_manager()
+            .retire("Console", &mut task)
+            .unwrap();
+        assert!(
+            !dispatcher
+                .module_programs
+                .values()
+                .any(|program| program.manifest.name.eq_ignore_ascii_case("Console"))
+        );
     }
 
     #[test]

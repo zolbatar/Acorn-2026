@@ -1,5 +1,6 @@
 pub mod basic64;
 pub mod basic_compat;
+pub mod boot;
 pub(crate) mod configure;
 mod desktop_scene;
 pub mod display;
@@ -16,6 +17,7 @@ pub mod runtime;
 pub mod snapshot;
 pub mod swi;
 pub mod tokenized_basic;
+pub mod trellis;
 mod vello_backend;
 pub mod wimp;
 pub mod window;

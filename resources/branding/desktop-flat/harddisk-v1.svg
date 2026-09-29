@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" shape-rendering="crispEdges">
+  <title>Hard disk drive</title>
+  <rect x="128" y="352" width="768" height="320" rx="16" fill="#4b4b4b"/>
+  <rect x="144" y="368" width="736" height="288" rx="8" fill="#f0f0be"/>
+  <g fill="#101010">
+    <rect x="192" y="416" width="27" height="176" rx="4"/>
+    <rect x="254" y="416" width="27" height="176" rx="4"/>
+    <rect x="316" y="416" width="27" height="176" rx="4"/>
+    <rect x="378" y="416" width="27" height="176" rx="4"/>
+    <rect x="440" y="416" width="27" height="176" rx="4"/>
+  </g>
+  <rect x="765" y="507" width="64" height="48" rx="6" fill="#e00000"/>
+</svg>

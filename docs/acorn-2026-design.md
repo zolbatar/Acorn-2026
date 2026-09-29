@@ -8,7 +8,11 @@ The environment is named **Trellis**. Its mission is to make the computer
 understandable, programmable and malleable by the person using it, continuing
 the Acorn tradition through a modern, live and inspectable RISC OS environment.
 The live-system architecture, module-owned SWI decision, and bootstrap boundary
-are specified in [`trellis-architecture.md`](trellis-architecture.md).
+are specified in [`trellis-architecture.md`](trellis-architecture.md). The
+implementation phases and tasks are defined in
+[`trellis-work-packages.md`](trellis-work-packages.md).
+The agreed native language extensions and their compatibility boundary are
+specified in [`basic64-system-profile.md`](basic64-system-profile.md).
 
 This is a design brief for a new, tinkerable computer environment inspired by Acorn and RISC OS. It is a re-imagining, not a RISC OS 3.71 simulator or a cosmetic remake. RISC OS supplies ideas and a valuable body of API knowledge; it does not dictate the implementation.
 
@@ -25,6 +29,8 @@ The guiding question for each inherited feature is:
 Preserve directness, inspectability, stable interfaces, fast startup, applications as tangible objects, a capable file manager, contextual interaction, drag-and-drop, and the sense that the computer is open to its owner. Let go of old hardware limits, pixel-era rendering assumptions, and compatibility burdens that do not serve those ideas.
 
 The environment should feel descended from Acorn's design culture and remain crisp, restrained, content-focused, and modern. The desktop keeps classic RISC OS behavior, terminology, and source compatibility while using a new modern visual system by default. The 3.71 desktop is reference material for interaction, layout, and selected textures; reproducing its old furniture, palette, and display limits is not the visual target.
+
+The user-approved visual target is recorded in [Desired desktop look](desired-desktop-look.md), with the [approved mockup](assets/approved-desktop-design.png). This reference supersedes earlier appearance experiments; it specifies the desired look, not completed implementation.
 
 ## 2. Scope and non-goals
 
@@ -80,11 +86,11 @@ BASIC64 should remain recognizably BBC BASIC: immediate use, short programs, `PR
 
 The compatibility target is **BBC BASIC V/VI source semantics where feasible**. Existing documented source behavior should remain intact in a compatibility personality: syntax, operators and precedence, numeric and string behavior, control flow, error handling, built-in procedures/functions, memory operators, and interactions with `SYS` should be inventoried and treated as a compatibility contract. New BASIC64 capabilities should be additive or opt-in so they do not silently reinterpret established source.
 
-BASIC64 is the system's native language; earlier BASIC syntax defines compatibility paths, not the language used to implement the system by default. A firm requirement is that the system can load programs from all earlier BBC BASIC versions. The user has described the tokenized saved-program format as shared. Real BBC Micro and BBC Master files show one shared-boundary layout; the ARM BASIC V fixture uses a separate line terminator and record marker. One decoder accepts both layouts and preserves token bytes. The Master TETRIZ 1.5 fixture adds BASIC IV-class evidence, though its exact ROM revision is unknown and it does not cover every BASIC IV-specific token. Shared-boundary execution begins with the deliberately narrow leading-`REM`, literal-string `PRINT`, and `END` common-token subset; the detected record layout does not identify an exact BASIC release, and unsupported tokens fail explicitly. Version-specific token interpretation and execution remain separate compatibility work. The current evidence and gaps are tracked in [`docs/tokenized-basic-compatibility.md`](tokenized-basic-compatibility.md). UTF-8 source (`.bas64` or `.bas`) and decoded tokenized programs (`.bbc`) now converge on the same `ParsedProgram`, compatibility interpreter, and optional Cranelift JIT. A leading `REM @BASIC64` directive can select `MODE=CLASSIC`, `MODE=BASIC64`, or `MODE=HYBRID`, and `TARGET=HOSTED`/`RISCOS` or `TARGET=AGON`; each declared directive field overrides the corresponding persisted preference, while configuration fills unspecified fields. When no directive or configured value supplies a mode or target, the runtime defaults remain `HYBRID` and `HOSTED`. The Agon target selects its modern VDP 1.04+ mode table and BBC-style 1280×1024 logical graphics coordinates in the hosted graphics service; this does not emulate the VDP protocol or firmware. The language-mode field is carried through parsing, but full 32-bit/64-bit integer semantics are not yet implemented in the shared numeric evaluator. The first encoded compatibility fixture is ClockSP5 program version 5.08, kept beside its text source.
+BASIC64 is the system's native language; earlier BASIC syntax defines compatibility paths, not the language used to implement the system by default. A firm requirement is that the system can load programs from all earlier BBC BASIC versions. The user has described the tokenized saved-program format as shared. Real BBC Micro and BBC Master files show one shared-boundary layout; the ARM BASIC V fixture uses a separate line terminator and record marker. One decoder accepts both layouts and preserves token bytes. The Master TETRIZ 1.5 fixture adds BASIC IV-class evidence, though its exact ROM revision is unknown and it does not cover every BASIC IV-specific token. Shared-boundary execution begins with the deliberately narrow leading-`REM`, literal-string `PRINT`, and `END` common-token subset; the detected record layout does not identify an exact BASIC release, and unsupported tokens fail explicitly. Version-specific token interpretation and execution remain separate compatibility work. The current evidence and gaps are tracked in [`docs/tokenized-basic-compatibility.md`](tokenized-basic-compatibility.md). UTF-8 source (`.bas64` or `.bas`) and decoded tokenized programs (`.bbc`) now converge on the same `ParsedProgram`, compatibility interpreter, and optional Cranelift JIT. A leading `REM @BASIC64` directive can select `MODE=CLASSIC`, `MODE=BASIC64`, or `MODE=HYBRID`, and `TARGET=HOSTED`/`RISCOS` or `TARGET=AGON`; each declared directive field overrides the corresponding persisted preference, while configuration fills unspecified fields. When no directive or configured value supplies a mode or target, the runtime defaults remain `HYBRID` and `HOSTED`. The Agon target selects its modern VDP 1.04+ mode table and BBC-style 1280×1024 logical graphics coordinates in the hosted graphics service; this does not emulate the VDP protocol or firmware. The language mode still does not provide complete full-width integer semantics for ordinary BASIC64 programs; explicitly typed System Profile `INT64`/`UINT64` operations have a separate exact integer path. The first encoded compatibility fixture is ClockSP5 program version 5.08, kept beside its text source.
 
 “100% compatible” needs a bounded definition. Source-level compatibility does not itself promise that arbitrary ARM machine code, undocumented interpreter quirks, or hardware-specific code will run unchanged. The exact BASIC V/VI baseline, edge cases, and compatibility boundary are open design questions.
 
-In the current implementation, the directive's `TARGET` is applied to the graphics runtime, while `MODE` and `PROFILE` are parsed and retained as metadata only. The interpreter still uses its existing shared numeric representation for all modes; the declared integer widths above remain future semantics work.
+In the current implementation, the directive's `TARGET` is applied to the graphics runtime, while ordinary-program `MODE` and `PROFILE` are parsed and retained as metadata only. The shared numeric representation still applies to ordinary programs; the explicitly typed System Profile `INT64`/`UINT64` subset is separate. The broader declared integer widths above remain future semantics work.
 
 The runtime is written in Rust. Keep the interpreter as the language reference and fallback path. The experimental JIT targets verified regions of the shared parsed-program representation and must preserve program-visible behavior. Any wider compilation strategy should keep the REPL and interpreted path useful. An opt-in strict whole-program native mode may compile supported programs without entering the interpreter; unsupported constructs must either be diagnosed before execution or lower to an explicit checked runtime error when control reaches them.
 
@@ -138,18 +144,25 @@ For each implemented classic profile, compiled execution must preserve the inter
 
 BBC BASIC V's `LIBRARY` and `INSTALL` commands load separate saved BASIC programs that normally contain `PROC` and `FN` definitions. RISC OS BASIC V also has `OVERLAY` libraries, loaded on demand when a named procedure or function is called. Procedure lookup searches the main program first, then `LIBRARY` files (most recently loaded first), `INSTALL` files (in reverse load order), and finally the overlay list. These are name-searched procedure libraries rather than isolated modules with a declared ABI: resolution depends on the active library set, and library code may rely on the caller's BASIC variables and runtime state. The guide also warns that line-number references in a library refer to the main program, and recommends keeping library routines self-contained. Preserve these loading and lookup rules in the compatibility personality. They can still be compilation inputs: analyze and compile individual resolved definitions when eligible, while retaining runtime name resolution and invalidating compiled entries when the active definition or its dependencies change. Do not treat a library file's boundary as proof that all its routines are clean or statically closed. The [BASIC V procedures and libraries guide](https://www.riscos.com/support/developers/basicv/chap05.htm) describes the library model and its `LIBRARY`, `INSTALL`, and `OVERLAY` behavior.
 
-### Possible additive language evolution
+### Additive native language evolution
 
-The earlier language discussion explored features that could make BASIC64 feel like a modern continuation of BBC BASIC. These are options for Codex to evaluate, not a settled feature list. They must not silently change V/VI source semantics:
+The native BASIC64 System Profile will add the bounded facilities required to
+implement Trellis clearly: modules and visibility, named records, enums and
+flags, typed definitions, structured errors, opaque handles, read-only
+bindings, declarative SWI/primitive metadata, and distinct managed-reference
+and logical-address types. These are settled feature categories; their exact
+grammar and detailed semantics are preparatory work defined in
+[`basic64-system-profile.md`](basic64-system-profile.md).
 
-- Modern 64-bit types, records/value types, collections, and clearer procedure/function signatures.
-- Lexical scope and explicit global declarations in new code, while retaining classic `LOCAL` and variable behavior in compatibility code.
-- Modules and imports, structured error handling alongside `ON ERROR`, and Unicode strings with useful interpolation and slicing.
-- Direct iteration and ranges, with concurrency or asynchronous tasks available for programs that need them.
-- Built-in graphics and approachable GUI creation, so the path from a short program to a useful application remains short.
-- Low-level memory access and an integrated assembler, mediated by logical addresses and an explicit execution target.
+The additions are explicitly profile-gated and must not silently change BBC
+BASIC V/VI source semantics. Classes, inheritance, generics, macros, universal
+message dispatch, and async syntax are deferred until executable system work
+demonstrates a requirement. First-class functions and closures are likely but
+do not block the first module slice unless a concrete callback or lifecycle
+case requires them.
 
-Keep the language concise and direct. Avoid making BASIC64 a syntax-heavy systems language or requiring a large framework for ordinary programs.
+Keep the language concise and direct. Avoid making BASIC64 a syntax-heavy
+systems language or requiring a large framework for ordinary programs.
 
 ## 5. Services, SWIs, and modules
 
@@ -461,7 +474,7 @@ Work through these in order; preserve open questions rather than silently conver
 1. **Compatibility baseline:** Which exact BBC BASIC V and VI versions, documented behaviors, extensions, and known quirks define source compatibility? Initial program-source candidates are MAL, WimpLib, and the Archimedes Notify archive, with Wimp acceptance deferred until its service surface exists; which of these become required acceptance targets, and which exact ROM saves anchor them?
 2. **Shared tokenised format:** Which record-boundary layouts, token maps, and line-reference rules are used by the earlier BASIC versions? Which version-specific language and runtime behaviors must remain distinct after the shared decoder normalizes the file?
 3. **Compatibility selection:** Which exact classic BASIC release profiles are supported, and how are profiles assigned to tokenised files that cannot carry a source directive? What default classic profile applies when the originating release is unknown?
-4. **BASIC64 evolution:** Which new language features are essential at the start? How do integer suffixes, pointer/address types, overflow, string representation, and new syntax coexist with historical semantics?
+4. **BASIC64 System Profile details:** The initial feature categories are settled in [`basic64-system-profile.md`](basic64-system-profile.md). What exact grammar, keyword/profile compatibility, integer suffix and overflow rules, string representation, record value semantics, structured-error mechanics, and manifest/annotation precedence should System Profile 0.1 use?
 5. **SWI contract:** Which parts of the register/calling convention, errors, flag behavior, argument blocks, and module lifecycle must remain byte-for-byte compatible? The first icon-art extension uses a separately named, versioned `Wimp_CreateIconEx` SWI and leaves the standard `Wimp_CreateIcon` block untouched; should later extensions follow this pattern or use a broader extension registry?
 6. **Pointer descriptors:** How are pointer-bearing SWI arguments described? What are the exact rules for buffers retained after return, callbacks, vectors, async I/O, and module-held references?
 7. **Shared memory and Dynamic Areas:** What names or handles identify a shared region? Who can map it, resize it, revoke it, or free it? How are old Dynamic Area calls represented?
