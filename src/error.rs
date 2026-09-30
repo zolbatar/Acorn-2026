@@ -14,6 +14,12 @@ pub enum RuntimeError {
         code: u32,
         message: String,
     },
+    /// An OS_GenerateError-style result retaining its caller-supplied error
+    /// number and text until the SWI dispatcher applies normal or X-form rules.
+    StandardErrorBlock {
+        code: u32,
+        message: String,
+    },
 }
 
 impl fmt::Display for RuntimeError {
@@ -31,6 +37,9 @@ impl fmt::Display for RuntimeError {
             } => {
                 write!(f, "{type_name} (&{code:08X}): {message}")
             }
+            Self::StandardErrorBlock { code, message } => {
+                write!(f, "OSError (&{code:08X}): {message}")
+            }
         }
     }
 }
@@ -40,9 +49,11 @@ impl Error for RuntimeError {
         match self {
             Self::Io(error) => Some(error),
             Self::Memory(error) => Some(error),
-            Self::EndOfInput | Self::InvalidSwi(_) | Self::Program(_) | Self::Structured { .. } => {
-                None
-            }
+            Self::EndOfInput
+            | Self::InvalidSwi(_)
+            | Self::Program(_)
+            | Self::Structured { .. }
+            | Self::StandardErrorBlock { .. } => None,
         }
     }
 }

@@ -1,16 +1,39 @@
 REM @BASIC64 MODE=BASIC64
 REM @SYSTEM_PROFILE 0.1
 REM @MODULE Boot 1.0.0
-REM @CAPABILITY StartupPolicy
-REM @IMPORT Host.Configuration.ReadStartupLanguage StartupPolicy
-REM @IMPORT Host.Boot.RequestMos StartupPolicy
-REM @IMPORT Host.Boot.RequestDesktop StartupPolicy
+REM @IMPORT_MODULE Console 1.0.0
+REM @IMPORT_MODULE System 1.0.0
+REM @IMPORT_MODULE Error 1.0.0
+REM @IMPORT_MODULE Memory 1.0.0
+REM @IMPORT_MODULE ModuleManager 1.0.0
+REM @IMPORT_MODULE TaskManager 1.0.0
+REM @IMPORT_MODULE TrellisCommands 1.0.0
+REM @IMPORT_SYMBOL System PROC ReadStartupLanguage
+REM @IMPORT_SYMBOL System FN StartupLanguage
+REM @IMPORT_SYMBOL System FN StartupConfigurationRecovery
+REM @IMPORT_SYMBOL System PROC RequestMos
+REM @IMPORT_SYMBOL System PROC RequestDesktop
 REM @LIFECYCLE START Start
 REM @PRIVATE PROC Start
+REM @PRIVATE PROC ReportConfigurationRecovery
 REM @STATE STARTUPLANGUAGE% UINT32
+REM @STATE CONFIGURATIONRECOVERY% UINT32
 
 DEF PROC Start
-    PRIMITIVE Host.Configuration.ReadStartupLanguage TO STARTUPLANGUAGE%
-    IF STARTUPLANGUAGE% = 3 THEN PRIMITIVE Host.Boot.RequestDesktop
-    IF STARTUPLANGUAGE% = 0 THEN PRIMITIVE Host.Boot.RequestMos
+    PROC System.ReadStartupLanguage
+    STARTUPLANGUAGE% = FN System.StartupLanguage()
+    CONFIGURATIONRECOVERY% = FN System.StartupConfigurationRecovery()
+    IF CONFIGURATIONRECOVERY% <> 0 THEN PROC ReportConfigurationRecovery
+    IF STARTUPLANGUAGE% = 3 THEN PROC System.RequestDesktop
+    IF STARTUPLANGUAGE% = 0 THEN PROC System.RequestMos
+ENDPROC
+
+DEF PROC ReportConfigurationRecovery
+    IF CONFIGURATIONRECOVERY% = 1 THEN PRINT "Configuration recovery: settings are malformed or truncated; safe defaults are active and the saved file is unchanged."
+    IF CONFIGURATIONRECOVERY% = 2 THEN PRINT "Configuration recovery: the saved format version is unsupported; safe defaults are active and the file is unchanged."
+    IF CONFIGURATIONRECOVERY% = 3 THEN PRINT "Configuration recovery: the saved settings schema is unsupported; safe defaults are active and the file is unchanged."
+    IF CONFIGURATIONRECOVERY% = 4 THEN PRINT "Configuration recovery: the saved file is not valid UTF-8; safe defaults are active and the file is unchanged."
+    IF CONFIGURATIONRECOVERY% = 5 THEN PRINT "Configuration recovery: saved configuration storage is unreadable; safe defaults are active and no file was changed."
+    IF CONFIGURATIONRECOVERY% = 6 THEN PRINT "Configuration recovery: the saved configuration exceeds the 64 KiB safety limit; safe defaults are active and the file is unchanged."
+    PRINT "Use *STATUS to inspect effective settings; a valid *CONFIGURE write or *CONFIGURE DEFAULTS repairs the file, preserving any recoverable original bytes."
 ENDPROC

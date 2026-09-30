@@ -45,6 +45,7 @@ pub struct SystemModule {
     pub definitions: BTreeMap<String, DefinitionDescriptor>,
     persistent_state: BTreeMap<String, SystemType>,
     workspace: runtime::ModuleWorkspace,
+    source_text: String,
     program: ParsedProgram,
     typed_ir: PortableSystemIr,
 }
@@ -866,6 +867,7 @@ impl SystemModule {
             definitions,
             persistent_state,
             workspace: runtime::ModuleWorkspace::default(),
+            source_text: source.to_owned(),
             program,
             typed_ir,
         })
@@ -875,6 +877,14 @@ impl SystemModule {
     /// definition contracts, private workspace types, and checked memory ops.
     pub fn typed_ir(&self) -> &PortableSystemIr {
         &self.typed_ir
+    }
+
+    pub(crate) fn preserve_module_title(&mut self, title: &str) {
+        self.manifest.name = title.to_owned();
+        self.typed_ir.module_name = title.to_owned();
+        if let Some(manifest) = self.typed_ir.manifest.as_mut() {
+            manifest.name = title.to_owned();
+        }
     }
 
     #[cfg(test)]
@@ -961,6 +971,52 @@ impl SystemModule {
             types: self.program.system_types.clone(),
             private_state: self.persistent_state.clone(),
         }
+    }
+
+    /// Returns the retained BASIC64 source block for one procedure or
+    /// function. This is intentionally sourced from the parsed module's
+    /// retained input, never reopened through HostFS.
+    pub(crate) fn definition_source(&self, definition: &str) -> Option<String> {
+        let definition = definition.trim();
+        let upper = definition.to_ascii_uppercase();
+        let normalized = upper
+            .strip_prefix("FN:")
+            .or_else(|| upper.strip_prefix("FN "))
+            .map(|name| format!("FN:{name}"))
+            .unwrap_or(upper);
+        self.definitions.get(&normalized)?;
+
+        let lines = self.source_text.split_inclusive('\n').collect::<Vec<_>>();
+        let start = lines
+            .iter()
+            .position(|line| source_definition_key(line).as_deref() == Some(normalized.as_str()))?;
+        let is_function = normalized.starts_with("FN:");
+        let end = if is_function {
+            (start + 1..lines.len())
+                .find(|index| source_definition_key(lines[*index]).is_some())
+                .unwrap_or(lines.len())
+        } else {
+            (start + 1..lines.len())
+                .find(|index| source_line_is_endproc(lines[*index]))
+                .map(|index| index + 1)
+                .unwrap_or_else(|| {
+                    (start + 1..lines.len())
+                        .find(|index| source_definition_key(lines[*index]).is_some())
+                        .unwrap_or(lines.len())
+                })
+        };
+        if end <= start {
+            return None;
+        }
+        let start_offset = lines[..start].iter().map(|line| line.len()).sum::<usize>();
+        let end_offset = start_offset
+            + lines[start..end]
+                .iter()
+                .map(|line| line.len())
+                .sum::<usize>();
+        self.source_text
+            .get(start_offset..end_offset)
+            .map(str::to_owned)
     }
 
     pub(crate) fn invoke(
@@ -1102,6 +1158,68 @@ impl SystemModule {
         self.persistent_state == other.persistent_state
     }
 
+    pub(crate) fn has_compatible_workspace_schema(&self, other: &Self) -> bool {
+        // A retained state slot may name a RECORD/ENUM/FLAGS/ERROR whose
+        // layout is stored separately from the slot's SystemType. Requiring
+        // the complete named-type table to match keeps immediate replacement
+        // out of state migration and rejects otherwise invisible layout edits.
+        self.persistent_state == other.persistent_state
+            && self.program.system_types == other.program.system_types
+    }
+
+    pub(crate) fn has_compatible_public_abi(&self, other: &Self) -> bool {
+        if self.manifest.symbol_exports != other.manifest.symbol_exports
+            || self.manifest.lifecycle != other.manifest.lifecycle
+        {
+            return false;
+        }
+        let left = self.reflection();
+        let right = other.reflection();
+        let same_definition = |key: &str| {
+            let display_name = key
+                .strip_prefix("FN:")
+                .map(|name| format!("FN {name}"))
+                .unwrap_or_else(|| key.to_owned());
+            let left_definition = left.definitions.iter().find(|definition| {
+                definition
+                    .descriptor
+                    .name
+                    .eq_ignore_ascii_case(&display_name)
+            });
+            let right_definition = right.definitions.iter().find(|definition| {
+                definition
+                    .descriptor
+                    .name
+                    .eq_ignore_ascii_case(&display_name)
+            });
+            match (left_definition, right_definition) {
+                (Some(left), Some(right)) => {
+                    left.parameters.len() == right.parameters.len()
+                        && left.parameter_types == right.parameter_types
+                        && left.result_type == right.result_type
+                        && left.throws_type == right.throws_type
+                }
+                _ => false,
+            }
+        };
+        if !self
+            .manifest
+            .symbol_exports
+            .iter()
+            .all(|symbol| same_definition(symbol))
+        {
+            return false;
+        }
+        [
+            self.manifest.lifecycle.start.as_deref(),
+            self.manifest.lifecycle.quiesce.as_deref(),
+            self.manifest.lifecycle.finalise.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .all(|hook| same_definition(hook))
+    }
+
     pub(crate) fn inherit_workspace(&mut self, other: &Self) -> Result<(), RuntimeError> {
         if !self.has_compatible_workspace(other) {
             return Err(RuntimeError::Program(
@@ -1211,6 +1329,49 @@ impl SystemTypeBuilder {
         }
         Ok(())
     }
+}
+
+fn source_line_body(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    let digit_count = trimmed
+        .bytes()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digit_count == 0 {
+        return trimmed;
+    }
+    trimmed[digit_count..].trim_start()
+}
+
+fn source_definition_key(line: &str) -> Option<String> {
+    let body = source_line_body(line.trim_end_matches(['\r', '\n']));
+    let mut words = body.split_ascii_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("DEF") {
+        return None;
+    }
+    let kind = words.next()?;
+    let name = words
+        .next()?
+        .split(['(', ' ', '\t'])
+        .next()?
+        .trim_end_matches(['%', '$', '!']);
+    if name.is_empty() {
+        return None;
+    }
+    if kind.eq_ignore_ascii_case("PROC") {
+        Some(name.to_ascii_uppercase())
+    } else if kind.eq_ignore_ascii_case("FN") {
+        Some(format!("FN:{}", name.to_ascii_uppercase()))
+    } else {
+        None
+    }
+}
+
+fn source_line_is_endproc(line: &str) -> bool {
+    source_line_body(line.trim_end_matches(['\r', '\n']))
+        .split_ascii_whitespace()
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("ENDPROC"))
 }
 
 fn parse_system_field(text: &str, line: u16) -> Result<SystemField, RuntimeError> {

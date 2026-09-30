@@ -1,0 +1,16 @@
+REM @BASIC64 MODE=BASIC64
+REM @SYSTEM_PROFILE 0.1
+REM @MODULE TaskManager 1.0.0
+REM @CAPABILITY TaskQuery
+REM @CAPABILITY RuntimeErrors
+REM @IMPORT Host.Task.ReadIdentity TaskQuery
+REM @IMPORT Host.Runtime.UnsupportedServiceReason RuntimeErrors
+REM @SWI Acorn_TaskInfo &4FF11 ReadTaskInfo REGISTERS=R0:U32:IN|R1:U32:OUT|R2:U32:OUT|R3:U32:OUT;BLOCKING=FALSE;REENTRANT=TRUE;ERROR=TaskInfoError
+
+DEF PROC ReadTaskInfo
+    IF R0% <> 1 THEN PRIMITIVE Host.Runtime.UnsupportedServiceReason, &4FF11, R0%
+    PRIMITIVE Host.Task.ReadIdentity TO TASKID%, MEMSIZE%, DYNAMICAREACOUNT%
+    R1% = TASKID%
+    R2% = MEMSIZE%
+    R3% = DYNAMICAREACOUNT%
+ENDPROC

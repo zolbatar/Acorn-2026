@@ -3,8 +3,8 @@
 use crate::{
     font::bbc_micro_glyph,
     graphics::{
-        GraphicsPrimitive, GraphicsSnapshot, GraphicsWindow, Point, graphics_colour,
-        logical_rect_pixels,
+        GraphicsPrimitive, GraphicsSnapshot, GraphicsWindow, Point, TextRenderingProfile,
+        graphics_colour, logical_rect_pixels,
     },
     riscos_font::NativeRasterFont,
     riscos_resources::{FontName, RiscOsSprite, RiscOsSpriteFile, SpriteSet, builtin_sprite_set},
@@ -26,8 +26,36 @@ pub const SCREEN_WIDTH: u32 = 640;
 pub const SCREEN_HEIGHT: u32 = 256;
 const BYTES_PER_PIXEL: usize = 4;
 
-/// Paint graphics and the BBC bitmap text into one RGBA frame.
-pub fn render(snapshot: &GraphicsSnapshot, frame: &mut [u8]) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SoftwareRenderError {
+    ModernTextRequiresVello,
+}
+
+impl std::fmt::Display for SoftwareRenderError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ModernTextRequiresVello => formatter.write_str(
+                "TEXT=MODERN text requires the Parley/Vello compositor; software rendering supports TEXT=CLASSIC only",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SoftwareRenderError {}
+
+/// Paint a complete Classic graphics/text snapshot into an RGBA frame.
+/// Modern text must use the Parley/Vello compositor and returns an error here.
+pub fn render(snapshot: &GraphicsSnapshot, frame: &mut [u8]) -> Result<(), SoftwareRenderError> {
+    if snapshot.text_profile == TextRenderingProfile::Modern {
+        return Err(SoftwareRenderError::ModernTextRequiresVello);
+    }
+    render_for_vello(snapshot, frame);
+    Ok(())
+}
+
+/// Render the raster and any Classic bitmap text for a Vello scene. Modern
+/// text is intentionally omitted here because the Vello scene overlays it.
+pub fn render_for_vello(snapshot: &GraphicsSnapshot, frame: &mut [u8]) {
     let width = snapshot.mode.pixel_width;
     let height = snapshot.mode.pixel_height;
     let expected_size = width as usize * height as usize * BYTES_PER_PIXEL;
@@ -102,15 +130,27 @@ pub fn render(snapshot: &GraphicsSnapshot, frame: &mut [u8]) {
         }
     }
 
-    draw_text(snapshot, frame, width, height);
-    draw_cursor(snapshot, frame, width, height);
+    if snapshot.text_profile == TextRenderingProfile::Classic {
+        draw_text(snapshot, frame, width, height);
+        draw_cursor(snapshot, frame, width, height);
+    }
 }
 
-/// Render guest content without altering its classic text or graphics profile.
-pub fn render_desktop_content(snapshot: &GraphicsSnapshot, frame: &mut [u8]) {
+/// Render guest content for a software desktop snapshot. Modern text cannot
+/// be rasterized by this path and is rejected explicitly.
+pub fn render_desktop_content(
+    snapshot: &GraphicsSnapshot,
+    frame: &mut [u8],
+) -> Result<(), SoftwareRenderError> {
     // Guest VDU output has identical bitmap glyphs, palette and MODE semantics
     // in a Wimp window and fullscreen. Only the host furniture uses UI fonts.
-    render(snapshot, frame);
+    render(snapshot, frame)
+}
+
+/// Render only the compatibility image that the Vello compositor uses as its
+/// guest surface; Modern text is drawn separately by the compositor.
+pub fn render_desktop_content_for_vello(snapshot: &GraphicsSnapshot, frame: &mut [u8]) {
+    render_for_vello(snapshot, frame);
 }
 
 /// Render the hosted Wimp desktop. Each guest Wimp window has its own
@@ -124,12 +164,18 @@ pub fn render_desktop(
     menus: &[DesktopMenu],
     notice: Option<&str>,
     frame: &mut [u8],
-) {
+) -> Result<(), SoftwareRenderError> {
     let width = DESKTOP_PIXEL_WIDTH;
     let height = DESKTOP_PIXEL_HEIGHT;
     let bytes = width as usize * height as usize * BYTES_PER_PIXEL;
     if frame.len() < bytes {
-        return;
+        return Ok(());
+    }
+    if scenes
+        .values()
+        .any(|snapshot| snapshot.text_profile == TextRenderingProfile::Modern)
+    {
+        return Err(SoftwareRenderError::ModernTextRequiresVello);
     }
     draw_desktop_background(frame);
 
@@ -158,6 +204,7 @@ pub fn render_desktop(
     for menu in menus {
         draw_menu(frame, menu);
     }
+    Ok(())
 }
 
 fn menu_colour(index: u8) -> [u8; 4] {
@@ -812,7 +859,8 @@ fn draw_task_scene(
         return;
     }
     let mut source = vec![0; source_width as usize * source_height as usize * BYTES_PER_PIXEL];
-    render_desktop_content(snapshot, &mut source);
+    render_desktop_content(snapshot, &mut source)
+        .expect("render_desktop rejects Modern snapshots before drawing guest windows");
 
     // The task display is a fixed-resolution application surface. Its mode
     // contributes its own OS-unit pixel ratios; the desktop's mode-20 pixels
@@ -2215,6 +2263,22 @@ fn colour(logical_colour: u32, snapshot: &GraphicsSnapshot) -> [u8; 4] {
 #[cfg(test)]
 mod icon_colour_tests {
     use super::window_icon_colours;
+
+    #[test]
+    fn software_snapshot_path_rejects_modern_text_instead_of_blank_rendering() {
+        let mut graphics = crate::graphics::GraphicsService::default();
+        graphics
+            .set_text_profile(
+                crate::graphics::TextRenderingProfile::Modern,
+                crate::graphics::TextEncoding::Utf8,
+            )
+            .unwrap();
+        let mut frame = vec![0; 640 * 256 * 4];
+        assert_eq!(
+            super::render(graphics.snapshot(), &mut frame),
+            Err(super::SoftwareRenderError::ModernTextRequiresVello)
+        );
+    }
 
     #[test]
     fn selected_filer_icon_keeps_transparent_margins_and_highlights_only_label() {

@@ -1,0 +1,55 @@
+REM @BASIC64 MODE=BASIC64
+REM @SYSTEM_PROFILE 0.1
+REM @MODULE System 1.0.0
+REM @CAPABILITY StartupPolicy
+REM @CAPABILITY SystemQueries
+REM @IMPORT Host.Configuration.ReadStartupLanguage StartupPolicy
+REM @IMPORT Host.Boot.RequestMos StartupPolicy
+REM @IMPORT Host.Boot.RequestDesktop StartupPolicy
+REM @IMPORT Host.System.ReadMonotonicTime SystemQueries
+REM @IMPORT Host.System.SwiNumberToString SystemQueries
+REM @IMPORT Host.System.SwiNumberFromString SystemQueries
+REM @STATE STARTUPLANGUAGE% UINT32
+REM @STATE CONFIGURATIONRECOVERY% UINT32
+REM @EXPORT FN StartupLanguage
+REM @EXPORT FN StartupConfigurationRecovery
+REM @EXPORT PROC ReadStartupLanguage
+REM @EXPORT PROC RequestMos
+REM @EXPORT PROC RequestDesktop
+REM @SWI OS_SWINumberToString &38 SwiNumberToString REGISTERS=R0:U32:IN|R1:ADDRESS32:INOUT|R2:U32:INOUT;MEMORY=R1:WRITE:128;BLOCKING=FALSE;REENTRANT=TRUE;ERROR=SwiNameError
+REM @SWI OS_SWINumberFromString &39 SwiNumberFromString REGISTERS=R0:U32:OUT|R1:ADDRESS32:IN;MEMORY=R1:READ:128;BLOCKING=FALSE;REENTRANT=TRUE;ERROR=SwiNameError
+REM @SWI OS_ReadMonotonicTime &42 ReadMonotonicTime REGISTERS=R0:U32:OUT;BLOCKING=FALSE;REENTRANT=TRUE
+
+DEF PROC ReadStartupLanguage
+    PRIMITIVE Host.Configuration.ReadStartupLanguage TO LANGUAGE%, CONFIGURATIONRECOVERY%
+    STARTUPLANGUAGE% = LANGUAGE%
+ENDPROC
+
+DEF FN StartupLanguage() AS UINT32
+= STARTUPLANGUAGE%
+
+DEF FN StartupConfigurationRecovery() AS UINT32
+= CONFIGURATIONRECOVERY%
+
+DEF PROC RequestMos
+    PRIMITIVE Host.Boot.RequestMos
+ENDPROC
+
+DEF PROC RequestDesktop
+    PRIMITIVE Host.Boot.RequestDesktop
+ENDPROC
+
+DEF PROC SwiNumberToString
+    PRIMITIVE Host.System.SwiNumberToString, R0%, R1%, R2% TO NAMELEN%
+    R2% = NAMELEN%
+ENDPROC
+
+DEF PROC SwiNumberFromString
+    PRIMITIVE Host.System.SwiNumberFromString, R1% TO SVCODE%
+    R0% = SVCODE%
+ENDPROC
+
+DEF PROC ReadMonotonicTime
+    PRIMITIVE Host.System.ReadMonotonicTime TO TICKCOUNT%
+    R0% = TICKCOUNT%
+ENDPROC

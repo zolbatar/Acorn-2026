@@ -9,7 +9,6 @@ use std::fmt;
 
 const SOURCE_TREE: &str = "f6c81db7e90f727f3258f874692f751b692a14cb";
 
-const TOOLS3D: &[u8] = include_bytes!("../resources/riscos-3.71/sprites/Tools3d,ff9");
 const TOOLS: &[u8] = include_bytes!("../resources/riscos-3.71/sprites/Tools,ff9");
 const SPRITES22: &[u8] = include_bytes!("../resources/riscos-3.71/sprites/Sprites22,ff9");
 const SYSTEM_HARD_FONT: &[u8; 1792] =
@@ -41,8 +40,6 @@ const PALETTE_8DESKTOP: &[u8; 1024] =
 /// Original resource collection included in this checkout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SpriteSet {
-    /// Native 3D furniture sprites, including the `*22` variants.
-    Tools3d,
     /// Earlier flat furniture sprite set.
     Tools,
     /// System sprite catalogue. Some packed high-colour atlas modes are kept
@@ -135,11 +132,6 @@ impl RiscOsSpriteFile {
     /// Load and verify a checked-in RISC OS 3.71 sprite resource.
     pub fn builtin(set: SpriteSet) -> Result<Self, ResourceError> {
         let (label, bytes, blob_sha): (&'static str, &[u8], &'static str) = match set {
-            SpriteSet::Tools3d => (
-                "Sources/OS_Core/Desktop/Wimp/Resources/UK/Tools3d,ff9",
-                TOOLS3D,
-                "30149ceb56805c5938108f62c4513528d1c6d52d",
-            ),
             SpriteSet::Tools => (
                 "Sources/OS_Core/Desktop/Wimp/Resources/UK/Tools,ff9",
                 TOOLS,
@@ -1082,56 +1074,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pinned_tools3d_has_native_22_furniture_variants() {
-        let sprites = RiscOsSpriteFile::builtin(SpriteSet::Tools3d).unwrap();
-        assert_eq!(sprites.len(), 80);
-        for name in [
-            "bicon22",
-            "tbarmidt22",
-            "hwelll22",
-            "vbarmid22",
-            "phbarmid22",
-        ] {
-            let sprite = sprites
-                .get(name)
-                .unwrap_or_else(|| panic!("missing {name}"));
-            assert!(sprite.scale_22, "{name} should be marked as a 22 variant");
-            assert!(!sprite.rgba.is_empty());
-        }
-        assert_eq!(
-            (
-                sprites.get("bicon22").unwrap().width,
-                sprites.get("bicon22").unwrap().height
-            ),
-            (20, 20)
-        );
-        assert_eq!(
-            (
-                sprites.get("tbarmidt22").unwrap().width,
-                sprites.get("tbarmidt22").unwrap().height
-            ),
-            (128, 10)
-        );
-        assert_eq!(
-            (
-                sprites.get("vwellt22").unwrap().width,
-                sprites.get("vwellt22").unwrap().height
-            ),
-            (20, 218)
-        );
-        assert_eq!(
-            (
-                sprites.get("vbarmid22").unwrap().width,
-                sprites.get("vbarmid22").unwrap().height
-            ),
-            (20, 64)
-        );
-        assert_eq!(sprites.get("TBARMIDT22").unwrap().height, 10);
-    }
-
-    #[test]
     fn all_pinned_sprite_sets_parse_with_native_depths() {
-        for set in [SpriteSet::Tools3d, SpriteSet::Tools, SpriteSet::Sprites22] {
+        for set in [SpriteSet::Tools, SpriteSet::Sprites22] {
             let file = RiscOsSpriteFile::builtin(set).unwrap();
             assert!(!file.is_empty());
         }

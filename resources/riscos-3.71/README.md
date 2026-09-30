@@ -8,7 +8,6 @@ API by that SHA rather than through a mutable branch URL.
 | Checked-in resource | Original source path | Git blob SHA-1 |
 |---|---|---|
 | `sprites/Tools,ff9` | `Sources/OS_Core/Desktop/Wimp/Resources/UK/Tools,ff9` | `298d22d65559f3ffbb73029d3c857331a75f0ce2` |
-| `sprites/Tools3d,ff9` | `Sources/OS_Core/Desktop/Wimp/Resources/UK/Tools3d,ff9` | `30149ceb56805c5938108f62c4513528d1c6d52d` |
 | `sprites/Sprites22,ff9` | `Sources/OS_Core/Desktop/Wimp/Resources/UK/Sprites22,ff9` | `c64f8aa90a6c2593f55255dd40e29e1d4a009a24` |
 | `palettes/8desktop,ffd` | `Sources/OS_Core/Video/Render/Colours/Palettes/8desktop,ffd` | `1dc5e842239e20f3800caa9dc65deda57aac66ea` |
 | `fonts/Encodings/.Base0` | `Sources/OS_Core/Video/Render/Fonts/ROMFonts/Fonts/Encodings/.Base0` | `b8aece8a9698b55aa02cde8193b2d1ce1195e24a` |
@@ -32,6 +31,11 @@ characters 32–255 from `os-source/vdufontl1`; each glyph is eight rows and bit
 7 is the leftmost pixel. The extracted file has Git blob SHA-1
 `53a8ac732144f02835829c3d514767b2bcfd14cb` and is golden-tested alongside its
 source.
+
+The `Tools3d,ff9` sprite file was removed from the hosted bundle when the
+optional bevelled furniture preference and its rendering path were retired;
+the active shell now has one flat presentation. `WindowFurnitureLayout` remains
+as a geometry and hit-testing name, not a style switch.
 
 ## Reference screenshot texture crops
 

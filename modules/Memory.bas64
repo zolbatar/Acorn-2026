@@ -1,0 +1,65 @@
+REM @BASIC64 MODE=BASIC64
+REM @SYSTEM_PROFILE 0.1
+REM @MODULE Memory 1.0.0
+REM @CAPABILITY TaskMemory
+REM @CAPABILITY RuntimeErrors
+REM @IMPORT Host.Memory.CreateDynamicArea TaskMemory
+REM @IMPORT Host.Memory.RemoveDynamicArea TaskMemory
+REM @IMPORT Host.Memory.ReadDynamicArea TaskMemory
+REM @IMPORT Host.Memory.NextDynamicArea TaskMemory
+REM @IMPORT Host.Memory.ChangeDynamicArea TaskMemory
+REM @IMPORT Host.Runtime.UnsupportedServiceReason RuntimeErrors
+REM @SWI OS_ChangeDynamicArea &2A ChangeDynamicArea REGISTERS=R0:U32:IN|R1:S32:INOUT;BLOCKING=FALSE;REENTRANT=TRUE;ERROR=DynamicAreaError
+REM @SWI OS_DynamicArea &66 DynamicArea REGISTERS=R0:U32:IN|R1:U32:INOUT|R2:U32:INOUT|R3:U32:INOUT|R4:U32:INOUT|R5:U32:INOUT|R6:U32:INOUT|R7:U32:INOUT|R8:ADDRESS32:INOUT;BLOCKING=FALSE;REENTRANT=FALSE;ERROR=DynamicAreaError
+REM @PRIVATE PROC CreateDynamicArea
+REM @PRIVATE PROC RemoveDynamicArea
+REM @PRIVATE PROC ReadDynamicArea
+REM @PRIVATE PROC EnumerateDynamicAreas
+
+DEF PROC ChangeDynamicArea
+    PRIMITIVE Host.Memory.ChangeDynamicArea, R0%, R1% TO MOVED%
+    R1% = MOVED%
+ENDPROC
+
+DEF PROC DynamicArea
+    IF R0% = 0 THEN PROC CreateDynamicArea
+    IF R0% = 1 THEN PROC RemoveDynamicArea
+    IF R0% = 2 THEN PROC ReadDynamicArea
+    IF R0% = 3 THEN PROC EnumerateDynamicAreas
+    IF R0% > 3 THEN PRIMITIVE Host.Runtime.UnsupportedServiceReason, &66, R0%
+ENDPROC
+
+DEF PROC CreateDynamicArea
+    IF R1% <> 4294967295 OR R3% <> 4294967295 OR R6% <> 0 OR R7% <> 0 THEN PRIMITIVE Host.Runtime.UnsupportedServiceReason, &66, R1%
+    IF R4% AND &FFFFFF40 THEN PRIMITIVE Host.Runtime.UnsupportedServiceReason, &66, R4%
+    REQUESTEDNUMBER% = 4294967295
+    REQUESTEDBASE% = 4294967295
+    MAXIMUMINPUT% = R5%
+    IF R5% = 4294967295 THEN MAXIMUMINPUT% = 4294967295
+    PRIMITIVE Host.Memory.CreateDynamicArea, REQUESTEDNUMBER%, R2%, REQUESTEDBASE%, R4%, MAXIMUMINPUT%, R6%, R7%, R8% TO NUMBER%, BASE%, MAXIMUM%
+    R1% = NUMBER%
+    R3% = BASE%
+    R5% = MAXIMUM%
+ENDPROC
+
+DEF PROC RemoveDynamicArea
+    PRIMITIVE Host.Memory.RemoveDynamicArea, R1%
+ENDPROC
+
+DEF PROC ReadDynamicArea
+    PRIMITIVE Host.Memory.ReadDynamicArea, R1% TO CURRENT%, BASE%, FLAGS%, MAXIMUM%, HANDLER%, WORKSPACE%, NAME%
+    R2% = CURRENT%
+    R3% = BASE%
+    R4% = FLAGS%
+    R5% = MAXIMUM%
+    R6% = HANDLER%
+    R7% = WORKSPACE%
+    R8% = NAME%
+ENDPROC
+
+DEF PROC EnumerateDynamicAreas
+    CURSOR% = R1%
+    IF R1% = 4294967295 THEN CURSOR% = 4294967295
+    PRIMITIVE Host.Memory.NextDynamicArea, CURSOR% TO NEXTAREA%
+    R1% = NEXTAREA%
+ENDPROC

@@ -7,9 +7,9 @@ executable grammar for the native BASIC64 profile used to implement Trellis
 modules and system policy.
 
 The feature categories and semantic boundaries are firm. The spelling below has
-now been exercised by the Console, Error/FileSwitch and Wimp test fragments, but
-remains System Profile 0.1 syntax under review rather than a frozen long-term
-language ABI.
+now been exercised by Console, Error/FileSwitch, Wimp, System-query, and MOS
+command definitions, but remains System Profile 0.1 syntax under review rather
+than a frozen long-term language ABI.
 
 This profile is an additive native language. It does not silently change BBC
 BASIC V/VI compatibility behaviour.
@@ -81,7 +81,9 @@ complete general BASIC64 integer semantics for ordinary programs or every
 legacy/floating builtin combination. Unsupported conversions and 64-bit/f64
 mixing fail rather than round. `FINALLY`, workspace migration, exhaustive
 historical SWI error/X-bit behavior, and cryptographic package verification
-remain open. Classic-compatible numeric programs retain their prior
+remain open. The hosted dispatcher supports the common X-form error-block/V
+convention described below, but this does not freeze System Profile's error ABI
+or implement an OS error vector. Classic-compatible numeric programs retain their prior
 Hybrid/Strict JIT paths.
 
 The native `SystemModule` parser is profile-gated. Classic and Hybrid parsing
@@ -90,7 +92,103 @@ remain ordinary identifiers there. The new block/type syntax is not silently
 enabled by setting `MODE=BASIC64` on an ordinary source file. Representative
 Error, FileSwitch, and Wimp fragments are executable unit-test fixtures in
 `src/basic_compat/system_profile.rs`; the Console example is the real source
-module at [`../modules/Console.bas64`](../modules/Console.bas64).
+module at [`../modules/Console.bas64`](../modules/Console.bas64). The original
+Phase 4 capsule comprised seven native foundation modules; the current capsule
+adds `TrellisCommands` for BASIC64-owned `OS_CLI` routing of its own command
+family. The source files are
+[`../modules/System.bas64`](../modules/System.bas64),
+[`../modules/Boot.bas64`](../modules/Boot.bas64),
+[`../modules/Error.bas64`](../modules/Error.bas64),
+[`../modules/ModuleManager.bas64`](../modules/ModuleManager.bas64),
+[`../modules/TaskManager.bas64`](../modules/TaskManager.bas64),
+[`../modules/Memory.bas64`](../modules/Memory.bas64), and Console.
+The current capsule also loads
+[`../modules/TrellisCommands.bas64`](../modules/TrellisCommands.bas64).
+System is a source-visible startup facade and owns the bounded
+`OS_SWINumberToString`, `OS_SWINumberFromString`, and `OS_ReadMonotonicTime`
+services; its `StartupPolicy` capability limits configuration read and
+MOS/desktop handoff to three declared protected primitives. `TrellisCommands` parses and presents
+read-only `*INSPECT MODULES`, `MODULE`, `SWI`, and bounded retained-source
+`DEFINITION` queries (`SOURCE` is a read-only alias). Classic module commands
+are `*Modules`, `*RMLoad`, `*RMRun`, `*RMKill`, and conditional `*RMEnsure`;
+known native ROM/RMA commands without a hosted state model are explicit
+unsupported operations. It uses ModuleManager's shared caller-buffer query
+SWIs for inspection, while mutations use the separate `OS_Module` service.
+Other OS_CLI commands still use a capability-gated Rust legacy adapter. Active module/SWI identity is explicitly public metadata;
+retained definition source requires task-scoped `SourceRead`, and OS_Module
+mutation requires separate `ModuleManagement`. The host explicitly bootstraps
+the interactive MOS task with both rights; ordinary tasks receive neither and
+do not inherit them by task ID or module-provider capability. Boot is a lifecycle-only policy module
+with no host grant and imports System's typed functions. Rust consumes Boot's
+selected request without reinterpreting the saved Language value. Boot depends
+on Console, Error, Memory, ModuleManager, System, and TaskManager, so all six
+service providers are active before its `Start` hook runs. Console also has its
+own startup hook; System and the narrow management/error/task/memory services
+do not need startup hooks. This narrow System query set is not the broader
+public System service family proposed for later migration.
+
+The initial Error, ModuleManager, TaskManager, and Memory services are also
+real source definitions rather than parser fixtures or empty modules. Error
+owns `OS_GenerateError` and validates/reads the caller's error block through a
+checked primitive before raising a structured error. The dispatcher recognizes
+numeric X bit 17 and named `X` calls: success clears V; failure returns the
+standard four-byte number/NUL-message block in a reserved caller-task logical
+slot at R0 and sets V. Unknown SWIs use generic error code 1; structured
+service failures retain their code. This X form avoids host pointers, but
+normal calls still propagate through the existing hosted `RuntimeError` path
+rather than a RISC OS error vector/handler. BBC `SYS ... TO ... ; flags` can
+capture NZCV (V is bit 0) in this hosted subset.
+
+`TrellisCommands` also owns the hosted six-key v3 `*CONFIGURE`/`*STATUS`
+contract. The standard analogues are `Language` (only module 0/3) and
+`WimpMode`/`Mode` (`Auto` or a supported `X<width> Y<height> C/G<depth>`
+selector). WimpMode alone controls resolution and palette: Auto means
+host-sized, full-colour C16M/Rgb888; fixed selectors choose both dimensions
+and palette. Old `DisplayResolution` and `DisplayColour` file keys migrate to
+WimpMode, v2 WimpMode takes precedence over retired `TrellisOutputProfile`,
+and old `WindowFurniture` is discarded. These are not public options. There is
+no bevelled furniture option or rendering path. See the MOS configuration
+audit for defaults, mappings, and unsupported PRM mode selectors.
+
+ModuleManager's `Acorn_ModuleInfo` extension (&4FF10, ABI 1) enumerates active
+module names, versions, and lifecycle states into checked caller memory.
+ModuleManager also owns post-boot
+`OS_Module` (&1E) reasons 1 Load and 4 Delete, plus `Acorn_ModuleLookup`
+(&4FF12), `Acorn_SwiInfo` (&4FF13), `Acorn_ModuleExport` (&4FF14), and
+`Acorn_DefinitionSource` (&4FF15). Load accepts bounded caller-path,
+UTF-8 BASIC64 source of filetype `&064`; guests cannot request protected
+capabilities, and public imports must resolve to active dependencies. A same-
+title reload supports only the compatible-immediate class: it preserves module
+and entry-cell identities/workspace, advances all exported SWI generations
+atomically, and leaves active old-generation calls intact. It rejects lifecycle,
+capability, dependency, public-contract, or complete persistent type/schema
+changes rather than attempting state migration. Candidate Start and old
+Quiesce/Finalise do not run. Delete uses transactional Quiesce/Finalise,
+protects foundation and depended-on modules, and allows retry after failed
+Finalise. `Acorn_ModuleExport` enumerates active manifest SWI exports;
+`Acorn_DefinitionSource` reads retained current PROC/FN source in bounded
+caller-memory chunks. `Acorn_ModuleExport` is public metadata, while
+`Acorn_DefinitionSource` requires `SourceRead` before retained bytes are read
+or returned. Its CLI projection has the same check. `TrellisCommands.bas64` owns
+`*INSPECT` query presentation and the documented classic module command subset;
+other MOS command parsing remains on the legacy Rust adapter.
+Other historical `OS_Module` reasons are structured rejections, particularly reason 18 because
+it returns process pointers; `%` instantiations and native `&FFA` images are
+unsupported. The project queries return manifest identity through checked
+caller buffers, never pointers. Exact OS_Module reasons and register shapes
+are documented in [`trellis-boot-capsule.md`](trellis-boot-capsule.md) and the
+[RISC OS PRM](https://www.riscos.com/support/developers/prm/modules.html).
+
+TaskManager's
+`Acorn_TaskInfo` extension (&4FF11, ABI 1) reports the caller task ID, logical
+address-space span, and dynamic-area count, not task-creation or scheduler
+control. Memory owns standard `OS_ChangeDynamicArea` (&2A) and
+`OS_DynamicArea` (&66) reason dispatch. Its hosted areas use automatic
+caller-local IDs/bases and checked task memory, with a 16 MiB per-area cap,
+32 MiB per-task reservation cap, and no callbacks, physical pages, or
+doubly-mapped support. Exact public ownership and compatibility gaps are listed
+in [`trellis-boot-capsule.md`](trellis-boot-capsule.md) and
+[`trellis-compatibility-matrix.md`](trellis-compatibility-matrix.md).
 
 ## Purpose
 
@@ -270,10 +368,17 @@ ENDPROC
 ```
 
 The interpreter propagates a structured failure to the caller or matching
-`CATCH`. Mapping that value to each public SWI's documented RISC OS error block
-and X-bit/register convention is not implemented yet; the Console slice retains
-its current Rust `Result` error transport. Rust primitives do not fabricate
-unchecked guest pointers.
+`CATCH`. At the public SWI boundary, numeric X bit 17 and named `X` calls now
+clear V on success or return normally with V set and R0 pointing to a
+caller-task-local, checked standard error block on failure. The block contains
+a 32-bit code and NUL-terminated message in reserved logical memory, not a host
+pointer. Unknown SWIs use generic code 1; structured service failures retain
+their code. The PRM-specific `XOS_GenerateError` form instead preserves its
+input R0 error-block address and sets V. Non-X calls still use the hosted `RuntimeError` propagation path;
+RISC OS error vectors/handlers and exhaustive service-specific error/flag
+mapping are not implemented. BBC `SYS ... TO ... ; flags` exposes the hosted
+NZCV result (V is bit 0). Rust primitives do not fabricate unchecked guest
+pointers.
 
 System Profile 0.1 uses typed throws and structured `TRY`/`CATCH`/`ENDTRY`.
 Thrown values carry the declared type, code, message, and readonly fields;
@@ -542,12 +647,15 @@ Console, Error, FileSwitch and Wimp fragments exist; the provisional comment
 metadata and type/signature grammar is exercised; compatibility gates and
 interpreter semantics are tested; and Console is routed through a module-owned
 SWI subset. The initial syntax should now be reviewed for awkwardness before
-System Profile 0.1 is declared stable.
+System Profile 0.1 is not declared stable; its grammar and package ABI remain
+provisional pending broader review and completion of the listed acceptance
+criteria.
 
 The first 0.1 design loop has resolved and implemented local immutable
 bindings, handle-registry rights, exact explicitly typed 64-bit integers, and
-executable qualified imported PROC/FN calls. Exhaustive public SWI error/X-bit
-mapping remains open. The portable IR is complete for the admitted profile
+executable qualified imported PROC/FN calls. Common X-form SWI errors now use
+a checked per-task standard error block and V flag; exhaustive public SWI and
+normal error-handler mapping remains open. The portable IR is complete for the admitted profile
 subset and is the interpreter boundary; native System Profile JIT/AOT lowering
 remains future work until module state, checked memory, primitive authority,
 and generation interfaces are stable enough to share with a second backend.
@@ -593,5 +701,5 @@ handles without encoding them as naming conventions.
 | Caller-scoped addresses and memory safety | Typed for System Profile SWI parameters/PC, checked on memory access and arithmetic, rejected from persistent state. Legacy numeric BASIC memory access remains for compatibility. |
 | CLASSIC/HYBRID compatibility | Profile-gating tests keep System Profile names ordinary under the compatibility parser. The Hybrid JIT keeps the numeric classic path and routes the new features to interpreter; Strict rejects them explicitly. |
 | Portable typed IR and module JIT/AOT | A separate source-located typed IR fully represents the admitted statement/expression subset without retaining parser AST payload and is reconstructed into the reference interpreter. It carries definition/workspace/source identity and checked task-owned address operations. Hybrid/Strict/AOT requests share an explicit boundary; native System Profile lowering and serialized package ABI are not implemented. |
-| External SWI structured-error mapping and exhaustive BBC error/X-bit conformance | Not implemented; current errors propagate through the hosted Rust `Result` path. |
+| External SWI structured-error mapping and exhaustive BBC error/X-bit conformance | Bounded X-form mapping is implemented: success clears V; errors return a caller-task standard block in R0 and set V; unknown SWIs use code 1. Non-X failures retain hosted `RuntimeError` propagation. Error vectors/handlers and exhaustive SWI-specific behavior remain unimplemented. |
 | State migration, broad exact integer semantics outside explicitly typed System Profile values, exhaustive SWI error/X-bit conformance, general constants, cryptographic package verification | Not implemented; the current executable subset does not imply those broader guarantees. |

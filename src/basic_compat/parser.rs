@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use crate::{
     configure::BasicLanguageMode as LanguageMode,
     error::RuntimeError,
-    graphics::GraphicsProfile,
+    graphics::{GraphicsProfile, TextRenderingProfile},
     tokenized_basic::{TokenizedBasicLine, TokenizedBasicProgram, decode_line_reference},
 };
 
@@ -226,6 +226,7 @@ pub(crate) enum Statement {
         name: Vec<u8>,
         arguments: Vec<Option<Expr>>,
         results: Vec<String>,
+        flags: Option<String>,
     },
     PrimitiveCall {
         name: String,
@@ -322,9 +323,11 @@ pub(crate) struct ProgramOptions {
     pub mode: LanguageMode,
     pub target: GraphicsProfile,
     pub profile: Option<String>,
+    pub text_profile: TextRenderingProfile,
     pub mode_declared: bool,
     pub target_declared: bool,
     pub profile_declared: bool,
+    pub text_profile_declared: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -525,6 +528,7 @@ pub(super) fn parse_basic64_directive(
     let mut mode_seen = false;
     let mut target_seen = false;
     let mut profile_seen = false;
+    let mut text_seen = false;
     for word in words {
         let (key, value) = word
             .split_once('=')
@@ -571,6 +575,19 @@ pub(super) fn parse_basic64_directive(
             profile_seen = true;
             options.profile_declared = true;
             options.profile = Some(value.to_owned());
+        } else if key.eq_ignore_ascii_case("TEXT") {
+            if text_seen {
+                return Err(syntax_error(line_number, "duplicate TEXT field"));
+            }
+            text_seen = true;
+            options.text_profile_declared = true;
+            options.text_profile = if value.eq_ignore_ascii_case("CLASSIC") {
+                TextRenderingProfile::Classic
+            } else if value.eq_ignore_ascii_case("MODERN") {
+                TextRenderingProfile::Modern
+            } else {
+                return Err(syntax_error(line_number, "unknown BASIC text profile"));
+            };
         } else {
             return Err(syntax_error(
                 line_number,
@@ -1710,10 +1727,16 @@ impl Parser {
                 }
             }
         }
+        let flags = if self.consume_symbol(b';') {
+            Some(self.expect_identifier("SYS flags variable")?)
+        } else {
+            None
+        };
         Ok(Statement::Sys {
             name,
             arguments,
             results,
+            flags,
         })
     }
 
@@ -2176,7 +2199,25 @@ fn syntax_error(line_number: u16, message: &str) -> RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::{Statement, TokenProfile, parse_program, parse_source};
+    use crate::graphics::TextRenderingProfile;
     use crate::tokenized_basic::TokenizedBasicProgram;
+
+    #[test]
+    fn text_profile_is_independent_directive_metadata() {
+        let parsed = parse_source("REM @BASIC64 MODE=CLASSIC TEXT=MODERN\nPRINT \"hello\"\n")
+            .expect("text profile should be accepted alongside CLASSIC language mode");
+        assert_eq!(parsed.options.text_profile, TextRenderingProfile::Modern);
+        assert!(parsed.options.text_profile_declared);
+        assert_eq!(
+            parsed.options.mode,
+            crate::configure::BasicLanguageMode::Classic
+        );
+
+        let error =
+            parse_source("REM @BASIC64 MODE=BASIC64 TEXT=CLASSIC TEXT=MODERN\nPRINT \"hello\"\n")
+                .expect_err("a duplicate TEXT field must be rejected");
+        assert!(error.to_string().contains("duplicate TEXT field"));
+    }
 
     #[test]
     fn parses_dense_clocksp5_source_without_splitting_keyword_prefixed_names() {

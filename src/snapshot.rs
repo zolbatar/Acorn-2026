@@ -135,7 +135,7 @@ pub fn write_desktop_demo_snapshot(path: impl AsRef<Path>) -> Result<(), Box<dyn
         &wimp.desktop_menus(),
         wimp.desktop_notice().as_deref(),
         &mut rgba,
-    );
+    )?;
     write_ppm(path.as_ref(), &rgba)?;
     Ok(())
 }
@@ -235,37 +235,6 @@ pub fn write_display_manager_snapshots(directory: impl AsRef<Path>) -> Result<()
             &capture_display_manager_scene(&wimp),
         )?;
 
-        click_display_window_control(&wimp, "16 million")?;
-        let colour_menu = wait_for_display_menu("Colours", &wimp, &task_error_receiver)?;
-        let colour_labels = colour_menu
-            .rows
-            .iter()
-            .map(|row| row.label.as_str())
-            .collect::<Vec<_>>();
-        if colour_labels
-            != [
-                "Black/white",
-                "4 greys",
-                "16 greys",
-                "16 colours",
-                "256 greys",
-                "256 colours",
-                "32 thousand",
-                "16 million",
-            ]
-        {
-            return Err(io::Error::other(format!(
-                "Display Manager colour menu is incomplete: {colour_labels:?}"
-            ))
-            .into());
-        }
-        write_display_manager_scene(
-            directory.join("display-manager-colours-menu.ppm"),
-            &capture_display_manager_scene(&wimp),
-        )?;
-        click_display_menu_row(&wimp, &colour_menu, "Black/white")?;
-        wait_for_display_window_icon(&wimp, &task_error_receiver, "Black/white")?;
-
         let resolution_label = wimp
             .desktop_window_icons()
             .into_iter()
@@ -303,6 +272,36 @@ pub fn write_display_manager_snapshots(directory: impl AsRef<Path>) -> Result<()
         )?;
         click_display_menu_row(&wimp, &resolution_menu, "1024 x 768")?;
         wait_for_display_window_icon(&wimp, &task_error_receiver, "1024 x 768")?;
+        click_display_window_control(&wimp, "16 million")?;
+        let colour_menu = wait_for_display_menu("Colours", &wimp, &task_error_receiver)?;
+        let colour_labels = colour_menu
+            .rows
+            .iter()
+            .map(|row| row.label.as_str())
+            .collect::<Vec<_>>();
+        if colour_labels
+            != [
+                "Black/white",
+                "4 greys",
+                "16 greys",
+                "16 colours",
+                "256 greys",
+                "256 colours",
+                "32 thousand",
+                "16 million",
+            ]
+        {
+            return Err(io::Error::other(format!(
+                "Display Manager colour menu is incomplete: {colour_labels:?}"
+            ))
+            .into());
+        }
+        write_display_manager_scene(
+            directory.join("display-manager-colours-menu.ppm"),
+            &capture_display_manager_scene(&wimp),
+        )?;
+        click_display_menu_row(&wimp, &colour_menu, "Black/white")?;
+        wait_for_display_window_icon(&wimp, &task_error_receiver, "Black/white")?;
         write_display_manager_scene(
             directory.join("display-manager-cancel-pending.ppm"),
             &capture_display_manager_scene(&wimp),
@@ -416,7 +415,7 @@ pub fn write_display_manager_snapshots(directory: impl AsRef<Path>) -> Result<()
         wait_for_display_manager_closed(&wimp, &task_error_receiver)?;
         let expected_windowed = DisplaySettings {
             resolution: DesktopResolution::Window,
-            colour: DisplayColour::Grey256,
+            colour: DisplayColour::Rgb888,
         };
         if wimp.display_settings() != expected_windowed
             || wimp.desktop_metrics().pixel_size() != (900, 700)
@@ -449,7 +448,11 @@ pub fn write_display_manager_snapshots(directory: impl AsRef<Path>) -> Result<()
                 io::Error::other("Display Manager lost its singleton window after resize").into(),
             );
         }
-        click_display_window_control(&wimp, "256 greys")?;
+        click_display_window_control(&wimp, "Window (900 x 700)")?;
+        let resolution_menu = wait_for_display_menu("Resolution", &wimp, &task_error_receiver)?;
+        click_display_menu_row(&wimp, &resolution_menu, "640 x 480")?;
+        wait_for_display_window_icon(&wimp, &task_error_receiver, "640 x 480")?;
+        click_display_window_control(&wimp, "16 million")?;
         let colour_menu = wait_for_display_menu("Colours", &wimp, &task_error_receiver)?;
         click_display_menu_row(&wimp, &colour_menu, "Black/white")?;
         wait_for_display_window_icon(&wimp, &task_error_receiver, "Black/white")?;
@@ -999,7 +1002,8 @@ fn write_filer_desktop_scene(path: &Path, scene: &FilerDesktopScene) -> io::Resu
         &scene.menus,
         None,
         &mut rgba,
-    );
+    )
+    .map_err(io::Error::other)?;
     write_ppm(path, &rgba)
 }
 

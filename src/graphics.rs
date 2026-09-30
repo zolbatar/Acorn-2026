@@ -8,6 +8,28 @@ pub enum GraphicsProfile {
     Agon,
 }
 
+/// Guest text presentation is independent from the BASIC language mode.
+/// `Classic` keeps the historical bitmap renderer; `Modern` keeps the same
+/// text grid and cursor contract but paints scalable JetBrains Mono glyphs in
+/// the desktop compositor.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TextRenderingProfile {
+    #[default]
+    Classic,
+    Modern,
+}
+
+/// Source string encoding selected for guest output. Legacy BASIC/Hybrid
+/// output remains byte-oriented; native BASIC64 may decode UTF-8 into a
+/// Classic Latin-1 bitmap byte or a replacement `?`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TextEncoding {
+    #[default]
+    ClassicBytes,
+    Latin1,
+    Utf8,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Point {
     pub x: i32,
@@ -90,11 +112,38 @@ pub struct GraphicsSnapshot {
     pub graphics_cursor: Point,
     pub text_cursor: Point,
     pub text_colour: u8,
+    pub text_profile: TextRenderingProfile,
+    pub text_encoding: TextEncoding,
+    /// Marks the interactive host console, whose scalable text is laid out on
+    /// a host-owned 640x512 virtual surface rather than the guest MODE raster.
+    pub modern_shell_console: bool,
     pub graphics_action: u8,
     pub graphics_colour: u32,
     pub text_cells: Vec<u8>,
+    /// Unicode cell contents for the Modern text renderer. The classic byte
+    /// grid remains authoritative for legacy rendering and VDU behavior.
+    pub modern_text_cells: Vec<char>,
+    /// In-flight native UTF-8 decoder state is part of display snapshots so a
+    /// split multi-byte scalar survives a compositor snapshot between bytes.
+    #[doc(hidden)]
+    pub pending_utf8_bytes: Vec<u8>,
+    #[doc(hidden)]
+    pub pending_utf8_expected: usize,
     pub primitives: Vec<GraphicsPrimitive>,
     pub raster_surface: Option<SharedRasterSurface>,
+}
+
+impl GraphicsSnapshot {
+    /// Virtual coordinate size used to lay out Modern text. The MOS shell has
+    /// a host-owned 4:5 canvas so 80x32 JetBrains Mono cells retain their
+    /// intrinsic width-to-line-height ratio; guests keep their MODE geometry.
+    pub(crate) fn modern_text_surface_size(&self) -> (u32, u32) {
+        if self.modern_shell_console {
+            (640, 512)
+        } else {
+            (self.mode.pixel_width, self.mode.pixel_height)
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -139,6 +188,18 @@ impl SharedRasterSurface {
             width,
             height,
             pixels,
+        })))
+    }
+
+    fn detached_copy(&self) -> Self {
+        let data = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self(Arc::new(Mutex::new(RasterData {
+            width: data.width,
+            height: data.height,
+            pixels: data.pixels.clone(),
         })))
     }
 
@@ -244,6 +305,7 @@ struct PendingVdu {
 /// The service preserves logical graphics coordinates and clipping state; a
 /// windowing backend can render the resulting snapshot without changing BASIC
 /// or SWI behavior.
+#[derive(Clone)]
 pub struct GraphicsService {
     snapshot: GraphicsSnapshot,
     pending_vdu: Option<PendingVdu>,
@@ -269,12 +331,21 @@ impl Default for GraphicsService {
                 graphics_cursor: Point::default(),
                 text_cursor: Point::default(),
                 text_colour: default_foreground_colour(mode),
+                text_profile: TextRenderingProfile::Classic,
+                text_encoding: TextEncoding::ClassicBytes,
+                modern_shell_console: false,
                 graphics_action: 0,
                 graphics_colour: 7,
                 text_cells: vec![
                     b' ';
                     usize::from(mode.text_columns) * usize::from(mode.text_rows)
                 ],
+                modern_text_cells: vec![
+                    ' ';
+                    usize::from(mode.text_columns) * usize::from(mode.text_rows)
+                ],
+                pending_utf8_bytes: Vec::with_capacity(4),
+                pending_utf8_expected: 0,
                 primitives: Vec::new(),
                 raster_surface: Some(SharedRasterSurface::new(
                     mode.pixel_width,
@@ -298,11 +369,27 @@ impl GraphicsService {
         }
     }
 
+    /// Copy graphics state without sharing the mutable CPU raster. The MOS
+    /// shell uses this while a guest temporarily occupies its fullscreen view.
+    pub(crate) fn detached_copy(&self) -> Self {
+        let mut copy = self.clone();
+        copy.snapshot.raster_surface = self
+            .snapshot
+            .raster_surface
+            .as_ref()
+            .map(SharedRasterSurface::detached_copy);
+        copy
+    }
+
     /// Copy the current mode and drawing state into an independent output
     /// destination, including a separate authoritative true-colour raster.
     pub(crate) fn new_window_output(&self) -> Self {
         let mut snapshot = self.snapshot.clone();
         snapshot.text_cells.fill(b' ');
+        snapshot.modern_text_cells.fill(' ');
+        snapshot.modern_shell_console = false;
+        snapshot.pending_utf8_bytes.clear();
+        snapshot.pending_utf8_expected = 0;
         snapshot.text_cursor = Point::default();
         snapshot.graphics_cursor = Point::default();
         snapshot.primitives.clear();
@@ -415,6 +502,15 @@ impl GraphicsService {
             return Ok(None);
         }
 
+        // Incomplete UTF-8 cannot span VDU controls. Replace the unfinished
+        // character before processing a control byte or a new leading byte.
+        if byte < 0x20
+            || byte == 0x7F
+            || self.snapshot.pending_utf8_expected != 0 && !(0x80..=0xBF).contains(&byte)
+        {
+            self.flush_incomplete_utf8();
+        }
+
         if byte == 0x7F {
             self.move_text_cursor(8);
             return Ok(Some(byte));
@@ -432,8 +528,126 @@ impl GraphicsService {
             return self.apply_vdu(byte, &[]);
         }
 
-        self.write_text_cell(byte);
+        match self.snapshot.text_encoding {
+            TextEncoding::Utf8 => self.write_utf8_byte(byte),
+            TextEncoding::Latin1 if self.snapshot.text_profile == TextRenderingProfile::Modern => {
+                let character = char::from(byte);
+                let character = if character.is_control() {
+                    '\u{FFFD}'
+                } else {
+                    character
+                };
+                let stored_byte = if character == '\u{FFFD}' { b'?' } else { byte };
+                self.write_text_cell(stored_byte, character);
+            }
+            _ => self.write_text_cell(byte, char::from(byte)),
+        }
         Ok(Some(byte))
+    }
+
+    pub(crate) fn set_text_profile(
+        &mut self,
+        profile: TextRenderingProfile,
+        encoding: TextEncoding,
+    ) -> Result<(), RuntimeError> {
+        if profile == TextRenderingProfile::Modern && is_teletext_mode(self.snapshot.mode.number) {
+            return Err(RuntimeError::Program(
+                "TEXT=MODERN does not support Teletext MODE 7; select TEXT=CLASSIC".into(),
+            ));
+        }
+        self.flush_incomplete_utf8();
+        if self.snapshot.text_profile != profile || self.snapshot.text_encoding != encoding {
+            self.snapshot.modern_shell_console = false;
+            self.snapshot.text_profile = profile;
+            self.snapshot.text_encoding = encoding;
+            self.snapshot.revision = self.snapshot.revision.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    /// Select the Runtime-owned Modern text presentation for the interactive
+    /// shell. Its console canvas is separate from the classic guest MODE grid.
+    pub(crate) fn set_modern_shell_console(&mut self) -> Result<(), RuntimeError> {
+        let mut next = self.clone();
+        next.set_text_profile(TextRenderingProfile::Modern, TextEncoding::Utf8)?;
+        if !next.snapshot.modern_shell_console {
+            next.snapshot.modern_shell_console = true;
+            next.snapshot.revision = next.snapshot.revision.wrapping_add(1);
+        }
+        *self = next;
+        Ok(())
+    }
+
+    /// Select the guest graphics target and text profile as one transition.
+    /// A target change resets to its default mode first; on the current target,
+    /// selecting Classic first lets a subsequent MODE 7 program leave an
+    /// earlier Modern session without the Teletext guard rejecting it.
+    pub(crate) fn set_display_profiles(
+        &mut self,
+        graphics_profile: GraphicsProfile,
+        text_profile: TextRenderingProfile,
+        encoding: TextEncoding,
+    ) -> Result<(), RuntimeError> {
+        let mut next = self.clone();
+        if next.snapshot.modern_shell_console {
+            next.snapshot.modern_shell_console = false;
+            next.snapshot.revision = next.snapshot.revision.wrapping_add(1);
+        }
+        if next.profile == graphics_profile {
+            next.set_text_profile(text_profile, encoding)?;
+            next.set_profile(graphics_profile)?;
+        } else {
+            next.set_profile(graphics_profile)?;
+            next.set_text_profile(text_profile, encoding)?;
+        }
+        *self = next;
+        Ok(())
+    }
+
+    fn write_utf8_byte(&mut self, byte: u8) {
+        if self.snapshot.pending_utf8_expected == 0 {
+            if byte < 0x80 {
+                self.write_text_cell(byte, char::from(byte));
+                return;
+            }
+            self.snapshot.pending_utf8_expected = match byte {
+                0xC2..=0xDF => 2,
+                0xE0..=0xEF => 3,
+                0xF0..=0xF4 => 4,
+                _ => {
+                    self.write_text_cell(b'?', '\u{FFFD}');
+                    return;
+                }
+            };
+            self.snapshot.pending_utf8_bytes.push(byte);
+            return;
+        }
+
+        if !(0x80..=0xBF).contains(&byte) {
+            self.flush_incomplete_utf8();
+            self.write_utf8_byte(byte);
+            return;
+        }
+        self.snapshot.pending_utf8_bytes.push(byte);
+        if self.snapshot.pending_utf8_bytes.len() == self.snapshot.pending_utf8_expected {
+            let character = std::str::from_utf8(&self.snapshot.pending_utf8_bytes)
+                .ok()
+                .and_then(|text| text.chars().next())
+                .filter(|character| !character.is_control())
+                .unwrap_or('\u{FFFD}');
+            let stored_byte = classic_byte_for_character(character);
+            self.write_text_cell(stored_byte, character);
+            self.snapshot.pending_utf8_bytes.clear();
+            self.snapshot.pending_utf8_expected = 0;
+        }
+    }
+
+    fn flush_incomplete_utf8(&mut self) {
+        if !self.snapshot.pending_utf8_bytes.is_empty() {
+            self.snapshot.pending_utf8_bytes.clear();
+            self.snapshot.pending_utf8_expected = 0;
+            self.write_text_cell(b'?', '\u{FFFD}');
+        }
     }
 
     /// Apply one OS_Plot operation using RISC OS logical coordinates.
@@ -575,6 +789,8 @@ impl GraphicsService {
         self.snapshot.text_cursor = Point::default();
         self.snapshot.text_cells =
             vec![b' '; usize::from(mode.text_columns) * usize::from(mode.text_rows)];
+        self.snapshot.modern_text_cells =
+            vec![' '; usize::from(mode.text_columns) * usize::from(mode.text_rows)];
         self.snapshot.primitives.clear();
         self.snapshot.raster_surface = Some(SharedRasterSurface::new(pixel_width, pixel_height));
         self.snapshot.logical_palette = Vec::new();
@@ -619,6 +835,29 @@ impl GraphicsService {
     }
 
     fn apply_vdu(&mut self, command: u8, parameters: &[u8]) -> Result<Option<u8>, RuntimeError> {
+        if self.snapshot.text_profile == TextRenderingProfile::Modern {
+            match command {
+                5 => {
+                    return Err(RuntimeError::Program(
+                        "VDU 5 graphics-cursor text requires TEXT=CLASSIC; Modern text uses the character grid".into(),
+                    ));
+                }
+                23 => {
+                    return Err(RuntimeError::Program(
+                        "VDU 23 user-defined raster glyphs require TEXT=CLASSIC".into(),
+                    ));
+                }
+                22 if parameters
+                    .first()
+                    .is_some_and(|number| is_teletext_mode(*number)) =>
+                {
+                    return Err(RuntimeError::Program(
+                        "Teletext MODE 7 requires TEXT=CLASSIC".into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
         match command {
             1 => return Ok(None),
             7 => return Ok(Some(7)),
@@ -685,6 +924,13 @@ impl GraphicsService {
                 self.profile
             ))
         })?;
+        if self.snapshot.text_profile == TextRenderingProfile::Modern
+            && is_teletext_mode(mode.number)
+        {
+            return Err(RuntimeError::Program(
+                "Teletext MODE 7 requires TEXT=CLASSIC".into(),
+            ));
+        }
         self.snapshot.mode = mode;
         self.snapshot.text_window = default_text_window(mode);
         self.snapshot.graphics_window = default_graphics_window(mode);
@@ -693,6 +939,8 @@ impl GraphicsService {
         self.snapshot.text_cursor = Point::default();
         self.snapshot.text_cells =
             vec![b' '; usize::from(mode.text_columns) * usize::from(mode.text_rows)];
+        self.snapshot.modern_text_cells =
+            vec![' '; usize::from(mode.text_columns) * usize::from(mode.text_rows)];
         self.snapshot.primitives.clear();
         self.snapshot.raster_surface = Some(SharedRasterSurface::new(
             mode.pixel_width,
@@ -740,7 +988,7 @@ impl GraphicsService {
         self.snapshot.text_cursor = Point::default();
     }
 
-    fn write_text_cell(&mut self, byte: u8) {
+    fn write_text_cell(&mut self, byte: u8, character: char) {
         let window_width =
             i32::from(self.snapshot.text_window.right - self.snapshot.text_window.left + 1);
         let window_height =
@@ -754,6 +1002,7 @@ impl GraphicsService {
             let index =
                 usize::from(y) * usize::from(self.snapshot.mode.text_columns) + usize::from(x);
             self.snapshot.text_cells[index] = byte;
+            self.snapshot.modern_text_cells[index] = character;
         }
         self.snapshot.text_cursor.x += 1;
         if self.snapshot.text_cursor.x >= window_width {
@@ -803,6 +1052,7 @@ impl GraphicsService {
                 let index =
                     usize::from(y) * usize::from(self.snapshot.mode.text_columns) + usize::from(x);
                 self.snapshot.text_cells[index] = b' ';
+                self.snapshot.modern_text_cells[index] = ' ';
             }
         }
     }
@@ -837,6 +1087,7 @@ impl GraphicsService {
                 let index =
                     usize::from(y) * usize::from(self.snapshot.mode.text_columns) + usize::from(x);
                 self.snapshot.text_cells[index] = b' ';
+                self.snapshot.modern_text_cells[index] = ' ';
             }
         }
     }
@@ -865,11 +1116,14 @@ impl GraphicsService {
                 let source = (row + 1) * columns + column;
                 let destination = row * columns + column;
                 self.snapshot.text_cells[destination] = self.snapshot.text_cells[source];
+                self.snapshot.modern_text_cells[destination] =
+                    self.snapshot.modern_text_cells[source];
             }
         }
         let last_row = bottom * columns;
         for column in left..=right {
             self.snapshot.text_cells[last_row + column] = b' ';
+            self.snapshot.modern_text_cells[last_row + column] = ' ';
         }
     }
 }
@@ -1382,6 +1636,14 @@ fn is_teletext_mode(number: u8) -> bool {
     number == 7
 }
 
+fn classic_byte_for_character(character: char) -> u8 {
+    if !character.is_control() && (character as u32) <= u32::from(u8::MAX) {
+        character as u8
+    } else {
+        b'?'
+    }
+}
+
 fn default_palette(mode: ScreenMode) -> Vec<[u8; 4]> {
     if mode.bits_per_pixel == 32 {
         return Vec::new();
@@ -1393,7 +1655,117 @@ fn default_palette(mode: ScreenMode) -> Vec<[u8; 4]> {
 
 #[cfg(test)]
 mod output_surface_tests {
-    use super::{GraphicsService, GraphicsWindow, Point, text_cell_bounds};
+    use super::{
+        GraphicsProfile, GraphicsService, GraphicsWindow, Point, TextEncoding,
+        TextRenderingProfile, text_cell_bounds,
+    };
+
+    #[test]
+    fn modern_shell_uses_a_host_text_canvas_without_changing_guest_mode() {
+        let mut graphics = GraphicsService::default();
+        let guest_mode = graphics.snapshot().mode;
+        graphics.set_modern_shell_console().unwrap();
+        let snapshot = graphics.snapshot();
+        assert_eq!(snapshot.mode, guest_mode);
+        assert_eq!(snapshot.mode.pixel_width, 640);
+        assert_eq!(snapshot.mode.pixel_height, 256);
+        assert_eq!(snapshot.mode.text_columns, 80);
+        assert_eq!(snapshot.mode.text_rows, 32);
+        assert_eq!(snapshot.modern_text_surface_size(), (640, 512));
+        assert!(snapshot.modern_shell_console);
+        assert_eq!(snapshot.text_cells.len(), 80 * 32);
+
+        graphics
+            .set_display_profiles(
+                GraphicsProfile::Hosted,
+                TextRenderingProfile::Classic,
+                TextEncoding::ClassicBytes,
+            )
+            .unwrap();
+        assert!(!graphics.snapshot().modern_shell_console);
+        assert_eq!(graphics.snapshot().mode, guest_mode);
+        assert_eq!(
+            graphics.snapshot().text_window.bottom,
+            guest_mode.text_rows - 1
+        );
+    }
+
+    #[test]
+    fn modern_grid_decodes_native_utf8_and_classic_latin1_to_one_cell_each() {
+        let mut native = GraphicsService::default();
+        native
+            .set_text_profile(TextRenderingProfile::Modern, TextEncoding::Utf8)
+            .unwrap();
+        for byte in "Aé🙂".bytes() {
+            native.write_byte(byte).unwrap();
+        }
+        assert_eq!(&native.snapshot().modern_text_cells[..3], &['A', 'é', '🙂']);
+        assert_eq!(native.snapshot().text_cursor.x, 3);
+
+        let mut classic = GraphicsService::default();
+        classic
+            .set_text_profile(TextRenderingProfile::Modern, TextEncoding::Latin1)
+            .unwrap();
+        classic.write_byte(0xE9).unwrap();
+        assert_eq!(classic.snapshot().modern_text_cells[0], 'é');
+        assert_eq!(classic.snapshot().text_cursor.x, 1);
+    }
+
+    #[test]
+    fn native_classic_utf8_maps_latin1_and_unrepresentable_scalars_to_classic_bytes() {
+        let mut graphics = GraphicsService::default();
+        graphics
+            .set_display_profiles(
+                GraphicsProfile::Hosted,
+                TextRenderingProfile::Classic,
+                TextEncoding::Utf8,
+            )
+            .unwrap();
+        for byte in "é🙂".bytes() {
+            graphics.write_byte(byte).unwrap();
+        }
+        assert_eq!(&graphics.snapshot().text_cells[..2], &[0xE9, b'?']);
+        assert_eq!(&graphics.snapshot().modern_text_cells[..2], &['é', '🙂']);
+        assert_eq!(graphics.snapshot().text_cursor.x, 2);
+    }
+
+    #[test]
+    fn rejected_modern_teletext_transition_leaves_the_entire_display_unchanged() {
+        let mut graphics = GraphicsService::default();
+        graphics.set_mode(7).unwrap();
+        let before = graphics.snapshot().clone();
+        let error = graphics
+            .set_display_profiles(
+                GraphicsProfile::Hosted,
+                TextRenderingProfile::Modern,
+                TextEncoding::Utf8,
+            )
+            .expect_err("Modern cannot select Teletext on the current target");
+        assert!(error.to_string().contains("Teletext MODE 7"));
+        assert_eq!(graphics.snapshot(), &before);
+    }
+
+    #[test]
+    fn modern_profile_rejects_bitmap_only_vdu_operations() {
+        let mut graphics = GraphicsService::default();
+        graphics
+            .set_text_profile(TextRenderingProfile::Modern, TextEncoding::Utf8)
+            .unwrap();
+        assert!(graphics.write_byte(5).is_err());
+
+        graphics.write_byte(23).unwrap();
+        for parameter in 0..9 {
+            let result = graphics.write_byte(parameter);
+            if parameter == 8 {
+                assert!(result.is_err());
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+
+        assert!(graphics.write_byte(22).unwrap().is_none());
+        assert!(graphics.write_byte(7).is_err());
+    }
 
     fn rasterized_line_pixels(from: Point, to: Point) -> Vec<(usize, usize)> {
         let mut graphics = GraphicsService::default();
@@ -1507,7 +1879,7 @@ mod output_surface_tests {
         assert!(!graphics.snapshot().graphics_content_present);
 
         let mut frame = vec![0; mode.pixel_width as usize * mode.pixel_height as usize * 4];
-        crate::renderer::render_desktop_content(graphics.snapshot(), &mut frame);
+        crate::renderer::render_desktop_content(graphics.snapshot(), &mut frame).unwrap();
         assert!(
             frame
                 .chunks_exact(4)

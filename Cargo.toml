@@ -24,6 +24,7 @@ cranelift-jit = { version = "=0.136.1", optional = true }
 cranelift-module = { version = "=0.136.1", optional = true }
 cranelift-native = { version = "=0.136.1", optional = true }
 parley = "=0.11.1"
+skrifa = "=0.44.0"
 pollster = "1.0.1"
 png = "=0.18.1"
 vello = "=0.10.0"

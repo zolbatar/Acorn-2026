@@ -699,6 +699,16 @@ impl WimpServer {
         let _ = self.desktop_updates.send(());
     }
 
+    /// Bind the session's persistent configuration without changing live
+    /// display settings. MOS may apply settings before the desktop handoff;
+    /// those writes must share its recovery latch and authority boundary.
+    pub(crate) fn bind_configure_store(&self, configure: ConfigureStore) {
+        *self
+            .configure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(configure);
+    }
+
     pub(crate) fn configure_store(&self) -> Option<ConfigureStore> {
         self.configure
             .lock()
@@ -747,7 +757,7 @@ impl WimpServer {
     }
 
     /// Persist and then atomically activate both display settings.
-    pub fn apply_display_settings(&self, settings: DisplaySettings) -> Result<(), String> {
+    pub(crate) fn apply_display_settings(&self, settings: DisplaySettings) -> Result<(), String> {
         let configure = self
             .configure_store()
             .unwrap_or_else(ConfigureStore::default);
@@ -6443,6 +6453,7 @@ mod tests {
                 colour: DisplayColour::Rgb555,
             })
             .unwrap();
+        let saved_fixed_settings = fs::read(&path).unwrap();
         let fixed = server.set_host_window_size(1024, 768);
         assert_eq!(fixed.pixel_size(), (640, 480));
         assert_eq!(fixed.host_pixel_size(), (1024, 768));
@@ -6452,6 +6463,24 @@ mod tests {
             .apply_display_settings(DisplaySettings {
                 resolution: DesktopResolution::Window,
                 colour: DisplayColour::Rgb555,
+            })
+            .expect_err("Auto must not accept an independent non-full-colour palette");
+        assert_eq!(
+            server.display_settings(),
+            DisplaySettings {
+                resolution: DesktopResolution::R640x480,
+                colour: DisplayColour::Rgb555,
+            }
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            saved_fixed_settings,
+            "rejected Auto/non-full-colour pair must not rewrite persisted settings"
+        );
+        server
+            .apply_display_settings(DisplaySettings {
+                resolution: DesktopResolution::Window,
+                colour: DisplayColour::Rgb888,
             })
             .unwrap();
         assert_eq!(server.desktop_metrics().pixel_size(), (1024, 768));
@@ -6465,7 +6494,7 @@ mod tests {
                 .unwrap()
                 .display
                 .colour,
-            DisplayColour::Rgb555
+            DisplayColour::Rgb888
         );
         let _ = fs::remove_file(path);
     }

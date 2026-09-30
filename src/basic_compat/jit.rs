@@ -1362,7 +1362,7 @@ fn has_compatible_mandelbrot_sethsv_procedure(program: &ParsedProgram) -> bool {
 
     let convert_matches = matches!(
         &body[0].statement,
-        Statement::Sys { name, arguments, results }
+        Statement::Sys { name, arguments, results, .. }
             if name.eq_ignore_ascii_case(b"ColourTrans_ConvertHSVToRGB")
                 && arguments.len() == 3
                 && arguments[0].as_ref().is_some_and(|value| expression_is(
@@ -1410,7 +1410,7 @@ fn has_compatible_mandelbrot_sethsv_procedure(program: &ParsedProgram) -> bool {
     );
     let set_gcol_matches = matches!(
         &body[1].statement,
-        Statement::Sys { name, arguments, results }
+        Statement::Sys { name, arguments, results, .. }
             if name.eq_ignore_ascii_case(b"ColourTrans_SetGCOL")
                 && arguments.len() == 5
                 && arguments[0].as_ref().is_some_and(|value| expression_is(value, &packed_colour))
@@ -1630,7 +1630,7 @@ fn if_matches_mandelbrot_colour(statement: &Statement) -> bool {
             && expression_is(&arguments[0], &Expr::Variable("H%".into()))
             && expression_is(&arguments[1], &Expr::Number(255.0))
             && expression_is(&arguments[2], &Expr::Number(255.0)));
-    let else_matches = matches!(else_body.as_slice(), [Statement::Sys { name, arguments, results }]
+    let else_matches = matches!(else_body.as_slice(), [Statement::Sys { name, arguments, results, .. }]
         if name.eq_ignore_ascii_case(b"ColourTrans_SetGCOL")
             && arguments.len() == 5
             && arguments[0].as_ref().is_some_and(|value| expression_is(value, &Expr::Number(0.0)))

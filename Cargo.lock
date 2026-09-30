@@ -31,6 +31,7 @@ dependencies = [
  "parley",
  "png",
  "pollster",
+ "skrifa",
  "vello",
  "wgpu",
  "winit",

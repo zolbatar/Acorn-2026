@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
 };
 
@@ -287,6 +287,14 @@ struct ReturnFrame {
     saved_variables: Vec<(String, Option<Value>)>,
     routine_name: Option<String>,
     local_readonly_scope: bool,
+    inline_continuation: VecDeque<InlineContinuation>,
+}
+
+#[derive(Clone)]
+struct InlineContinuation {
+    statement: Statement,
+    address: usize,
+    line: u16,
 }
 
 struct ForFrame {
@@ -328,6 +336,7 @@ pub(super) struct Interpreter {
     data: Vec<(u16, Expr)>,
     data_cursor: usize,
     returns: Vec<ReturnFrame>,
+    inline_continuations: VecDeque<InlineContinuation>,
     for_loops: Vec<ForFrame>,
     repeat_loops: Vec<usize>,
     for_pairs: HashMap<usize, usize>,
@@ -623,6 +632,7 @@ impl Interpreter {
             data,
             data_cursor: 0,
             returns: Vec::new(),
+            inline_continuations: VecDeque::new(),
             for_loops: Vec::new(),
             repeat_loops: Vec::new(),
             for_pairs,
@@ -693,7 +703,8 @@ impl Interpreter {
     ) -> Result<(), RuntimeError> {
         self.clock = dispatcher.system_clock();
         let mut address = 0_usize;
-        while address < self.program.instructions.len() {
+        while address < self.program.instructions.len() || !self.inline_continuations.is_empty() {
+            let inline_instruction = self.inline_continuations.pop_front();
             self.steps += 1;
             if self.steps & 0x3FF == 0 && self.pending_key.is_none() {
                 if let Some(key) = dispatcher.poll_key() {
@@ -701,16 +712,20 @@ impl Interpreter {
                 }
             }
             if self.steps > MAX_EXECUTION_STEPS {
-                let line = self.program.instructions[address].line_number;
+                let line = inline_instruction.as_ref().map_or_else(
+                    || self.program.instructions[address].line_number,
+                    |item| item.line,
+                );
                 return Err(program_error(line, "execution step limit reached"));
             }
 
             #[cfg(feature = "experimental-jit")]
-            if self
-                .jit
-                .as_ref()
-                .and_then(JitProgram::mandelbrot_frame_start)
-                == Some(address)
+            if inline_instruction.is_none()
+                && self
+                    .jit
+                    .as_ref()
+                    .and_then(JitProgram::mandelbrot_frame_start)
+                    == Some(address)
             {
                 let line = self.program.instructions[address].line_number;
                 let inputs = super::jit::MandelbrotFrameInputs {
@@ -763,11 +778,12 @@ impl Interpreter {
             }
 
             #[cfg(feature = "experimental-jit")]
-            if self
-                .jit
-                .as_ref()
-                .and_then(JitProgram::mandelbrot_inline_start)
-                == Some(address)
+            if inline_instruction.is_none()
+                && self
+                    .jit
+                    .as_ref()
+                    .and_then(JitProgram::mandelbrot_inline_start)
+                    == Some(address)
             {
                 let line = self.program.instructions[address].line_number;
                 let real_c = self.get_variable("A").number(line)?;
@@ -791,11 +807,12 @@ impl Interpreter {
             }
 
             #[cfg(feature = "experimental-jit")]
-            if self
-                .jit
-                .as_ref()
-                .and_then(JitProgram::clocksp5_region_start)
-                == Some(address)
+            if inline_instruction.is_none()
+                && self
+                    .jit
+                    .as_ref()
+                    .and_then(JitProgram::clocksp5_region_start)
+                    == Some(address)
             {
                 let line = self.program.instructions[address].line_number;
                 let values = ["B%", "L%", "I%", "D%", "E%"]
@@ -820,8 +837,9 @@ impl Interpreter {
             }
 
             #[cfg(feature = "experimental-jit")]
-            if let Statement::ProcedureCall(name, arguments) =
-                self.program.instructions[address].statement.clone()
+            if inline_instruction.is_none()
+                && let Statement::ProcedureCall(name, arguments) =
+                    self.program.instructions[address].statement.clone()
             {
                 if let Some(variable_names) = self
                     .jit
@@ -885,10 +903,11 @@ impl Interpreter {
             }
 
             #[cfg(feature = "experimental-jit")]
-            if let Some(variables) = self
-                .jit
-                .as_ref()
-                .and_then(|jit| jit.numeric_statement_variables(address))
+            if inline_instruction.is_none()
+                && let Some(variables) = self
+                    .jit
+                    .as_ref()
+                    .and_then(|jit| jit.numeric_statement_variables(address))
             {
                 let line = self.program.instructions[address].line_number;
                 let inputs = variables
@@ -923,10 +942,21 @@ impl Interpreter {
                 }
             }
 
-            let instruction = self.program.instructions[address].clone();
+            let executing_inline = inline_instruction.is_some();
+            let instruction_address = inline_instruction
+                .as_ref()
+                .map_or(address, |item| item.address);
+            let instruction = inline_instruction.map_or_else(
+                || self.program.instructions[address].clone(),
+                |item| super::parser::LocatedStatement {
+                    line_number: item.line,
+                    statement: item.statement,
+                },
+            );
+            let return_depth = self.returns.len();
             let executed = self.execute_statement(
                 &instruction.statement,
-                address,
+                instruction_address,
                 instruction.line_number,
                 task,
                 dispatcher,
@@ -944,9 +974,27 @@ impl Interpreter {
                 }
             };
             match flow {
-                Flow::Next => address += 1,
-                Flow::Jump(destination) => address = destination,
-                Flow::Stop => break,
+                Flow::Next => {
+                    if !executing_inline {
+                        address += 1;
+                    }
+                }
+                Flow::Jump(destination) => {
+                    if self.returns.len() > return_depth {
+                        if let Some(frame) = self.returns.last_mut() {
+                            frame
+                                .inline_continuation
+                                .append(&mut self.inline_continuations);
+                        }
+                    } else if self.returns.len() == return_depth {
+                        self.inline_continuations.clear();
+                    }
+                    address = destination;
+                }
+                Flow::Stop => {
+                    self.inline_continuations.clear();
+                    break;
+                }
             }
         }
         Ok(())
@@ -1115,10 +1163,29 @@ impl Interpreter {
                 } else {
                     else_body
                 };
-                for nested in selected {
+                for (index, nested) in selected.iter().enumerate() {
+                    let return_depth = self.returns.len();
                     match self.execute_statement(nested, address, line, task, dispatcher)? {
                         Flow::Next => {}
-                        flow => return Ok(flow),
+                        flow @ Flow::Jump(_) => {
+                            if self.returns.len() > return_depth {
+                                // A nested IF may already have queued the
+                                // remainder of its selected body. That inner
+                                // remainder must run before this IF's siblings.
+                                let mut continuation =
+                                    std::mem::take(&mut self.inline_continuations);
+                                continuation.extend(selected.iter().skip(index + 1).map(
+                                    |statement| InlineContinuation {
+                                        statement: statement.clone(),
+                                        address,
+                                        line,
+                                    },
+                                ));
+                                self.inline_continuations = continuation;
+                            }
+                            return Ok(flow);
+                        }
+                        flow @ Flow::Stop => return Ok(flow),
                     }
                 }
                 Ok(Flow::Next)
@@ -1148,6 +1215,7 @@ impl Interpreter {
                     saved_variables: Vec::new(),
                     routine_name: None,
                     local_readonly_scope: false,
+                    inline_continuation: VecDeque::new(),
                 });
                 Ok(Flow::Jump(destination))
             }
@@ -1324,15 +1392,14 @@ impl Interpreter {
                 name,
                 arguments,
                 results,
+                flags,
             } => {
                 let swi_name = String::from_utf8_lossy(name).to_ascii_uppercase();
                 let mut context = SwiContext::default();
                 for (register, argument) in arguments.iter().enumerate().take(10) {
                     if let Some(argument) = argument {
-                        context.registers[register] =
-                            self.evaluate(argument, line, task, dispatcher)?
-                                .number(line)?
-                                .trunc() as i32 as u32;
+                        let value = self.evaluate(argument, line, task, dispatcher)?;
+                        context.registers[register] = value_to_sys_register(&value, line, task.id)?;
                     }
                 }
                 if swi_name == "OS_READC"
@@ -1347,6 +1414,13 @@ impl Interpreter {
                     self.set_variable(
                         target,
                         Value::Number(f64::from(context.registers[register] as i32)),
+                        line,
+                    )?;
+                }
+                if let Some(target) = flags {
+                    self.set_variable(
+                        target,
+                        Value::Number(f64::from(context.returned_flags())),
                         line,
                     )?;
                 }
@@ -1535,6 +1609,13 @@ impl Interpreter {
                     }
                     (type_name.clone(), *code, message.as_bytes().to_vec())
                 }
+                RuntimeError::StandardErrorBlock { code, message } => {
+                    let type_name = "OSError";
+                    if !type_name.eq_ignore_ascii_case(&frame.error_type) {
+                        continue;
+                    }
+                    (type_name.into(), *code, message.as_bytes().to_vec())
+                }
                 RuntimeError::InvalidSwi(number) => (
                     frame.error_type.clone(),
                     2,
@@ -1561,6 +1642,7 @@ impl Interpreter {
                     self.restore_variables(return_frame.saved_variables);
                 }
             }
+            self.inline_continuations.clear();
             self.for_loops.truncate(frame.for_depth);
             self.repeat_loops.truncate(frame.repeat_depth);
             self.set_variable(&frame.error_name, value, line)?;
@@ -1667,6 +1749,7 @@ impl Interpreter {
             saved_variables,
             routine_name: Some(name.to_ascii_uppercase()),
             local_readonly_scope: true,
+            inline_continuation: VecDeque::new(),
         });
         Ok(Flow::Jump(definition.entry))
     }
@@ -1684,6 +1767,7 @@ impl Interpreter {
             return Err(program_error(line, "mismatched RETURN and ENDPROC"));
         }
         self.returns.pop();
+        self.inline_continuations = frame.inline_continuation;
         if frame.local_readonly_scope {
             self.restore_local_readonly_scope();
         }
@@ -2199,6 +2283,7 @@ impl Interpreter {
                                 RuntimeError::Io(_) => 4,
                                 RuntimeError::Program(_) => 1,
                                 RuntimeError::Structured { .. } => unreachable!(),
+                                RuntimeError::StandardErrorBlock { code, .. } => *code,
                             };
                             return Err(RuntimeError::Structured {
                                 type_name: expected.clone(),
@@ -3897,6 +3982,17 @@ fn value_to_primitive_register(
     }
 }
 
+fn value_to_sys_register(value: &Value, line: u16, task_id: u64) -> Result<u32, RuntimeError> {
+    match value {
+        Value::LogicalAddress { owner_task, raw } if *owner_task == task_id => Ok(*raw),
+        Value::LogicalAddress { .. } => Err(program_error(
+            line,
+            "logical address belongs to a different caller task",
+        )),
+        value => Ok(value.number(line)?.trunc() as i32 as u32),
+    }
+}
+
 fn value_to_contract_register(
     value: &Value,
     kind: &crate::trellis::RegisterKind,
@@ -4315,9 +4411,27 @@ fn program_error(line: u16, message: impl AsRef<str>) -> RuntimeError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Interpreter, Value};
+    use super::{Interpreter, Value, value_to_sys_register};
 
     use crate::{host::HostConsole, memory::Task, swi::SwiDispatcher};
+
+    #[test]
+    fn sys_register_accepts_only_same_task_logical_addresses() {
+        let address = Value::LogicalAddress {
+            owner_task: 910,
+            raw: 0x1234,
+        };
+        assert_eq!(value_to_sys_register(&address, 1, 910).unwrap(), 0x1234);
+        assert!(matches!(
+            value_to_sys_register(&address, 1, 911),
+            Err(crate::error::RuntimeError::Program(message))
+                if message.contains("different caller task")
+        ));
+        assert_eq!(
+            value_to_sys_register(&Value::Number(17.0), 1, 910).unwrap(),
+            17
+        );
+    }
 
     #[test]
     fn classic_and_hybrid_integer_literals_keep_the_floating_number_model() {
@@ -4335,5 +4449,33 @@ mod tests {
                 Value::Number(value) if value == 9_007_199_254_740_992.0
             ));
         }
+    }
+
+    #[test]
+    fn inline_if_resumes_after_procedure_call_and_honours_endproc() {
+        let source = "10 A%=0:IF 1 THEN PROC BUMP:A%=A%+1\n20 PROC EARLY\n30 PRINT A%\n40 END\nDEF PROC BUMP\nA%=A%+10\nENDPROC\nDEF PROC EARLY\nIF 1 THEN ENDPROC:A%=99\nA%=A%+100\nENDPROC\n";
+        let parsed = crate::basic_compat::parser::parse_source(source).unwrap();
+        let mut interpreter = Interpreter::new(parsed);
+        let mut dispatcher = SwiDispatcher::new(HostConsole::stdio());
+        interpreter
+            .run(&mut Task::new(910), &mut dispatcher)
+            .unwrap();
+
+        assert!(matches!(
+            interpreter.get_variable("A%"),
+            Value::Number(value) if value == 11.0
+        ));
+
+        let nested_source = "10 A%=0\n20 IF 1 THEN IF 1 THEN PROC BUMP:A%=A%*10+1:A%=A%*10+2\n30 PRINT A%\n40 END\nDEF PROC BUMP\nA%=A%*10+3\nENDPROC\n";
+        let parsed = crate::basic_compat::parser::parse_source(nested_source).unwrap();
+        let mut interpreter = Interpreter::new(parsed);
+        let mut dispatcher = SwiDispatcher::new(HostConsole::stdio());
+        interpreter
+            .run(&mut Task::new(910), &mut dispatcher)
+            .unwrap();
+        assert!(matches!(
+            interpreter.get_variable("A%"),
+            Value::Number(value) if value == 312.0
+        ));
     }
 }

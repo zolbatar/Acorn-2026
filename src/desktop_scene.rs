@@ -1,7 +1,7 @@
 //! Retained-in-memory scene construction for the modern Wimp shell.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::Cursor,
     sync::{Arc, OnceLock, Weak},
 };
@@ -10,6 +10,7 @@ use parley::{
     Alignment, AlignmentOptions, FontContext, FontWeight, LayoutContext, PositionedLayoutItem,
     StyleProperty,
 };
+use skrifa::MetadataProvider;
 use vello::{
     Glyph, Scene,
     peniko::{
@@ -19,7 +20,7 @@ use vello::{
 };
 
 use crate::{
-    graphics::GraphicsSnapshot,
+    graphics::{GraphicsSnapshot, TextRenderingProfile},
     renderer,
     wimp::{
         DESKTOP_ICONBAR_HEIGHT, DesktopIcon, DesktopIconImage, DesktopMenu, DesktopRect,
@@ -218,6 +219,7 @@ struct TextLayoutKey {
     size: u32,
     weight: u32,
     max_width: Option<u32>,
+    guest_font: bool,
 }
 
 impl TextLayoutKey {
@@ -227,6 +229,14 @@ impl TextLayoutKey {
             size: size.to_bits(),
             weight: weight.to_bits(),
             max_width: max_width.map(f32::to_bits),
+            guest_font: false,
+        }
+    }
+
+    fn guest(text: &str, size: f32, weight: f32, max_width: Option<f32>) -> Self {
+        Self {
+            guest_font: true,
+            ..Self::new(text, size, weight, max_width)
         }
     }
 }
@@ -318,7 +328,6 @@ pub(crate) struct DesktopSceneBuilder {
     text_layout_builds: usize,
     classic_image: Option<(u64, ImageData)>,
     font_error: Option<String>,
-    bevelled: bool,
     desktop_width_os: i32,
     desktop_height_os: i32,
 }
@@ -328,6 +337,11 @@ impl DesktopSceneBuilder {
         let mut fonts = FontContext::new();
         let inter = Arc::new(include_bytes!("../resources/fonts/InterVariable.ttf").to_vec());
         fonts.collection.register_fonts(Blob::new(inter), None);
+        let jetbrains_mono =
+            Arc::new(include_bytes!("../resources/fonts/JetBrainsMono-Regular.ttf").to_vec());
+        fonts
+            .collection
+            .register_fonts(Blob::new(jetbrains_mono), None);
         Self {
             fonts,
             layouts: LayoutContext::new(),
@@ -339,10 +353,6 @@ impl DesktopSceneBuilder {
             text_layout_builds: 0,
             classic_image: None,
             font_error: None,
-            bevelled: crate::configure::ConfigureStore::default()
-                .load()
-                .map(|c| c.bevelled_furniture)
-                .unwrap_or(false),
             desktop_width_os: DEFAULT_DESKTOP_OS_SIZE.0,
             desktop_height_os: DEFAULT_DESKTOP_OS_SIZE.1,
         }
@@ -433,6 +443,7 @@ impl DesktopSceneBuilder {
         } else {
             self.rebuild_classic(snapshot)
         };
+        let image_size = (image.width, image.height);
         let scale = (f64::from(width) / f64::from(image.width))
             .min(f64::from(height) / f64::from(image.height));
         let offset_x = (f64::from(width) - f64::from(image.width) * scale) / 2.0;
@@ -441,6 +452,23 @@ impl DesktopSceneBuilder {
             &ImageBrush::new(image).with_quality(ImageQuality::Low),
             Affine::translate((offset_x, offset_y)) * Affine::scale(scale),
         );
+        if snapshot.text_profile == TextRenderingProfile::Modern {
+            let raster_rect = Rect::new(
+                offset_x,
+                offset_y,
+                offset_x + f64::from(image_size.0) * scale,
+                offset_y + f64::from(image_size.1) * scale,
+            );
+            let text_rect = if snapshot.modern_shell_console {
+                fit_surface_rect(
+                    Rect::new(0.0, 0.0, f64::from(width), f64::from(height)),
+                    snapshot.modern_text_surface_size(),
+                )
+            } else {
+                raster_rect
+            };
+            self.draw_modern_guest_text(&mut scene, Affine::IDENTITY, snapshot, text_rect);
+        }
         scene
     }
 
@@ -448,7 +476,7 @@ impl DesktopSceneBuilder {
         let width = snapshot.mode.pixel_width;
         let height = snapshot.mode.pixel_height;
         let mut rgba = vec![0_u8; width as usize * height as usize * 4];
-        renderer::render(snapshot, &mut rgba);
+        renderer::render_for_vello(snapshot, &mut rgba);
         let image = ImageData {
             data: Blob::new(Arc::new(rgba)),
             format: ImageFormat::Rgba8,
@@ -501,25 +529,24 @@ impl DesktopSceneBuilder {
         scene.push_clip_layer(Fill::NonZero, transform, &work);
 
         if let Some(snapshot) = snapshot {
+            // The raster remains at its guest mode's pixel grid; the same
+            // geometry positions scalable text even if its raster is too
+            // large to cache and draw.
+            let osu_x = mode_osu_per_pixel(snapshot.mode.logical_width, snapshot.mode.pixel_width);
+            let osu_y =
+                mode_osu_per_pixel(snapshot.mode.logical_height, snapshot.mode.pixel_height);
+            let screen_left = window.work_area.min_x + window.work_extent.min_x - window.scroll_x;
+            let screen_top = window.work_area.max_y + window.work_extent.max_y - window.scroll_y;
+            let image_width = f64::from(snapshot.mode.pixel_width) * f64::from(osu_x);
+            let image_height = f64::from(snapshot.mode.pixel_height) * f64::from(osu_y);
+            let image_rect = Rect::new(
+                f64::from(screen_left),
+                f64::from(self.desktop_height_os - screen_top),
+                f64::from(screen_left) + image_width,
+                f64::from(self.desktop_height_os - screen_top) + image_height,
+            );
             if let Some(image) = self.task_image(surface, snapshot) {
-                // The raster remains at its guest mode's pixel grid and uses
-                // nearest sampling; only Wimp furniture is rendered at host DPI.
-                let osu_x =
-                    mode_osu_per_pixel(snapshot.mode.logical_width, snapshot.mode.pixel_width);
-                let osu_y =
-                    mode_osu_per_pixel(snapshot.mode.logical_height, snapshot.mode.pixel_height);
-                let screen_left =
-                    window.work_area.min_x + window.work_extent.min_x - window.scroll_x;
-                let screen_top =
-                    window.work_area.max_y + window.work_extent.max_y - window.scroll_y;
-                let image_width = f64::from(snapshot.mode.pixel_width) * f64::from(osu_x);
-                let image_height = f64::from(snapshot.mode.pixel_height) * f64::from(osu_y);
-                let image_rect = Rect::new(
-                    f64::from(screen_left),
-                    f64::from(self.desktop_height_os - screen_top),
-                    f64::from(screen_left) + image_width,
-                    f64::from(self.desktop_height_os - screen_top) + image_height,
-                );
+                // Nearest sampling preserves the guest pixel grid.
                 let source_size = (image.width, image.height);
                 scene.draw_image(
                     &ImageBrush::new(image).with_quality(ImageQuality::Low),
@@ -530,6 +557,14 @@ impl DesktopSceneBuilder {
                             image_rect.height() / f64::from(source_size.1),
                         ),
                 );
+            }
+            if snapshot.text_profile == TextRenderingProfile::Modern {
+                let text_rect = if snapshot.modern_shell_console {
+                    fit_surface_rect(work, snapshot.modern_text_surface_size())
+                } else {
+                    image_rect
+                };
+                self.draw_modern_guest_text(scene, transform, snapshot, text_rect);
             }
         }
 
@@ -580,6 +615,100 @@ impl DesktopSceneBuilder {
         outline(scene, transform, outer, (0, 0, 0, 255), 2.0);
     }
 
+    fn draw_modern_guest_text(
+        &mut self,
+        scene: &mut Scene,
+        transform: Affine,
+        snapshot: &GraphicsSnapshot,
+        image_rect: Rect,
+    ) {
+        let columns = usize::from(snapshot.mode.text_columns);
+        let rows = usize::from(snapshot.mode.text_rows);
+        if columns == 0 || rows == 0 || image_rect.width() <= 0.0 || image_rect.height() <= 0.0 {
+            return;
+        }
+        let cell_width = image_rect.width() / columns as f64;
+        let cell_height = image_rect.height() / rows as f64;
+        let font_size = (cell_height * 0.78) as f32;
+        let ink = snapshot
+            .logical_palette
+            .get(usize::from(snapshot.text_colour))
+            .copied()
+            .unwrap_or([255, 255, 255, 255]);
+        let ink = (ink[0], ink[1], ink[2], ink[3]);
+        let supported = modern_font_codepoints();
+
+        for row in 0..rows {
+            for column in 0..columns {
+                let index = row * columns + column;
+                let Some(character) = snapshot.modern_text_cells.get(index).copied() else {
+                    return;
+                };
+                if character == ' ' {
+                    continue;
+                }
+                // Use only glyphs present in the bundled font. This avoids
+                // platform-dependent system fallback and keeps the cell grid
+                // one Unicode scalar wide; unsupported characters become '?'.
+                let character = if supported.contains(&(character as u32)) {
+                    character
+                } else {
+                    '?'
+                };
+                let text = character.to_string();
+                let Some(key) = self.ensure_guest_text_layout(&text, font_size) else {
+                    continue;
+                };
+                self.touch_text_layout(&key);
+                let Some(layout) = self.text_layouts.get(&key) else {
+                    continue;
+                };
+                let advance = f64::from(layout.width());
+                if advance <= 0.0 {
+                    continue;
+                }
+                let fitted_advance = advance.min(cell_width);
+                let x = image_rect.x0
+                    + column as f64 * cell_width
+                    + (cell_width - fitted_advance) / 2.0;
+                let y = image_rect.y0
+                    + row as f64 * cell_height
+                    + ((cell_height - f64::from(layout.height())) / 2.0).max(0.0);
+                // Preserve the bundled font's real monospace advance. Shrink
+                // only when a target MODE supplies an unusually narrow cell;
+                // never stretch glyphs to fill the old bitmap-cell width.
+                let horizontal_scale = (cell_width / advance).min(1.0);
+                let glyph_transform = transform
+                    * Affine::translate((x, 0.0))
+                    * Affine::scale_non_uniform(horizontal_scale, 1.0);
+                draw_parley_layout(scene, layout, 0.0, y, ink, glyph_transform);
+            }
+        }
+
+        let cursor_x = i32::from(snapshot.text_window.left) + snapshot.text_cursor.x;
+        let cursor_y = i32::from(snapshot.text_window.top) + snapshot.text_cursor.y;
+        if cursor_x >= 0
+            && cursor_y >= 0
+            && (cursor_x as usize) < columns
+            && (cursor_y as usize) < rows
+        {
+            let left = image_rect.x0 + f64::from(cursor_x) * cell_width;
+            let top = image_rect.y0 + f64::from(cursor_y) * cell_height;
+            let thickness = 2.0_f64.min(cell_height).max(1.0);
+            fill(
+                scene,
+                transform,
+                ink,
+                Rect::new(
+                    left,
+                    top + cell_height - thickness,
+                    left + cell_width,
+                    top + cell_height,
+                ),
+            );
+        }
+    }
+
     fn task_image(
         &mut self,
         surface: (u64, Option<u32>),
@@ -596,7 +725,7 @@ impl DesktopSceneBuilder {
             return None;
         }
         let mut rgba = vec![0_u8; width as usize * height as usize * 4];
-        renderer::render_desktop_content(snapshot, &mut rgba);
+        renderer::render_desktop_content_for_vello(snapshot, &mut rgba);
         let image = ImageData {
             data: Blob::new(Arc::new(rgba)),
             format: ImageFormat::Rgba8,
@@ -630,25 +759,6 @@ impl DesktopSceneBuilder {
             title_rect.y1,
         );
         fill(scene, transform, title_color, title_band);
-        if self.bevelled {
-            let middle = (title_rect.y0 + title_rect.y1) / 2.0;
-            tool_strip(
-                scene,
-                transform,
-                "tbarmidt22",
-                Rect::new(title_rect.x0, title_rect.y0, title_rect.x1, middle),
-                true,
-                window.focused,
-            );
-            tool_strip(
-                scene,
-                transform,
-                "tbarmidb22",
-                Rect::new(title_rect.x0, middle, title_rect.x1, title_rect.y1),
-                true,
-                window.focused,
-            );
-        }
         fill(
             scene,
             transform,
@@ -713,10 +823,6 @@ impl DesktopSceneBuilder {
     }
 
     fn draw_back_glyph(&self, scene: &mut Scene, transform: Affine, bounds: DesktopRect) {
-        if self.bevelled {
-            tool_image(scene, transform, "bicon22", self.map_rect(bounds), false);
-            return;
-        }
         let b = self.map_rect(bounds);
         let cx = (b.x0 + b.x1) / 2.0;
         let cy = (b.y0 + b.y1) / 2.0;
@@ -729,10 +835,6 @@ impl DesktopSceneBuilder {
     }
 
     fn draw_close_glyph(&self, scene: &mut Scene, transform: Affine, bounds: DesktopRect) {
-        if self.bevelled {
-            tool_image(scene, transform, "cicon22", self.map_rect(bounds), false);
-            return;
-        }
         let b = self.map_rect(bounds);
         let cx = (b.x0 + b.x1) / 2.0;
         let cy = (b.y0 + b.y1) / 2.0;
@@ -747,10 +849,6 @@ impl DesktopSceneBuilder {
     }
 
     fn draw_toggle_glyph(&self, scene: &mut Scene, transform: Affine, bounds: DesktopRect) {
-        if self.bevelled {
-            tool_image(scene, transform, "ticon22", self.map_rect(bounds), false);
-            return;
-        }
         let b = self.map_rect(bounds);
         let cx = (b.x0 + b.x1) / 2.0;
         let cy = (b.y0 + b.y1) / 2.0;
@@ -767,10 +865,6 @@ impl DesktopSceneBuilder {
     }
 
     fn draw_resize_glyph(&self, scene: &mut Scene, transform: Affine, bounds: DesktopRect) {
-        if self.bevelled {
-            tool_image(scene, transform, "sicon22", self.map_rect(bounds), false);
-            return;
-        }
         let b = self.map_rect(bounds);
         fill(scene, transform, (224, 224, 225, 255), b);
         fill(
@@ -791,47 +885,6 @@ impl DesktopSceneBuilder {
         let Some(bar) = f.vertical_scrollbar else {
             return;
         };
-        if self.bevelled {
-            tool_image(
-                scene,
-                transform,
-                "uicon22",
-                self.map_rect(bar.up_arrow),
-                false,
-            );
-            tool_image(
-                scene,
-                transform,
-                "dicon22",
-                self.map_rect(bar.down_arrow),
-                false,
-            );
-            tool_strip(
-                scene,
-                transform,
-                "vwellt22",
-                self.map_rect(bar.track),
-                false,
-                false,
-            );
-            let slider = self.map_rect(bar.slider).inset(-2.0);
-            tool_strip(scene, transform, "vbarmid22", slider, false, false);
-            tool_image(
-                scene,
-                transform,
-                "vbart22",
-                Rect::new(slider.x0, slider.y0, slider.x1, slider.y0 + 3.0),
-                false,
-            );
-            tool_image(
-                scene,
-                transform,
-                "vbarb22",
-                Rect::new(slider.x0, slider.y1 - 4.0, slider.x1, slider.y1),
-                false,
-            );
-            return;
-        }
         let bounds = self.map_rect(bar.bounds);
         fill(scene, transform, (226, 226, 227, 255), bounds);
         fill(
@@ -1374,17 +1427,40 @@ impl DesktopSceneBuilder {
         weight: f32,
         max_width: Option<f32>,
     ) -> Option<TextLayoutKey> {
+        self.ensure_text_layout_with_font(text, size, weight, max_width, false)
+    }
+
+    fn ensure_guest_text_layout(&mut self, text: &str, size: f32) -> Option<TextLayoutKey> {
+        self.ensure_text_layout_with_font(text, size, 400.0, None, true)
+    }
+
+    fn ensure_text_layout_with_font(
+        &mut self,
+        text: &str,
+        size: f32,
+        weight: f32,
+        max_width: Option<f32>,
+        guest_font: bool,
+    ) -> Option<TextLayoutKey> {
         if text.is_empty() || self.font_error.is_some() {
             return None;
         }
-        let key = TextLayoutKey::new(text, size, weight, max_width);
+        let key = if guest_font {
+            TextLayoutKey::guest(text, size, weight, max_width)
+        } else {
+            TextLayoutKey::new(text, size, weight, max_width)
+        };
         if self.text_layouts.contains_key(&key) {
             self.touch_text_layout(&key);
             return Some(key);
         }
-        let base_key = TextLayoutKey::new(text, size, weight, None);
+        let base_key = if guest_font {
+            TextLayoutKey::guest(text, size, weight, None)
+        } else {
+            TextLayoutKey::new(text, size, weight, None)
+        };
         if !self.text_layouts.contains_key(&base_key) {
-            let layout = self.build_text_layout(text, size, weight);
+            let layout = self.build_text_layout(text, size, weight, guest_font);
             self.insert_text_layout(base_key.clone(), layout);
         } else {
             self.touch_text_layout(&base_key);
@@ -1401,7 +1477,13 @@ impl DesktopSceneBuilder {
         Some(key)
     }
 
-    fn build_text_layout(&mut self, text: &str, size: f32, weight: f32) -> parley::Layout<[u8; 4]> {
+    fn build_text_layout(
+        &mut self,
+        text: &str,
+        size: f32,
+        weight: f32,
+        guest_font: bool,
+    ) -> parley::Layout<[u8; 4]> {
         #[cfg(test)]
         {
             self.text_layout_builds += 1;
@@ -1410,10 +1492,19 @@ impl DesktopSceneBuilder {
             .layouts
             .ranged_builder(&mut self.fonts, text, 1.0, true);
         builder.push_default(StyleProperty::FontFamily(parley::FontFamily::named(
-            "Inter",
+            if guest_font {
+                "JetBrains Mono"
+            } else {
+                "Inter"
+            },
         )));
         builder.push_default(StyleProperty::FontSize(size));
         builder.push_default(StyleProperty::FontWeight(FontWeight::new(weight)));
+        if guest_font {
+            builder.push_default(StyleProperty::FontFeatures(parley::FontFeatures::from(
+                "\"liga\" off, \"clig\" off, \"calt\" off",
+            )));
+        }
         builder.push_default(StyleProperty::Brush([0, 0, 0, 0]));
         let mut layout = builder.build(text);
         layout.break_all_lines(None);
@@ -1552,6 +1643,24 @@ fn draw_parley_layout(
     }
 }
 
+fn modern_font_codepoints() -> &'static HashSet<u32> {
+    static CODEPOINTS: OnceLock<HashSet<u32>> = OnceLock::new();
+    CODEPOINTS.get_or_init(|| {
+        const FONT: &[u8] = include_bytes!("../resources/fonts/JetBrainsMono-Regular.ttf");
+        let supported = skrifa::FontRef::from_index(FONT, 0)
+            .ok()
+            .map(|font| {
+                font.charmap()
+                    .mappings()
+                    .map(|(codepoint, _)| codepoint)
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        debug_assert!(supported.contains(&u32::from(b'?')));
+        supported
+    })
+}
+
 fn image_byte_len(width: u32, height: u32) -> Option<usize> {
     usize::try_from(width)
         .ok()?
@@ -1595,113 +1704,6 @@ fn rgba_image_data(width: u32, height: u32, rgba: Vec<u8>) -> Option<ImageData> 
         width,
         height,
     })
-}
-
-fn tool_art(name: &str, yellow: bool) -> ImageData {
-    static IMAGES: OnceLock<HashMap<(String, bool), ImageData>> = OnceLock::new();
-    IMAGES
-        .get_or_init(|| {
-            let sprites = crate::riscos_resources::builtin_sprite_set(
-                crate::riscos_resources::SpriteSet::Tools3d,
-            )
-            .expect("bundled tools");
-            let mut images = HashMap::new();
-            for name in [
-                "bicon22",
-                "cicon22",
-                "ticon22",
-                "sicon22",
-                "uicon22",
-                "dicon22",
-                "tbarmidt22",
-                "tbarmidb22",
-                "vwellt22",
-                "vbarmid22",
-                "vbart22",
-                "vbarb22",
-            ] {
-                let sprite = sprites.get(name).expect("bundled tool");
-                for yellow in [false, true] {
-                    let pixels = sprite
-                        .rgba
-                        .iter()
-                        .flat_map(|p| {
-                            if yellow {
-                                [
-                                    ((u16::from(p[0]) * 239) / 255) as u8,
-                                    ((u16::from(p[1]) * 221) / 255) as u8,
-                                    ((u16::from(p[2]) * 105) / 255) as u8,
-                                    p[3],
-                                ]
-                            } else {
-                                *p
-                            }
-                        })
-                        .collect();
-                    images.insert(
-                        (name.to_owned(), yellow),
-                        rgba_image_data(sprite.width, sprite.height, pixels).unwrap(),
-                    );
-                }
-            }
-            images
-        })
-        .get(&(name.to_owned(), yellow))
-        .unwrap()
-        .clone()
-}
-
-fn tool_image(scene: &mut Scene, transform: Affine, name: &str, bounds: Rect, yellow: bool) {
-    let image = tool_art(name, yellow);
-    let scale = Affine::scale_non_uniform(
-        bounds.width() / f64::from(image.width),
-        bounds.height() / f64::from(image.height),
-    );
-    scene.draw_image(
-        &ImageBrush::new(image).with_quality(ImageQuality::Low),
-        transform * Affine::translate((bounds.x0, bounds.y0)) * scale,
-    );
-}
-
-fn tool_strip(
-    scene: &mut Scene,
-    transform: Affine,
-    name: &str,
-    bounds: Rect,
-    horizontal: bool,
-    yellow: bool,
-) {
-    let image = tool_art(name, yellow);
-    scene.push_clip_layer(Fill::NonZero, transform, &bounds);
-    let scale = if horizontal {
-        bounds.height() / f64::from(image.height)
-    } else {
-        bounds.width() / f64::from(image.width)
-    };
-    let step = if horizontal {
-        f64::from(image.width) * scale
-    } else {
-        f64::from(image.height) * scale
-    };
-    let length = if horizontal {
-        bounds.width()
-    } else {
-        bounds.height()
-    };
-    let mut offset = 0.0;
-    while offset < length {
-        let (x, y) = if horizontal {
-            (bounds.x0 + offset, bounds.y0)
-        } else {
-            (bounds.x0, bounds.y0 + offset)
-        };
-        scene.draw_image(
-            &ImageBrush::new(image.clone()).with_quality(ImageQuality::Low),
-            transform * Affine::translate((x, y)) * Affine::scale(scale),
-        );
-        offset += step;
-    }
-    scene.pop_layer();
 }
 
 fn acorn_logo() -> &'static ImageData {
@@ -1842,6 +1844,23 @@ fn trim_transparent_border(width: u32, height: u32, rgba: Vec<u8>) -> (u32, u32,
     (cropped_width as u32, cropped_height as u32, cropped)
 }
 
+fn fit_surface_rect(bounds: Rect, surface_size: (u32, u32)) -> Rect {
+    if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
+        return bounds;
+    }
+    let surface_width = f64::from(surface_size.0.max(1));
+    let surface_height = f64::from(surface_size.1.max(1));
+    let aspect = surface_width / surface_height;
+    let (width, height) = if bounds.width() / bounds.height() > aspect {
+        (bounds.height() * aspect, bounds.height())
+    } else {
+        (bounds.width(), bounds.width() / aspect)
+    };
+    let x = bounds.x0 + (bounds.width() - width) / 2.0;
+    let y = bounds.y0 + (bounds.height() - height) / 2.0;
+    Rect::new(x, y, x + width, y + height)
+}
+
 fn rgba(rgba: [u8; 4]) -> (u8, u8, u8, u8) {
     (rgba[0], rgba[1], rgba[2], rgba[3])
 }
@@ -1975,6 +1994,135 @@ fn palette_rgb(index: u8) -> (u8, u8, u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modern_guest_console_uses_bundled_monospace_metrics_and_fixed_fallback() {
+        let supported = modern_font_codepoints();
+        assert!(supported.contains(&(b'A' as u32)));
+        assert!(supported.contains(&('é' as u32)));
+        assert!(!supported.contains(&('漢' as u32)));
+
+        let mut builder = DesktopSceneBuilder::new();
+        let wide = builder
+            .ensure_guest_text_layout("W", 24.0)
+            .expect("bundled console font should shape W");
+        let narrow = builder
+            .ensure_guest_text_layout("i", 24.0)
+            .expect("bundled console font should shape i");
+        let wide_advance = builder.text_layouts.get(&wide).unwrap().width();
+        let narrow_advance = builder.text_layouts.get(&narrow).unwrap().width();
+        assert!((wide_advance - narrow_advance).abs() < 0.01);
+
+        let mut graphics = crate::graphics::GraphicsService::default();
+        graphics
+            .set_text_profile(
+                TextRenderingProfile::Modern,
+                crate::graphics::TextEncoding::Utf8,
+            )
+            .unwrap();
+        for byte in "A漢".bytes() {
+            graphics.write_byte(byte).unwrap();
+        }
+        let _scene = builder.build_classic(graphics.snapshot(), 1280, 1024);
+        assert!(builder.text_layout_builds >= 4);
+
+        let window = DesktopWindow {
+            handle: 1,
+            owner_task_id: 7,
+            is_console_output: false,
+            title: "Modern console".into(),
+            work_area: WorkArea {
+                min_x: 0,
+                min_y: 0,
+                max_x: 800,
+                max_y: 800,
+            },
+            work_extent: WorkArea {
+                min_x: 0,
+                min_y: 0,
+                max_x: 800,
+                max_y: 800,
+            },
+            scroll_x: 0,
+            scroll_y: 0,
+            preview_area: None,
+            preview_scroll: None,
+            has_back_icon: false,
+            has_title: true,
+            has_vertical_scrollbar: false,
+            has_toggle_size_icon: false,
+            maximized: false,
+            closable: true,
+            movable: true,
+            resizable: false,
+            focused: true,
+        };
+        let before_wimp_layouts = builder.text_layout_builds;
+        let scenes = HashMap::from([((7, Some(1)), graphics.snapshot().clone())]);
+        let _scene = builder.build(
+            &[window],
+            &scenes,
+            &[],
+            &[],
+            &[],
+            None,
+            Viewport::new(1600, 1200),
+        );
+        assert!(builder.text_layout_builds > before_wimp_layouts);
+        assert!(
+            builder
+                .text_layouts
+                .contains_key(&TextLayoutKey::guest("?", 24.96, 400.0, None,))
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a GPU; run with ACORN_VELLO_SNAPSHOT=1 and --ignored"]
+    fn gpu_modern_console_renders_jetbrains_mono_glyphs_to_png() {
+        assert!(
+            std::env::var_os("ACORN_VELLO_SNAPSHOT").is_some(),
+            "set ACORN_VELLO_SNAPSHOT=1 to opt into real GPU rendering"
+        );
+
+        let mut graphics = crate::graphics::GraphicsService::default();
+        graphics
+            .set_text_profile(
+                TextRenderingProfile::Modern,
+                crate::graphics::TextEncoding::Utf8,
+            )
+            .unwrap();
+        graphics.set_modern_shell_console().unwrap();
+        for byte in "JetBrains Mono 2026 | café | scalable BASIC console".bytes() {
+            graphics.write_byte(byte).unwrap();
+        }
+        let snapshot = graphics.snapshot().clone();
+        let mut empty_snapshot = snapshot.clone();
+        empty_snapshot.modern_text_cells.fill(' ');
+
+        let mut builder = DesktopSceneBuilder::new();
+        let scene = builder.build_classic(&snapshot, 1280, 1024);
+        let rendered = crate::vello_backend::snapshot_scene(&scene, 1280, 1024)
+            .expect("Vello renders real Modern console glyphs");
+        let mut empty_builder = DesktopSceneBuilder::new();
+        let empty_scene = empty_builder.build_classic(&empty_snapshot, 1280, 1024);
+        let empty = crate::vello_backend::snapshot_scene(&empty_scene, 1280, 1024)
+            .expect("Vello renders the empty control scene");
+        assert!(
+            region_difference_count(&rendered, &empty, 1280, (0, 0, 1280, 1024)) > 500,
+            "Modern text must contribute actual rendered pixels"
+        );
+
+        let file = std::fs::File::create("/private/tmp/acorn-modern-console.png")
+            .expect("create Modern console snapshot");
+        let mut encoder = png::Encoder::new(file, 1280, 1024);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(&rendered)
+            .unwrap();
+    }
 
     #[test]
     fn approved_branding_assets_decode_once_as_rgba() {

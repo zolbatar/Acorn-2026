@@ -113,6 +113,13 @@ pub enum SystemIrGraphicsTarget {
     Agon,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SystemIrTextProfile {
+    #[default]
+    Classic,
+    Modern,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SystemIrVduFormat {
     Byte,
@@ -149,9 +156,11 @@ pub struct SystemIrProgramOptions {
     pub mode: SystemIrLanguageMode,
     pub target: SystemIrGraphicsTarget,
     pub profile: Option<String>,
+    pub text_profile: SystemIrTextProfile,
     pub mode_declared: bool,
     pub target_declared: bool,
     pub profile_declared: bool,
+    pub text_profile_declared: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -382,6 +391,7 @@ pub enum SystemIrBasicStatement {
         name: Vec<u8>,
         arguments: Vec<Option<SystemIrExpression>>,
         results: Vec<String>,
+        flags: Option<String>,
     },
     Try,
     Catch {
@@ -1140,6 +1150,7 @@ fn lower_basic_statement(
             name,
             arguments,
             results,
+            flags,
         } => SystemIrBasicStatement::Sys {
             name: name.clone(),
             arguments: arguments
@@ -1147,6 +1158,7 @@ fn lower_basic_statement(
                 .map(|value| value.as_ref().map(expression))
                 .collect(),
             results: results.clone(),
+            flags: flags.clone(),
         },
         Statement::Try => SystemIrBasicStatement::Try,
         Statement::Catch {
@@ -2245,6 +2257,7 @@ fn basic_statement_from_ir(statement: &SystemIrBasicStatement) -> Result<Stateme
             name,
             arguments,
             results,
+            flags,
         } => Ok(Statement::Sys {
             name: name.clone(),
             arguments: arguments
@@ -2252,6 +2265,7 @@ fn basic_statement_from_ir(statement: &SystemIrBasicStatement) -> Result<Stateme
                 .map(|argument| argument.as_ref().map(expr).transpose())
                 .collect::<Result<_, _>>()?,
             results: results.clone(),
+            flags: flags.clone(),
         }),
         SystemIrBasicStatement::Try => Ok(Statement::Try),
         SystemIrBasicStatement::Catch {
@@ -2302,9 +2316,14 @@ fn lower_program_options(options: &ProgramOptions) -> SystemIrProgramOptions {
             GraphicsProfile::Agon => SystemIrGraphicsTarget::Agon,
         },
         profile: options.profile.clone(),
+        text_profile: match options.text_profile {
+            crate::graphics::TextRenderingProfile::Classic => SystemIrTextProfile::Classic,
+            crate::graphics::TextRenderingProfile::Modern => SystemIrTextProfile::Modern,
+        },
         mode_declared: options.mode_declared,
         target_declared: options.target_declared,
         profile_declared: options.profile_declared,
+        text_profile_declared: options.text_profile_declared,
     }
 }
 
@@ -2320,9 +2339,14 @@ fn parser_program_options(options: &SystemIrProgramOptions) -> ProgramOptions {
             SystemIrGraphicsTarget::Agon => GraphicsProfile::Agon,
         },
         profile: options.profile.clone(),
+        text_profile: match options.text_profile {
+            SystemIrTextProfile::Classic => crate::graphics::TextRenderingProfile::Classic,
+            SystemIrTextProfile::Modern => crate::graphics::TextRenderingProfile::Modern,
+        },
         mode_declared: options.mode_declared,
         target_declared: options.target_declared,
         profile_declared: options.profile_declared,
+        text_profile_declared: options.text_profile_declared,
     }
 }
 

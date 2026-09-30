@@ -14,27 +14,175 @@ and bootstrap boundary described here are firm design decisions. The complete
 live-system experience, language extensions, persistence model, optimisation
 strategy, and desktop projections remain staged design work.
 
-### Implementation checkpoint — 2026-09-29
+### Implementation checkpoint — 2026-09-30, Phases 0–4 plus partial WP5.1/WP5.3
 
-The Phase 0–3 first Console slice now routes `OS_ReadLine`, `OS_WriteC`,
-`OS_WriteS`, `OS_Write0`, `OS_NewLine`, and `OS_ReadC` through versioned
-registry entry cells to interpreted definitions in `modules/Console.bas64`.
-The remaining dispatcher handlers use an explicitly counted transitional
-Rust route.
+The initial Console SWIs (`OS_ReadLine`, `OS_WriteC`, `OS_WriteS`, `OS_Write0`,
+`OS_NewLine`, and `OS_ReadC`) remain versioned entry cells implemented by
+interpreted definitions in `modules/Console.bas64`. Phase 4 assembles a
+deterministic v1 boot capsule from the visible source and canonical manifests
+for eight foundation/command modules: System, ModuleManager, Error, TaskManager,
+Memory, Console, TrellisCommands, and Boot. The executable has no hand-maintained capsule
+archive: `include_str!` rebuilds its source inputs and `--write-boot-capsule`
+emits the same validated bytes on demand. Integrity uses CRC-32 for corruption
+detection, not cryptographic authentication; embedded sources are the trust
+root, while an alternate capsule is explicitly selected and receives only the
+host's fixed module/capability grants.
 
-This does not yet realize the zero-public-SWI bootstrap described below. The
-current `SwiDispatcher` constructor embeds and parses Console source, registers
-its host primitives, grants its capabilities, and publishes/starts those six
-exports. Existing Rust Console handler branches and numeric constants remain as
-migration scaffolding. The source module's `@SWI` declarations own the active
-six definitions, but Rust is still the bootstrap installer; the boot capsule
-and empty-table startup are Phase 4 work. `Host.Graphics.AcceptByte` owns the
-hosted VDU byte-stream policy while `Host.Console.WriteByte` performs raw host
-output. A trusted in-process `Basic64ModuleManager` supports compatible live
-replacement but is not a guest-facing system browser. See
-[`trellis-work-packages.md`](trellis-work-packages.md) for the package-by-package
-completion boundary and remaining compatibility, serialization, and compilation
-gaps.
+Native initialization starts with an empty public SWI registry, validates and
+links modules directly from capsule bytes without FileSwitch or public SWIs,
+and publishes the complete initial export set in one transaction. Start hooks
+run afterwards. Any start failure discards the entire initial namespace and
+module workspaces before exposing the restricted recovery interface. Recovery
+uses native host I/O/display mechanisms only; it reports stage, module,
+definition, structured cause and ABI details, and accepts only retry, a selected
+capsule path, or exit. It does not provide normal CLI, guest files, or SWIs.
+
+`modules/Boot.bas64` owns the `Language 0` versus `Language 3` decision. It reads
+the persisted value through the qualified BASIC64 `System.ReadStartupLanguage`
+definition and requests the MOS prompt or desktop through qualified System
+handoff definitions. `System.bas64` alone imports those protected settings and
+handoff primitives. `Runtime::run` only consumes the selected request; it does
+not interpret the saved language value. `TrellisCommands.bas64` owns OS_CLI
+(`&05`) dispatch plus read-only `*INSPECT`, the supported classic module
+commands, `*CONFIGURE`, and `*STATUS`. It owns configuration
+setting/default/value policy and output formatting, calling checked persistence
+mechanisms; remaining MOS commands, including the explicit `DESKTOP` command,
+still use the narrow transitional Rust legacy adapter and host handoff
+mechanism.
+
+Configuration-file recovery is a separate post-foundation path, not native
+capsule recovery. The typed store bounds reads at 64 KiB and classifies
+malformed/truncated, unsupported version/schema, invalid UTF-8, unreadable, and
+oversized files. `System.ReadStartupLanguage` returns safe effective defaults
+and a recovery code instead of failing `Boot.Start`; BASIC64 Boot reports the
+cause without exposing a host path, then follows the normal MOS/desktop startup
+policy. `*STATUS` reports effective values plus the latched cause. The file is
+not changed during boot or reads. The first authorized successful setting
+write or `*CONFIGURE DEFAULTS` creates a unique sibling recovery copy of any
+recoverable source (oversized inputs are copied by streaming) and atomically
+writes canonical v3 settings. A failed backup or save leaves active recovery
+latched and the original file unchanged. NotFound is ordinary first-run
+defaults; non-NotFound I/O failures are shown as unreadable storage. This path
+does not expand the native capsule recovery prompt or expose guest SWIs before
+the foundation is ready.
+
+The current v3 configuration profile has six public keys: `Language`,
+`WimpMode` (`Mode` alias), `BASICMode`, `BASICProfile`, `BASICTarget`, and
+`BASICEngine`. `Language` retains the standard numeric form but this host
+accepts only module 0 (MOS prompt) and 3 (desktop). `WimpMode` accepts `Auto`
+or `X<width> Y<height> C/G<depth>` for the six documented hosted sizes and
+eight supported depth tokens; numeric monitor mode IDs, EX/EY, and refresh
+selectors have no hosted monitor table. WimpMode alone controls both
+resolution and palette: Auto follows host content size and selects full-colour
+C16M/Rgb888. Previous `DisplayResolution`/`DisplayColour` pairs are migrated
+when loading old files, with Window becoming Auto/full-colour; explicit v2
+WimpMode takes precedence over the retired `TrellisOutputProfile` row.
+`WindowFurniture` is discarded. These old keys are rejected by public
+commands and full configuration resets. The renderer has one flat
+appearance, and `WindowFurnitureLayout` is only a geometry/hit-test type.
+
+The Phase 4 foundation was the original seven-module set; the current capsule
+adds `TrellisCommands` as the first bounded WP5.3 command module. Console owns the six
+migrated character services; `Error` owns `OS_GenerateError`; `Memory` owns
+`OS_ChangeDynamicArea` and `OS_DynamicArea`; `ModuleManager` owns
+`Acorn_ModuleInfo`, `OS_Module`, `Acorn_ModuleLookup`, and `Acorn_SwiInfo`; and
+`TaskManager` owns `Acorn_TaskInfo`. These are executable definitions in the
+capsule, with Rust providing only their capability-gated mechanisms. The
+current Phase 5/WP5.1 checkpoint adds a bounded post-boot `OS_Module` Load
+(reason 1) and Delete (reason 4) subset over visible BASIC64 `&064` source,
+safe manifest-derived identity queries, and a common X-form error block/V
+transport. A same-title guest Load supports a narrow compatible-immediate
+replacement: it preserves module and entry-cell IDs, retains the workspace
+when persistent declarations and all named type layouts match, and advances
+the full exported SWI set in one registry transaction. Active leases keep the
+old source generation; subsequent calls use the new source. Case-only title
+changes are normalized to the installed display spelling. Candidate Start,
+old Quiesce, and Finalise hooks are not run during this in-place swap. Manifest,
+dependency, capability, exported SWI/PROC/FN signature, lifecycle-contract, or
+state-schema changes are rejected without changing the active module; foundation
+modules are protected. PRM reason 1 instead kills all same-title instantiations
+before initializing the new image, so this is a deliberate, rollback-safe
+hosted deviation. `System` now also owns PRM-numbered `OS_SWINumberToString` (`&38`),
+`OS_SWINumberFromString` (`&39`), and `OS_ReadMonotonicTime` (`&42`) through
+capability-gated Rust mechanisms. The conversion services use active manifest
+identities only, preserve the X bit and exact-case lookup rule, and read/write
+checked caller-task buffers bounded to 128 bytes. Transitional Rust-only and
+unknown services, `OS_WriteI` values, and numeric module-chunk aliases have no
+identity mapping and return structured errors. The hosted monotonic value is
+32-bit centiseconds since runtime startup. `ModuleManager` also owns the
+read-only `Acorn_ModuleExport` (`&4FF14`) and `Acorn_DefinitionSource`
+(`&4FF15`) queries used by the commands and intended future browser. Source is
+read from retained active BASIC64 definitions using checked caller memory and
+bounded chunks; source output escapes display control bytes. Active
+module/version/state and exported SWI identities are explicitly public
+metadata; they describe published service names, not source or task state.
+Definition-source queries require the original caller Task's `SourceRead`
+authority, and OS_Module Load/Replace/Delete requires the separately scoped
+`ModuleManagement` authority. ModuleManager BASIC64 asks for each right before
+the operation, and Rust rechecks it at the shared service handler using the
+same caller Task passed through nested SWI/provider calls. A privileged
+ModuleManager provider capability never upgrades that requestor. Host
+bootstrap grants are private fields on the Task object, not derived from its
+numeric ID: `Task::trusted_mos_session` is the explicit interactive MOS
+bootstrap; source-only and manager-only host profiles are distinct; spawned
+desktop tasks use ordinary `Task::new` and do not inherit. Code executing in a
+trusted session shares that task-scoped authority; stronger guest-program
+isolation requires a separate ordinary task. Grants last for the Task
+object's lifetime and are revoked by host task teardown/replacement; there is
+no guest-visible grant/revoke API. `*INSPECT` and `*Modules` are read-only;
+`*RMLoad`, `*RMRun`, `*RMKill`, and an RMEnsure fallback that invokes a
+mutation reach the separately authorized `OS_Module` interface.
+
+The command module exposes read-only `*INSPECT MODULES [filter]`,
+`*INSPECT MODULE <title>`, `*INSPECT SWI <name|number>`, and
+`*INSPECT DEFINITION <module>/<definition> [byte-offset]`; `SOURCE` is a
+read-only alias. These call the same structured ModuleManager query SWIs
+reserved for future UI parity. Selectors use `FN:` to disambiguate functions;
+only active definitions/current source are available. CLI byte offsets are
+strict decimal values in the nonnegative signed-32-bit range.
+
+The implemented classic mutation/list subset is `*Modules`, `*RMLoad`,
+`*RMRun`, `*RMKill`, and conditional `*RMEnsure`. `*Modules` reports hosted
+logical module titles, semantic versions, and active state; it does not invent
+historical memory/workspace addresses or `%instance` records. RMLoad/RMRun
+accept one RISC OS guest path mapped to visible BASIC64 `&064` source; optional
+module initialization strings are rejected. RMRun currently equals RMLoad
+because hosted modules have no separate application entry. RMKill accepts a
+full title and does not support `%instantiation` selection. RMEnsure compares
+numeric `major.minor[.patch]` components, is a no-op when the installed
+version is equal/newer, and dispatches the complete bounded command tail only
+when missing/older; an unsatisfied check without a tail raises a CLI error.
+Same-title Load uses Trellis' compatible atomic guest-replacement rules, which
+are deliberately rollback-safe and differ from PRM's destructive native `&FFA`
+replacement lifecycle.
+
+Known classic names `*RMReInit`, `*RMInsert`, `*RMTidy`, `*RMClear`,
+`*RMFaster`, `*ROMModules`, and `*Unplug` return explicit unsupported
+diagnostics because this host has no ROM/RMA/unplug state model. This is not a
+claim that these operations are aliases for module load/delete. Abbreviations
+come from a fixed BASIC64 command table (including the unique `*M.` and `*I.`
+prefixes), not the PRM's dynamically assembled module alias order; collisions
+such as `*INSPECT MOD.` are reported as ambiguous while exact `MODULE.` selects
+detail. OS_CLI strips repeated leading `*`/whitespace, accepts PRM NUL/LF/CR
+terminators, and preserves R0.
+The Rust legacy command fallback is only for unrelated commands not yet
+migrated. Broader MOS migration and other WP5.1 compatibility remain open. The
+native loader still installs the initial namespace directly and never calls
+public `OS_Module`.
+
+State migration, quiescent/restart-required replacement, OS_Module parameters,
+broader System query compatibility, task creation/scheduling, OS
+error-vector handling, and the remaining transitional Rust SWI semantics are
+still Phase 5 work. This checkpoint does not mark WP5.1 complete. No public SWI
+is installed as a hidden bootstrap service. `Boot`
+owns Language 0/3 policy through qualified System imports.
+`Host.Graphics.AcceptByte` contains the hosted VDU byte-stream policy while
+`Host.Console.WriteByte` remains raw host output. Capsule contracts, RISC OS
+deviations, and hosted memory limits are recorded in
+[`trellis-boot-capsule.md`](trellis-boot-capsule.md).
+See [`trellis-boot-capsule.md`](trellis-boot-capsule.md) and
+[`trellis-work-packages.md`](trellis-work-packages.md) for the wire contract and
+package-level status.
 
 System Profile 0.1 now has a separate, source-located typed high-level IR whose
 operations represent the supported expressions/statements without retaining
@@ -44,8 +192,9 @@ also executes linked cross-module PROC/FN calls, checks managed resource rights
 at use, scopes typed local read-only bindings in PROC/FN calls, and preserves
 exact explicitly typed `INT64`/`UINT64` operations. Hybrid/Strict JIT and AOT
 requests use the same admission boundary and reject native System Profile
-lowering explicitly. This is not a serialized capsule format or native module
-compiler. Lifecycle workspace writes are transactional: failed `Quiesce`
+lowering explicitly. The IR is not serialized module bytecode or a native
+module compiler; the v1 boot capsule stores visible source and canonical
+manifests. Lifecycle workspace writes are transactional: failed `Quiesce`
 restores the prior workspace and `Active` admission; failed `Finalise` restores
 workspace state but leaves the module safely quiesced, exports inaccessible and
 source/workspace retained for retry. Irreversible host effects performed by a
@@ -315,10 +464,14 @@ source metadata spelling and example are in
 tracked in [`trellis-swi-inventory.yaml`](trellis-swi-inventory.yaml).
 
 Replacement metadata values are `IMMEDIATE`, `QUIESCENT`, `MIGRATING`, and
-`RESTART`. The Phase 0–3 live path currently accepts only a compatible immediate
-definition replacement with the same module version, dependencies, exports,
-contracts, capabilities, lifecycle, and workspace schema. It retains active
-old generations and invalidates derived identities on source/dependency change.
+`RESTART`. Compatible-immediate replacement is implemented for individual
+trusted-host definition updates and, through guest `OS_Module` reason 1, for a
+bounded whole-source module class. The guest path requires unchanged manifest
+identity/dependencies/capabilities/lifecycle/public contracts, matching
+exported PROC/FN signatures, and identical persistent state plus the full named
+type table; it shares the existing workspace and does not run lifecycle hooks.
+The registry swaps all module SWI cells while exclusively borrowed, preserving
+cell IDs and active old leases. Candidate rejection occurs before publication.
 The other values are reserved policy labels, not working state-migration or
 restart workflows. Schema 1 and source fingerprints are deterministic and
 serializable but are not signed or cryptographically authenticated; FNV-1a is
@@ -332,14 +485,18 @@ until no active invocation or retained reference requires them.
 
 Replacement falls into explicit classes:
 
-- immediate replacement for stateless compatible definitions;
+- immediate replacement for compatible definitions or state-preserving module
+  generations whose workspace schema is unchanged;
 - quiescent replacement after active calls finish;
 - migrating replacement with a checked state-upgrade definition;
 - restart-required replacement when foundational invariants change.
 
-Replacement is rejected if validation, contract checking, capability checks,
-or state migration fail. Live modification is not permission to corrupt the
-system silently.
+Only the compatible-immediate path is presently implemented. Guest source
+replacement is further restricted to unchanged dependencies, authority and
+lifecycle metadata/contracts, with all public SWIs committed together and the
+existing workspace shared. It rejects schema/API changes rather than attempting
+Phase 7 state migration. Failure validation leaves the installed module
+unchanged. Live modification is not permission to corrupt the system silently.
 
 ## Bootstrap architecture
 
@@ -386,11 +543,13 @@ The executable embeds, or is distributed with, a trusted boot capsule. It is a
 ROM-equivalent package rather than a mounted filing system. Rust accesses it
 directly without using `OS_File` or another SWI.
 
-The capsule contains visible BASIC64 source or rebuildable portable IR, module
-manifests, dependencies, primitive imports, SWI exports, integrity metadata,
-and optionally discardable native-code caches.
+The target capsule can contain visible BASIC64 source or rebuildable portable
+IR, module manifests, dependencies, primitive imports, SWI exports, integrity
+metadata, and optionally discardable native-code caches. The current v1 capsule
+stores visible source, canonical schema-1 manifests, explicit host grants,
+runtime ABI, and a CRC-32 integrity check; it contains no native-code cache.
 
-The initial capsule contains small foundation modules such as:
+The target architecture anticipates small foundation modules such as:
 
 ```text
 System
@@ -401,6 +560,13 @@ Memory
 Console
 Boot
 ```
+
+The current capsule contains the original seven Phase 4 foundation modules
+plus `TrellisCommands`: `System`, `ModuleManager`, `Error`, `TaskManager`,
+`Memory`, `Console`, `Boot`, and `TrellisCommands`. The first usable service
+slices are source-defined and manifest-owned;
+their precise boundaries and remaining breadth are recorded in
+[`trellis-boot-capsule.md`](trellis-boot-capsule.md).
 
 #### 3. Validate and link foundation modules
 
@@ -442,8 +608,10 @@ filing system is active, from the system volume. These may include FileSwitch,
 HostFS, FontManager, ColourTrans, graphics, Wimp, Filer, BASIC, configuration,
 networking, the inspector, and the desktop.
 
-The boot capsule should contain enough to reach a usable recovery command line.
-It need not contain every normal desktop component.
+The boot capsule should contain enough to reach a usable recovery surface. It
+need not contain every normal desktop component. The current implementation
+offers only the restricted native retry/alternate/exit surface; it is not yet a
+recoverable BASIC64 command line.
 
 #### 7. Enter the configured environment
 

@@ -428,6 +428,36 @@ impl HostFileSystem {
         Ok((fs::read(resolved.host_path)?, metadata))
     }
 
+    /// Reads a guest file without ever buffering more than the caller's
+    /// explicit limit plus one byte. This is used for source/package loading,
+    /// where checking the length after `read_file` would permit an untrusted
+    /// guest file to force an unbounded allocation first.
+    pub fn read_file_limited(
+        &self,
+        context: &FileSystemContext,
+        path: &str,
+        maximum_bytes: usize,
+    ) -> Result<(Vec<u8>, FileMetadata), RuntimeError> {
+        let resolved = self.canonical_guest_path(context, path)?;
+        if resolved.is_directory {
+            return Err(fs_error(format!("'{}' is a directory", path)));
+        }
+        let metadata = resolved
+            .metadata
+            .ok_or_else(|| fs_error(format!("file '{}' not found", path)))?;
+        let file = fs::File::open(resolved.host_path)?;
+        let mut bytes = Vec::with_capacity(maximum_bytes.min(16 * 1024));
+        file.take(maximum_bytes.saturating_add(1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > maximum_bytes {
+            return Err(fs_error(format!(
+                "file '{}' exceeds the {maximum_bytes}-byte read limit",
+                path
+            )));
+        }
+        Ok((bytes, metadata))
+    }
+
     pub fn create_file(
         &self,
         context: &FileSystemContext,

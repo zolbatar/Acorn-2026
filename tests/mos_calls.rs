@@ -1,7 +1,7 @@
 use acorn_2026::{
     basic_compat,
     host::HostConsole,
-    memory::{GUEST_MEMORY_BASE, GUEST_MEMORY_SIZE, Task},
+    memory::{GUEST_MEMORY_BASE, GUEST_MEMORY_SIZE, SWI_ERROR_BLOCK_SIZE, Task},
     swi::{DisplayEvent, OS_BYTE, SwiContext, SwiDispatcher},
     tokenized_basic::TokenizedBasicProgram,
 };
@@ -94,7 +94,7 @@ fn mos_character_entrypoints_reach_output() {
 fn invalid_calls_do_not_alias_mos_entrypoints() {
     let crossing_end = format!(
         "10 A%=3:X%={}:Y%=0:CALL &FFF1",
-        GUEST_MEMORY_BASE as usize + GUEST_MEMORY_SIZE - 2
+        GUEST_MEMORY_BASE as usize + GUEST_MEMORY_SIZE + SWI_ERROR_BLOCK_SIZE - 2
     );
     for source in [
         "10 CALL &1234",

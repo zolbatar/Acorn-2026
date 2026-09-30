@@ -20,14 +20,20 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// Start the trusted interactive MOS session on the terminal host.
+    /// The grant is task-scoped; applications spawned as independent tasks do
+    /// not inherit it.
     pub fn stdio() -> Self {
         Self::new(HostConsole::stdio())
     }
 
+    /// Construct the trusted interactive MOS shell for the windowed host.
     pub fn windowed(input: Receiver<u8>, display_events: Sender<DisplayEvent>) -> Self {
+        let mut dispatcher = SwiDispatcher::windowed(HostConsole::windowed(input), display_events);
+        dispatcher.initialize_mos_shell_console();
         Self {
-            task: Task::new(TASK_ID),
-            dispatcher: SwiDispatcher::windowed(HostConsole::windowed(input), display_events),
+            task: Task::trusted_mos_session(TASK_ID),
+            dispatcher,
         }
     }
 
@@ -36,17 +42,20 @@ impl Runtime {
         display_events: Sender<DisplayEvent>,
         wimp: Arc<WimpServer>,
     ) -> Self {
+        let mut dispatcher = SwiDispatcher::windowed_with_desktop(
+            HostConsole::windowed(input),
+            display_events,
+            wimp,
+        );
+        dispatcher.initialize_mos_shell_console();
         Self {
-            task: Task::new(TASK_ID),
-            dispatcher: SwiDispatcher::windowed_with_desktop(
-                HostConsole::windowed(input),
-                display_events,
-                wimp,
-            ),
+            task: Task::trusted_mos_session(TASK_ID),
+            dispatcher,
         }
     }
 
-    /// Construct an independent BASIC task attached to the shared hosted Wimp.
+    /// Construct an ordinary, unprivileged BASIC task attached to the shared
+    /// hosted Wimp. It does not inherit the interactive MOS task's rights.
     pub fn desktop_task(
         task_id: u64,
         input: Receiver<u8>,
@@ -93,10 +102,13 @@ impl Runtime {
         result.map(|_| ())
     }
 
+    /// Construct the host's trusted MOS session around a console.
     pub fn new(console: HostConsole) -> Self {
+        let mut dispatcher = SwiDispatcher::new(console);
+        dispatcher.initialize_mos_shell_console();
         Self {
-            task: Task::new(TASK_ID),
-            dispatcher: SwiDispatcher::new(console),
+            task: Task::trusted_mos_session(TASK_ID),
+            dispatcher,
         }
     }
 
@@ -132,6 +144,7 @@ impl Runtime {
 
     /// An isolated desktop prompt: do not re-run the saved startup Language.
     pub fn run_desktop_console(&mut self, basic: bool) -> Result<(), RuntimeError> {
+        self.dispatcher.initialize_mos_shell_console();
         let mut lines = std::collections::BTreeMap::<u32, String>::new();
         loop {
             self.write_console_text(if basic { ">" } else { "*" })?;
@@ -205,7 +218,7 @@ impl Runtime {
                     } else {
                         line
                     };
-                    self.run_application(&source)
+                    self.run_basic_console_source(&source)
                 };
                 if let Err(error) = result {
                     if matches!(error, RuntimeError::EndOfInput) {
@@ -228,6 +241,17 @@ impl Runtime {
                 .dispatch(OS_WRITE_C, &mut self.task, &mut context)?;
         }
         self.dispatcher.flush()
+    }
+
+    fn run_basic_console_source(&mut self, source: &str) -> Result<(), RuntimeError> {
+        let configuration = self.dispatcher.load_basic_configuration()?;
+        crate::basic_compat::run_source_from_basic_console(
+            source,
+            &mut self.task,
+            &mut self.dispatcher,
+            &configuration,
+        )
+        .map(|_| ())
     }
 
     fn write_prompt(&mut self) -> Result<(), RuntimeError> {
@@ -297,6 +321,48 @@ mod tests {
     };
 
     #[test]
+    fn interactive_runtime_bootstrap_is_trusted_but_spawned_desktop_task_is_not() {
+        let (_shell_input, shell_receiver) = mpsc::channel();
+        let (shell_display, _shell_events) = mpsc::channel();
+        let shell = Runtime::windowed(shell_receiver, shell_display);
+        assert!(shell.task.require_source_read().is_ok());
+        assert!(shell.task.require_module_management().is_ok());
+        assert!(shell.task.require_configuration_write().is_ok());
+
+        let (_task_input, task_receiver) = mpsc::channel();
+        let (task_display, _task_events) = mpsc::channel();
+        let (updates, _updates_receiver) = mpsc::channel();
+        let wimp = WimpServer::new(updates);
+        let spawned = Runtime::desktop_task(77, task_receiver, task_display, wimp);
+        assert!(matches!(
+            spawned.task.require_source_read(),
+            Err(RuntimeError::Structured { type_name, code: 1, .. })
+                if type_name == "TaskAuthorizationDenied"
+        ));
+        assert!(matches!(
+            spawned.task.require_module_management(),
+            Err(RuntimeError::Structured { type_name, code: 2, .. })
+                if type_name == "TaskAuthorizationDenied"
+        ));
+        assert!(matches!(
+            spawned.task.require_configuration_write(),
+            Err(RuntimeError::Structured { type_name, code: 4, .. })
+                if type_name == "TaskAuthorizationDenied"
+        ));
+
+        // Rights are carried by the task object, not inferred from its ID.
+        let same_id_untrusted = Task::new(shell.task.id);
+        assert!(same_id_untrusted.require_source_read().is_err());
+        assert!(same_id_untrusted.require_module_management().is_err());
+        assert!(same_id_untrusted.require_configuration_write().is_err());
+
+        let config_only = Task::trusted_configuration_manager(77);
+        assert!(config_only.require_configuration_write().is_ok());
+        assert!(config_only.require_source_read().is_err());
+        assert!(config_only.require_module_management().is_err());
+    }
+
+    #[test]
     fn desktop_mandelbrot_publishes_extended_mode_and_coloured_raster() {
         // Exercise the actual desktop file-launch entry point with the original
         // listing, reducing only resolution/iteration count; a queued key ends its wait.
@@ -311,8 +377,12 @@ mod tests {
             }
         }
         std::fs::write(root.join("test"), bytes).unwrap();
-        std::fs::write(root.join("test.acornmeta"),
-            include_str!("../demo-volume/mandelbrot.bbc.acornmeta").replace("guest-name=mandelbrot", "guest-name=test")).unwrap();
+        std::fs::write(
+            root.join("test.acornmeta"),
+            include_str!("../demo-volume/mandelbrot.bbc.acornmeta")
+                .replace("guest-name=mandelbrot", "guest-name=test"),
+        )
+        .unwrap();
         let (input, rx) = mpsc::channel();
         input.send(b' ').unwrap();
         let (display, events) = mpsc::channel();
@@ -320,24 +390,41 @@ mod tests {
         let wimp = WimpServer::new(updates);
         wimp.task_started(900, "mandelbrot").unwrap();
         let mut runtime = Runtime::desktop_task(900, rx, display, wimp.clone());
-        runtime.dispatcher.set_file_system_for_test(HostFileSystem::new(&root));
+        runtime
+            .dispatcher
+            .set_file_system_for_test(HostFileSystem::new(&root));
         let configure = ConfigureStore::with_path(root.join("configure"));
         #[cfg(feature = "experimental-jit")]
         configure.set("BASICEngine", "HYBRID").unwrap();
         runtime.dispatcher.set_configure_store_for_test(configure);
         runtime.run_guest_file("$.test").unwrap();
-        let snapshots: Vec<_> = events.try_iter().filter_map(|event| match event {
-            DisplayEvent::GraphicsSnapshot { snapshot, .. } => Some(snapshot),
-            DisplayEvent::Plot { .. } => panic!("desktop file launch must batch plots"),
-            _ => None,
-        }).collect();
-        assert!(snapshots.len() >= 2, "MODE and final frame must both be published");
+        let snapshots: Vec<_> = events
+            .try_iter()
+            .filter_map(|event| match event {
+                DisplayEvent::GraphicsSnapshot { snapshot, .. } => Some(snapshot),
+                DisplayEvent::Plot { .. } => panic!("desktop file launch must batch plots"),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            snapshots.len() >= 2,
+            "MODE and final frame must both be published"
+        );
         let snapshot = snapshots.last().unwrap();
-        assert_eq!((snapshot.mode.pixel_width, snapshot.mode.pixel_height), (128, 96));
+        assert_eq!(
+            (snapshot.mode.pixel_width, snapshot.mode.pixel_height),
+            (128, 96)
+        );
         let mut pixels = vec![0; 128 * 96 * 4];
-        crate::renderer::render(snapshot, &mut pixels);
-        assert!(pixels.chunks_exact(4).filter(|p| p[0] != p[1] || p[1] != p[2]).count() > 100,
-            "Mandelbrot must draw a coloured image, not just a black background/cursor");
+        crate::renderer::render_for_vello(snapshot, &mut pixels);
+        assert!(
+            pixels
+                .chunks_exact(4)
+                .filter(|p| p[0] != p[1] || p[1] != p[2])
+                .count()
+                > 100,
+            "Mandelbrot must draw a coloured image, not just a black background/cursor"
+        );
         let window = &wimp.desktop_windows()[0];
         assert_eq!(window.work_area.max_x - window.work_area.min_x, 256);
         assert_eq!(window.work_area.max_y - window.work_area.min_y, 192);
@@ -346,14 +433,21 @@ mod tests {
             let scene = builder.build(
                 &wimp.desktop_windows(),
                 &std::collections::HashMap::from([((900, None), snapshot.clone())]),
-                &[], &[], &[], None,
+                &[],
+                &[],
+                &[],
+                None,
                 crate::desktop_scene::Viewport::new(1600, 1200),
             );
             let rgba = crate::vello_backend::snapshot_scene(&scene, 1600, 1200).unwrap();
             let mut encoder = png::Encoder::new(std::fs::File::create(path).unwrap(), 1600, 1200);
             encoder.set_color(png::ColorType::Rgba);
             encoder.set_depth(png::BitDepth::Eight);
-            encoder.write_header().unwrap().write_image_data(&rgba).unwrap();
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&rgba)
+                .unwrap();
         }
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -361,7 +455,7 @@ mod tests {
     #[test]
     fn desktop_prompts_accept_commands_and_basic_without_startup_handoff() {
         for (basic, input, expected) in [
-            (false, "STATUS WindowFurniture\rQUIT\r", "WindowFurniture"),
+            (false, "STATUS WimpMode\rQUIT\r", "WimpMode"),
             (true, "10 PRINT 12345\r20 END\rLIST\rRUN\rQUIT\r", "12345"),
         ] {
             let (tx, rx) = mpsc::channel();
@@ -381,6 +475,32 @@ mod tests {
                 .collect();
             assert!(text.contains(expected), "{text}");
             assert!(!text.contains("error"), "{text}");
+        }
+    }
+
+    #[test]
+    fn desktop_task_prompts_initialize_a_modern_shell_for_mos_and_basic() {
+        for basic in [false, true] {
+            let (input_sender, input_receiver) = mpsc::channel();
+            for byte in b"QUIT\r" {
+                input_sender.send(*byte).unwrap();
+            }
+            drop(input_sender);
+            let (display_sender, display_receiver) = mpsc::channel();
+            let (updates, _updates_receiver) = mpsc::channel();
+            let wimp = WimpServer::new(updates);
+            let mut runtime = Runtime::desktop_task(901, input_receiver, display_sender, wimp);
+            runtime.run_desktop_console(basic).unwrap();
+
+            assert_eq!(
+                runtime.dispatcher.graphics().snapshot().text_profile,
+                crate::graphics::TextRenderingProfile::Modern
+            );
+            assert!(display_receiver.try_iter().any(|event| matches!(
+                event,
+                DisplayEvent::GraphicsSnapshot { snapshot, .. }
+                    if snapshot.text_profile == crate::graphics::TextRenderingProfile::Modern
+            )));
         }
     }
 
@@ -476,7 +596,53 @@ mod tests {
     }
 
     #[test]
-    fn language_three_starts_the_desktop_command_path_without_showing_a_mos_prompt() {
+    fn boot_module_language_zero_enters_the_mos_command_prompt() {
+        let (input_sender, input_receiver) = mpsc::channel();
+        for byte in b"QUIT\r" {
+            input_sender.send(*byte).unwrap();
+        }
+        drop(input_sender);
+        let (display_sender, display_receiver) = mpsc::channel();
+        let (updates, _update_receiver) = mpsc::channel();
+        let wimp = WimpServer::new(updates);
+        let runtime_wimp = wimp.clone();
+        let config_path = std::env::temp_dir().join(format!(
+            "acorn-2026-language-mos-startup-{}.configure",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&config_path);
+        let configure = ConfigureStore::with_path(&config_path);
+        configure.set("Language", "0").unwrap();
+        let (finished_sender, finished_receiver) = mpsc::channel();
+
+        let runtime_thread = thread::spawn(move || {
+            let mut runtime =
+                Runtime::windowed_with_desktop(input_receiver, display_sender, runtime_wimp);
+            runtime.dispatcher.set_configure_store_for_test(configure);
+            let _ = finished_sender.send(runtime.run());
+        });
+
+        loop {
+            match display_receiver.recv_timeout(Duration::from_secs(2)) {
+                Ok(DisplayEvent::WriteByte { byte: b'*', .. }) => break,
+                Ok(DisplayEvent::DesktopStarted) => {
+                    panic!("configured Language 0 must not start the desktop")
+                }
+                Ok(_) => {}
+                Err(error) => panic!("configured Language 0 did not show the MOS prompt: {error}"),
+            }
+        }
+        finished_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("QUIT should leave the configured MOS command prompt")
+            .expect("the MOS runtime should shut down cleanly");
+        runtime_thread.join().unwrap();
+        wimp.stop();
+        let _ = std::fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn boot_module_language_three_starts_desktop_without_showing_a_mos_prompt() {
         let (input_sender, input_receiver) = mpsc::channel();
         drop(input_sender);
         let (display_sender, display_receiver) = mpsc::channel();

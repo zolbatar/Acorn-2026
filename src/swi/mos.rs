@@ -44,6 +44,7 @@ impl MosClock {
 #[derive(Default)]
 pub(super) struct MosState {
     pub(super) system_clock: MosClock,
+    pub(super) monotonic_timer: MosClock,
     interval_timer: MosClock,
     pub(super) input: VecDeque<u8>,
 }

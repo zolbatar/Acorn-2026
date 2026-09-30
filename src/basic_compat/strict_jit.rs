@@ -3292,6 +3292,7 @@ fn scan_statement(statement: &Statement, scan: &mut ProgramScan) {
             name,
             arguments,
             results,
+            flags,
         } => {
             scan.string_constants.insert(name.clone());
             for argument in arguments.iter().flatten() {
@@ -3299,6 +3300,9 @@ fn scan_statement(statement: &Statement, scan: &mut ProgramScan) {
             }
             for result in results {
                 scan_name(result, scan);
+            }
+            if let Some(flags) = flags {
+                scan_name(flags, scan);
             }
         }
         Statement::PrimitiveCall {

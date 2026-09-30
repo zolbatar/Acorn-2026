@@ -1,0 +1,78 @@
+REM @BASIC64 MODE=BASIC64
+REM @SYSTEM_PROFILE 0.1
+REM @MODULE ModuleManager 1.0.0
+REM @CAPABILITY ModuleIntrospection
+REM @CAPABILITY ModuleManagement
+REM @CAPABILITY RuntimeErrors
+REM @IMPORT Host.ModuleManager.ReadInfo ModuleIntrospection
+REM @IMPORT Host.ModuleManager.LoadSource ModuleManagement
+REM @IMPORT Host.ModuleManager.Unload ModuleManagement
+REM @IMPORT Host.ModuleManager.LookupModule ModuleIntrospection
+REM @IMPORT Host.ModuleManager.LookupSwi ModuleIntrospection
+REM @IMPORT Host.ModuleManager.LookupModuleExport ModuleIntrospection
+REM @IMPORT Host.ModuleManager.ReadDefinitionSource ModuleIntrospection
+REM @IMPORT Host.ModuleManager.AuthorizeSourceRead ModuleIntrospection
+REM @IMPORT Host.ModuleManager.AuthorizeManagement ModuleManagement
+REM @IMPORT Host.Runtime.UnsupportedServiceReason RuntimeErrors
+REM @SWI Acorn_ModuleInfo &4FF10 ReadModuleInfo REGISTERS=R0:U32:IN|R1:U32:INOUT|R2:ADDRESS32:INOUT|R3:U32:IN|R4:U32:OUT|R5:U32:OUT|R6:U32:OUT|R7:U32:OUT|R8:U32:OUT;MEMORY=R2:WRITE:128;BLOCKING=FALSE;REENTRANT=TRUE;ERROR=ModuleInfoError
+REM @SWI Acorn_ModuleLookup &4FF12 LookupModule REGISTERS=R0:U32:IN|R1:ADDRESS32:INOUT|R2:U32:OUT|R3:U32:OUT|R4:U32:OUT|R5:U32:OUT|R6:U32:OUT;MEMORY=R1:READ:128;BLOCKING=FALSE;REENTRANT=TRUE;ERROR=ModuleLookupError
+REM @SWI Acorn_SwiInfo &4FF13 ReadSwiInfo REGISTERS=R0:U32:IN|R1:U32:IN|R2:ADDRESS32:OUT|R3:U32:IN|R4:ADDRESS32:OUT|R5:U32:IN|R6:ADDRESS32:OUT|R7:U32:IN|R8:U32:OUT;MEMORY=R2:WRITE:128|R4:WRITE:128|R6:WRITE:128;BLOCKING=FALSE;REENTRANT=TRUE;ERROR=SwiIdentityError
+REM @SWI Acorn_ModuleExport &4FF14 LookupModuleExport REGISTERS=R0:U32:IN|R1:ADDRESS32:IN|R2:U32:INOUT|R3:ADDRESS32:OUT|R4:U32:IN|R5:U32:OUT|R6:ADDRESS32:OUT|R7:U32:IN|R8:U32:OUT|R9:U32:OUT;MEMORY=R1:READ:128|R3:WRITE:128|R6:WRITE:128;BLOCKING=FALSE;REENTRANT=TRUE;ERROR=ModuleExportError
+REM @SWI Acorn_DefinitionSource &4FF15 ReadDefinitionSource REGISTERS=R0:U32:INOUT|R1:ADDRESS32:IN|R2:U32:INOUT|R3:ADDRESS32:OUT|R4:U32:IN|R5:U32:OUT|R6:U32:OUT|R7:ADDRESS32:OUT|R8:U32:IN|R9:U32:OUT|R10:U32:OUT;MEMORY=R1:READ:128|R3:WRITE:1025|R7:WRITE:128;BLOCKING=FALSE;REENTRANT=TRUE;ERROR=DefinitionSourceError
+REM @SWI OS_Module &1E OperateModule REGISTERS=R0:U32:IN|R1:ADDRESS32:INOUT;BLOCKING=TRUE;REENTRANT=FALSE;ERROR=ModuleOperationError
+
+DEF PROC ReadModuleInfo
+    IF R0% <> 1 THEN PRIMITIVE Host.Runtime.UnsupportedServiceReason, &4FF10, R0%
+    PRIMITIVE Host.ModuleManager.ReadInfo, R1%, R2%, R3% TO NEXT%, FOUND%, MAJOR%, MINOR%, PATCH%, STATE%
+    R1% = NEXT%
+    R4% = FOUND%
+    R5% = MAJOR%
+    R6% = MINOR%
+    R7% = PATCH%
+    R8% = STATE%
+ENDPROC
+
+DEF PROC LookupModule
+    IF R0% <> 1 THEN PRIMITIVE Host.Runtime.UnsupportedServiceReason, &4FF12, R0%
+    PRIMITIVE Host.ModuleManager.LookupModule, R1% TO FOUND%, NUMBER%, MAJOR%, MINOR%, PATCH%, STATE%
+    R1% = FOUND%
+    R2% = NUMBER%
+    R3% = MAJOR%
+    R4% = MINOR%
+    R5% = PATCH%
+    R6% = STATE%
+ENDPROC
+
+DEF PROC ReadSwiInfo
+    IF R0% <> 1 THEN PRIMITIVE Host.Runtime.UnsupportedServiceReason, &4FF13, R0%
+    PRIMITIVE Host.ModuleManager.LookupSwi, R1%, R2%, R3%, R4%, R5%, R6%, R7% TO NAMELEN%, MODULELEN%, DEFLEN%, GENERATION%
+    R8% = GENERATION%
+ENDPROC
+
+DEF PROC LookupModuleExport
+    IF R0% <> 1 THEN PRIMITIVE Host.Runtime.UnsupportedServiceReason, &4FF14, R0%
+    PRIMITIVE Host.ModuleManager.LookupModuleExport, R1%, R2%, R3%, R4%, R6%, R7% TO NEXT%, FOUND%, NUMBER%, GENERATION%
+    R2% = NEXT%
+    R5% = NUMBER%
+    R8% = GENERATION%
+    R9% = FOUND%
+ENDPROC
+
+DEF PROC ReadDefinitionSource
+    IF R0% <> 1 THEN PRIMITIVE Host.Runtime.UnsupportedServiceReason, &4FF15, R0%
+    PRIMITIVE Host.ModuleManager.AuthorizeSourceRead
+    PRIMITIVE Host.ModuleManager.ReadDefinitionSource, R1%, R2%, R3%, R4%, R7%, R8% TO BYTES%, NEXT%, TOTAL%, GENERATION%, IDLOW%, IDHIGH%
+    R0% = BYTES%
+    R2% = NEXT%
+    R5% = TOTAL%
+    R6% = GENERATION%
+    R9% = IDLOW%
+    R10% = IDHIGH%
+ENDPROC
+
+DEF PROC OperateModule
+    IF R0% <> 1 AND R0% <> 4 THEN PRIMITIVE Host.Runtime.UnsupportedServiceReason, &1E, R0%
+    PRIMITIVE Host.ModuleManager.AuthorizeManagement
+    IF R0% = 1 THEN PRIMITIVE Host.ModuleManager.LoadSource, R1%
+    IF R0% = 4 THEN PRIMITIVE Host.ModuleManager.Unload, R1%
+ENDPROC

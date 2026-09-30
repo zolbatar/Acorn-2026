@@ -1,7 +1,7 @@
 schema_version: 1
 inventory_version: 1
 scope:
-  source: src/swi.rs and src/wimp.rs
+  source: src/swi.rs, src/wimp.rs, and active modules/*.bas64 manifests
   note: >-
     This describes the hosted dispatcher currently in the repository, including
     named-only project services. It is an implementation inventory, not a
@@ -17,13 +17,38 @@ dispatch_routes:
     - "0x03 OS_NewLine -> Console.NewLine"
     - "0x04 OS_ReadC -> Console.ReadC"
     - "0x0E OS_ReadLine -> Console.ReadLine"
-  transitional_numeric: all other numeric services below
+    - "0x38 OS_SWINumberToString -> System.SwiNumberToString"
+    - "0x39 OS_SWINumberFromString -> System.SwiNumberFromString"
+    - "0x42 OS_ReadMonotonicTime -> System.ReadMonotonicTime"
+    - "0x2A OS_ChangeDynamicArea -> Memory.ChangeDynamicArea"
+    - "0x2B OS_GenerateError -> Error.GenerateError"
+    - "0x66 OS_DynamicArea -> Memory.DynamicArea"
+    - "0x4FF10 Acorn_ModuleInfo -> ModuleManager.ReadModuleInfo (project extension)"
+    - "0x1E OS_Module -> ModuleManager.OperateModule"
+    - "0x4FF12 Acorn_ModuleLookup -> ModuleManager.LookupModule (project extension)"
+    - "0x4FF13 Acorn_SwiInfo -> ModuleManager.ReadSwiInfo (project extension)"
+    - "0x4FF11 Acorn_TaskInfo -> TaskManager.ReadTaskInfo (project extension)"
+    - "0x4FF14 Acorn_ModuleExport -> ModuleManager.LookupModuleExport (project extension)"
+    - "0x4FF15 Acorn_DefinitionSource -> ModuleManager.ReadDefinitionSource (project extension)"
+    - "0x05 OS_CLI -> TrellisCommands.ExecuteCli"
+  transitional_numeric: all numeric services below without a module-owned route
   transitional_named_only:
     - COLOURTRANS_CONVERTHSVTORGB
     - COLOURTRANS_SETGCOL
     - COLOURTRANS_WRITEPALETTE
     - ACORN_DESKTOP
     - ACORN_DISPLAY
+
+system_query_identity:
+  authority: "Active module manifest exports; numeric/name constants in host code are routing metadata, not an identity source."
+  lookup_scope: "Only currently active manifest-owned exports are mapped. Transitional Rust-only SWIs, the OS_WriteI encoding range, and unknown numbers/names are not synthesized."
+  to_string: "OS_SWINumberToString strips bit 17 for the active identity lookup, prepends X when set, returns a NUL-terminated name, and reports the name length excluding NUL in R2. A checked caller buffer must fit name plus NUL."
+  from_string: "OS_SWINumberFromString scans a caller-scoped logical string until an ASCII control/space byte, recognizes leading uppercase X as bit 17, matches names exactly/case-sensitively, preserves R1 and returns R0. Unknown names return a structured identity error."
+  monotonic_time: "OS_ReadMonotonicTime returns wrapping low-32-bit centiseconds since hosted runtime initialization; unlike the PRM hard-reset/power-on epoch, this hosted epoch is not hardware reset time."
+  limits: "The historical PRM also defines fallback names for unmigrated OS SWIs, OS_WriteI character forms, numeric module-chunk suffixes, and User fallback names. Trellis intentionally does not guess identities for services absent from active manifests."
+  prm_references:
+    - https://www.riscos.com/support/developers/prm/conversions.html
+    - https://www.riscos.com/support/developers/prm/timedate.html
 
 numeric_services:
   - number: "0x00"
@@ -78,13 +103,15 @@ numeric_services:
 
   - number: "0x05"
     name: OS_CLI
-    current_handler: SwiDispatcher::execute_cli
-    contract: "R0 logical address of NUL-terminated command; command runs synchronously"
-    logical_memory: "read caller task at R0, bounded to MAX_CLI_BYTES"
+    current_handler: "TrellisCommands.ExecuteCli BASIC64 definition; Host.MOS.ExecuteLegacy protected fallback"
+    contract: "R0 unmasked caller logical address of command; command runs synchronously and preserves R0 on success. BASIC64 parser recognizes NUL, LF, or CR line endings."
+    logical_memory: "checked caller task read at R0, bounded to 256 bytes; unterminated input is rejected, never truncated"
     blocking: true
-    owner: MOS
-    final_form: "BASIC64 MOS policy with a command-execution primitive"
-    current_tests: "src/swi.rs CLI abbreviation/configuration/desktop tests; tests/mos_calls.rs"
+    owner: TrellisCommands
+    final_form: "BASIC64 `*INSPECT`, supported classic module commands, `*CONFIGURE`, and `*STATUS` parsing/selection/validation/presentation plus explicit `Host.MOS.ExecuteLegacy` bridge for remaining MOS commands"
+    current_tests: "tests/trellis_classic_module_commands.rs; tests/trellis_mos_introspection.rs; tests/trellis_mos_configuration.rs; tests/trellis_configuration_recovery.rs; tests/trellis_authorization.rs; src/swi.rs CLI abbreviation/configuration/desktop tests; tests/mos_calls.rs"
+    configuration_contract: "Current v3 schema has six keys: Language (PRM decimal/&hex/base_num spelling, hosted values 0/3), WimpMode (Mode alias; Auto or canonical X<width> Y<height> C/G<depth>; zero-padded 3/4 digit dimensions canonicalize), BASICMode, BASICProfile, BASICTarget, and BASICEngine. WimpMode alone chooses both resolution and palette: fixed selectors support six logical sizes and C2/C16/C256/C32K/C16M/G4/G16/G256; Auto is host-sized and full-colour C16M/Rgb888. Physical mode IDs, EX/EY scaling and frame rate are unsupported. Defaults: Language=0, BASICMode=AUTO, BASICProfile=AUTO, BASICTarget=AUTO, BASICEngine=INTERPRETER, WimpMode=AUTO. Old DisplayResolution/DisplayColour pairs migrate to WimpMode (Window becomes Auto/full-colour); explicit WimpMode in v2 wins over retired TrellisOutputProfile. WindowFurniture and TrellisOutputProfile rows are discarded on file load; legacy keys are file-load migration only and rejected by command/reset APIs. Renderer appearance is flat-only. Stored reads are bounded to 64 KiB."
+    compatibility: "The interim `*TRELLIS` family is not recognized or advertised. `*INSPECT` is read-only: MODULES [filter], MODULE title, SWI name|number, DEFINITION module/definition [strict decimal byte offset], with SOURCE as a read-only alias. Classic supported routes are *Modules, *RMLoad, *RMRun, *RMKill, and conditional *RMEnsure. Final-dot prefixes use a fixed BASIC64 table and exact routes win; ambiguous prefixes error. The current table includes `*I.`, `*M.`, `*Mod.`, and `*INSPE.`; it does not reproduce PRM's dynamic alias/module-order resolution. Repeated leading `*` and command whitespace are stripped. RMLoad/RMRun accept one guest path to BASIC64 filetype &064; init strings are rejected. RMRun equals RMLoad because hosted modules have no app-entry address. RMKill does not model `%instance`. RMEnsure compares numeric major.minor[.patch] components, no-ops when installed version is sufficient, and executes its bounded tail only when missing/older; an unsatisfied check without tail raises CliError. `*Modules` lists logical hosted title/version/state without invented RMA/workspace addresses or instance rows. RMReInit/RMInsert/RMTidy/RMClear/RMFaster/ROMModules/Unplug are explicit unsupported errors without state change because hosted ROM/RMA/unplug support does not exist. CONFIGURE/CONF. and STATUS policy is BASIC64-owned. OS_CLI accepts NUL/LF/CR terminators, preserves R0, and uses checked task-local dynamic scratch released on normal or exceptional exit. Configuration writes require separate caller Task ConfigurationWrite authority deliberately granted to interactive MOS, not inherited by spawned tasks; source reading and module management remain separate rights. Malformed, unsupported, unreadable, invalid-UTF-8, and oversized stored configuration now boots with safe defaults and a path-redacted warning/status; the file remains unchanged until an authorized successful repair preserves recoverable bytes in a `.recovery-*` sibling and atomically writes canonical v3. Oversized input is copied by streaming. This post-foundation route is separate from native capsule recovery. Remaining MOS command semantics are transitional Rust; full OS_CLI migration is open."
 
   - number: "0x06"
     name: OS_Byte
@@ -176,6 +203,17 @@ numeric_services:
     final_form: "BASIC64 edit/echo policy over ConsoleInput, ConsoleOutput, and checked caller-scoped memory"
     current_tests: "swi::tests::os_read_line_* cover module route, editing/backspace, accepted range, echo-only and R4 substitution flags, buffer-full bell, Escape, EOF, CR and memory bounds; exhaustive option combinations and exact error-block details remain gaps"
 
+  - number: "0x1E"
+    name: OS_Module
+    current_handler: "ModuleManager.OperateModule BASIC64 definition; Host.ModuleManager.LoadSource/Unload protected primitives"
+    contract: "Historical reason 1 Load (R0=1,R1 pathname) and reason 4 Delete (R0=4,R1 full module title); both require ModuleManagement on the original caller Task; R0/R1 preserved on success. Load reads a HostFS guest path to UTF-8 BASIC64 source filetype &064 and links/starts a new module, or performs a compatible-immediate same-title source replacement. Delete quiesces/finalises an active guest module."
+    logical_memory: "R1 is a checked caller-scoped NUL-terminated logical string (256 bytes for Load, 128 for Delete)"
+    blocking: true
+    owner: ModuleManager
+    final_form: "BASIC64 reason selection and public policy over protected HostFS/registry/lifecycle mechanisms"
+    current_tests: "swi::tests::module_manager_loads_inspects_and_unloads_guest_source_modules; swi::tests::module_manager_replaces_guest_exports_as_one_generation_and_preserves_workspace; wp51_os_module_replacement_is_atomic_compatible_and_preserves_active_calls; swi::tests::module_manager_rolls_back_failed_guest_start_and_protects_foundation; swi::tests::module_manager_enforces_guest_capability_and_dependency_boundaries; swi::tests::swi_errors_and_x_form_errors_use_the_documented_task_scoped_block"
+    compatibility: "Deliberate hosted adaptation: &064 visible BASIC64 source replaces historical &FFA relocatable ARM image. The requestor Task must carry ModuleManagement; ModuleManager's provider capability does not confer it. Titles are ASCII alphanumeric and matched case-insensitively; case-only replacement preserves the installed spelling. A same-title Load atomically replaces all exports only when module identity/version/dependencies/capabilities/lifecycle, SWI names/numbers/definition names/register contracts, exported PROC/FN signatures, and full persistent/type schema are unchanged. It preserves ModuleId, entry-cell IDs and workspace; active leases keep old code. Candidate Start and old Quiesce/Finalise are not rerun. Incompatible candidates are rejected without disturbing the installed module. This is intentionally safer than PRM reason 1, which kills the old module and all instantiations before initialization. No init parameters or %instantiations. Only reasons 1 and 4 are supported. Reasons 0, 2-3, 5-17, and 19-20 return UnsupportedServiceReason. Reasons 12 and 18 are specifically rejected because their outputs include raw module/private-word/postfix pointers; safe inventory and name lookup are provided by Acorn_ModuleInfo and Acorn_ModuleLookup."
+
   - number: "0x29"
     name: OS_FSControl
     current_handler: SwiDispatcher::os_fscontrol
@@ -195,6 +233,39 @@ numeric_services:
     owner: Graphics
     final_form: "BASIC64 graphics service over caller-owned surface query primitive"
     current_tests: "src/swi.rs os_read_point_reads_immediate_pixels_and_preserves_coordinates"
+
+  - number: "0x38"
+    name: OS_SWINumberToString
+    current_handler: "System.SwiNumberToString BASIC64 definition; Host.System.SwiNumberToString protected primitive"
+    contract: "R0 SWI number and R1 buffer pointer are preserved; R2 is the maximum buffer length on entry and name length on exit. Output is NUL-terminated; bit 17 adds a leading X."
+    logical_memory: "R1 is a checked caller-scoped logical output buffer; capacity is 1..128 bytes and must fit the returned name plus NUL."
+    blocking: false
+    owner: System
+    final_form: "BASIC64 conversion policy over active manifest identity lookup and checked caller memory"
+    current_tests: "swi::tests::system_query_swis_use_active_manifest_identity_and_checked_buffers; wp51_public_contracts_cover_modules_errors_identity_and_system_queries"
+    compatibility: "Only active manifest-owned SWIs are returned. Transitional Rust-only handlers, OS_WriteI aliases, numeric module-chunk names, and unknown User names are not synthesized; unsupported identity and short-buffer cases return structured errors."
+
+  - number: "0x39"
+    name: OS_SWINumberFromString
+    current_handler: "System.SwiNumberFromString BASIC64 definition; Host.System.SwiNumberFromString protected primitive"
+    contract: "R1 points to a control/space-terminated name; R1 is preserved and R0 receives the SWI number. Leading uppercase X sets bit 17. Names are case-sensitive."
+    logical_memory: "R1 is a checked caller-scoped logical input string, scanned to ASCII control/space within 128 bytes."
+    blocking: false
+    owner: System
+    final_form: "BASIC64 name/X policy over active manifest identity lookup and checked caller memory"
+    current_tests: "swi::tests::system_query_swis_use_active_manifest_identity_and_checked_buffers; wp51_public_contracts_cover_modules_errors_identity_and_system_queries"
+    compatibility: "Only active manifest-owned names resolve. Historical module numeric suffix forms and OS_WriteI aliases are not parsed; non-ASCII/unterminated/unknown names return structured errors."
+
+  - number: "0x42"
+    name: OS_ReadMonotonicTime
+    current_handler: "System.ReadMonotonicTime BASIC64 definition; Host.System.ReadMonotonicTime protected primitive"
+    contract: "No inputs; R0 returns wrapping 32-bit centiseconds from the hosted monotonic epoch."
+    logical_memory: none
+    blocking: false
+    owner: System
+    final_form: "BASIC64 public dispatch over an independent hosted monotonic clock mechanism"
+    current_tests: "swi::tests::system_query_swis_use_active_manifest_identity_and_checked_buffers; wp51_public_contracts_cover_modules_errors_identity_and_system_queries"
+    compatibility: "The epoch begins at hosted runtime initialization rather than the hardware's last hard reset or power-on."
 
   - number: "0x45"
     name: OS_Plot
@@ -396,6 +467,122 @@ numeric_services:
     final_form: "BASIC64 extension owned by Wimp; retained as a documented hosted addition"
     current_tests: "src/wimp.rs custom icon asset and ownership tests"
 
+  - number: "0x2A"
+    name: OS_ChangeDynamicArea
+    current_handler: "Memory.ChangeDynamicArea BASIC64 definition; Host.Memory.ChangeDynamicArea protected primitive"
+    contract: "R0 caller-task dynamic-area number; R1 signed byte delta; R1 returns amount moved"
+    logical_memory: none
+    blocking: false
+    owner: Memory
+    final_form: "BASIC64 service over caller-scoped checked logical memory"
+    current_tests: "swi::tests::basic64_memory_module_owns_task_scoped_dynamic_area_lifecycle"
+
+  - number: "0x2B"
+    name: OS_GenerateError
+    current_handler: "Error.GenerateError BASIC64 definition; Host.Error.RaiseErrorBlock protected primitive"
+    contract: "R0 caller logical address of a 256-byte standard error block"
+    logical_memory: "checked read of four-byte error number plus bounded NUL-terminated message"
+    blocking: false
+    owner: Error
+    final_form: "BASIC64 error service translating caller error blocks to structured runtime errors"
+    current_tests: "swi::tests::error_task_and_module_foundation_sw_is_are_owned_by_basic64_modules; swi::tests::swi_errors_and_x_form_errors_use_the_documented_task_scoped_block"
+    compatibility: "OS_GenerateError preserves the checked standard error-block input shape and raises a structured OSError in normal form. X bit 17 returns a caller-task-local standard block in R0 and sets V on failure; XOS_GenerateError specifically preserves its input R0 block and sets V. Exhaustive historical error handling is not claimed."
+
+  - number: "0x66"
+    name: OS_DynamicArea
+    current_handler: "Memory.DynamicArea BASIC64 reason dispatch; Host.Memory.* protected primitives"
+    contract: "R0 reason 0 create, 1 remove, 2 information, 3 enumeration; R1-R8 are reason-specific"
+    logical_memory: "reason 0 reads the caller NUL-terminated name at R8; returned area addresses remain caller-scoped"
+    blocking: false
+    owner: Memory
+    final_form: "BASIC64 service over task-local checked logical dynamic areas"
+    current_tests: "swi::tests::basic64_memory_module_owns_task_scoped_dynamic_area_lifecycle"
+    compatibility: "Automatic IDs and bases only; 16 MiB per area and 32 MiB total reservation; callback and physical mapping features are unsupported."
+
+  - number: "0x4FF10"
+    name: Acorn_ModuleInfo
+    current_handler: "ModuleManager.ReadModuleInfo BASIC64 definition; Host.ModuleManager.ReadInfo protected primitive"
+    contract: "Project extension ABI 1: R1 cursor, R2 output name buffer, R3 capacity; R1 next cursor, R4 found, R5-R7 semantic version, R8 lifecycle state"
+    logical_memory: "checked caller buffer write, at most 128 bytes"
+    blocking: false
+    owner: ModuleManager
+    final_form: "BASIC64 read-only module registry query"
+    current_tests: "swi::tests::error_task_and_module_foundation_sw_is_are_owned_by_basic64_modules"
+    compatibility: "Hosted Trellis extension; not a historical RISC OS SWI. Module enumeration is read-only, while post-boot load/delete are owned by OS_Module."
+
+  - number: "0x4FF11"
+    name: Acorn_TaskInfo
+    current_handler: "TaskManager.ReadTaskInfo BASIC64 definition; Host.Task.ReadIdentity protected primitive"
+    contract: "Project extension ABI 1: R1 caller task ID, R2 logical address-space span, R3 dynamic-area count"
+    logical_memory: none
+    blocking: false
+    owner: TaskManager
+    final_form: "BASIC64 caller-task query"
+    current_tests: "swi::tests::error_task_and_module_foundation_sw_is_are_owned_by_basic64_modules"
+    compatibility: "Hosted Trellis extension; not a historical RISC OS SWI and does not create or schedule tasks."
+
+  - number: "0x4FF12"
+    name: Acorn_ModuleLookup
+    current_handler: "ModuleManager.LookupModule BASIC64 definition; Host.ModuleManager.LookupModule protected primitive"
+    contract: "Project extension ABI 1: R0 version, R1 exact case-insensitive module-title pointer; returns R1 found, R2 one-based deterministic active-module ordinal, R3-R5 semantic version, R6 lifecycle state"
+    logical_memory: "checked caller name read, at most 128 bytes"
+    blocking: false
+    owner: ModuleManager
+    final_form: "BASIC64 active-manifest lookup without historical pointer results"
+    current_tests: "swi::tests::module_manager_loads_inspects_and_unloads_guest_source_modules"
+    compatibility: "Hosted Trellis extension, not historical OS_Module reason 18. Ordinal is transient and may shift as active modules change; exact full case-insensitive title only, with no abbreviations or instantiations. Guest load titles follow RISC OS ASCII-alphanumeric form."
+
+  - number: "0x4FF13"
+    name: Acorn_SwiInfo
+    current_handler: "ModuleManager.ReadSwiInfo BASIC64 definition; Host.ModuleManager.LookupSwi protected primitive"
+    contract: "Project extension ABI 1: R0 version, R1 active SWI number; R2/R3 checked name output buffer/capacity, R4/R5 owner-module buffer/capacity, R6/R7 current definition buffer/capacity; R8 active generation number"
+    logical_memory: "checked caller output strings, each capacity 1..128 bytes"
+    blocking: false
+    owner: ModuleManager
+    final_form: "BASIC64 active-manifest and entry-cell identity query"
+    current_tests: "swi::tests::module_manager_loads_inspects_and_unloads_guest_source_modules"
+    compatibility: "Hosted Trellis extension; reports only active entries and returns names through caller buffers rather than raw module pointers."
+
+  - number: "0x4FF14"
+    name: Acorn_ModuleExport
+    current_handler: "ModuleManager.LookupModuleExport BASIC64 definition; Host.ModuleManager.LookupModuleExport protected primitive"
+    contract: "Project extension ABI 1: R0 version, R1 module-title input; R2 zero-based cursor in/out; R3/R4 SWI-name output/capacity; R5 SWI number; R6/R7 definition-name output/capacity; R8 generation; R9 found flag"
+    logical_memory: "checked caller-owned module-title read and SWI/definition output buffers, each bounded to 128 bytes"
+    blocking: false
+    owner: ModuleManager
+    final_form: "BASIC64 read-only enumeration of the active module's manifest-owned SWI exports"
+    current_tests: "tests/trellis_mos_introspection.rs::wp51_mos_introspection_matches_read_only_queries_and_tracks_live_generations"
+    compatibility: "Hosted extension, not a historical RISC OS SWI. Cursor order is deterministic by SWI number. It reports only currently active SWI exports/current generations, not private PROC/FN exports or historical generations. Active module/SWI identity is explicitly public metadata and the query is read-only."
+
+  - number: "0x4FF15"
+    name: Acorn_DefinitionSource
+    current_handler: "ModuleManager.ReadDefinitionSource BASIC64 definition; Host.ModuleManager.ReadDefinitionSource protected primitive"
+    contract: "Project extension ABI 1: the original caller Task must carry SourceRead; R0 bytes copied in/out; R1 `Module/Definition` selector input (`FN:` marks functions); R2 source byte offset in/out; R3/R4 chunk buffer/capacity; R5 total source bytes; R6 current generation when unambiguous; R7/R8 source-path buffer/capacity; R9/R10 stable DefinitionId low/high"
+    logical_memory: "checked caller selector/path buffers and source chunk; capacities up to 128 bytes for selectors/path and 1025 bytes for source including NUL; chunks copy at most 1024 source bytes, UTF-8 boundaries only. CLI offset is strict decimal 0..2147483647."
+    blocking: false
+    owner: ModuleManager
+    final_form: "BASIC64 read-only query of retained active BASIC64 definition source; no HostFS reopen"
+    current_tests: "tests/trellis_mos_introspection.rs::wp51_mos_introspection_matches_read_only_queries_and_tracks_live_generations"
+    compatibility: "Hosted extension, not historical. Selects active PROC/FN definitions, including private ones, by stable logical identity; source bytes preserve source line endings and trailing newline. Offset past end or inside a UTF-8 scalar is rejected. Capacity is 2..=1025 while data remains (one byte only at EOF). No historical generations are selectable. The same Task::require_source_read policy applies to direct SWI and *INSPECT DEFINITION/SOURCE calls; denied callers receive TaskAuthorizationDenied before source bytes are read or returned. Public metadata does not imply SourceRead."
+
+caller_authorization:
+  owner: Task
+  policy: >-
+    Public active module/version/state and SWI identity metadata do not require a
+    grant. Retained definition source requires SourceRead. OS_Module reason 1
+    Load/compatible replacement and reason 4 Delete require the separate
+    ModuleManagement right. BASIC64 ModuleManager procedures request the right;
+    Rust service handlers recheck it against the same original Task supplied to
+    nested SWI/provider calls. Provider module capabilities never upgrade the
+    caller. Rights are private task-object state, not keyed by numeric task ID
+    or guest-controlled data. `Task::new` grants nothing. Only explicit host
+    bootstrap constructors grant a trusted MOS session, source inspector, or
+    manager-only task; ordinary spawned desktop tasks do not inherit. Code
+    running within a trusted session shares its task principal and rights.
+    Grants last for the Task object's lifetime and are revoked by host task
+    teardown/replacement; no guest-visible grant/revoke API exists.
+  denial: "TaskAuthorizationDenied code 1 = missing SourceRead; code 2 = missing ModuleManagement. Normal and X forms retain the same structured code/message; X sets V and returns a caller-task error block."
+
 named_aliases:
   - {name: OS_BYTE, target: "0x06"}
   - {name: OS_WORD, target: "0x07"}
@@ -405,6 +592,7 @@ named_aliases:
   - {name: OS_NEWLINE, target: "0x03"}
   - {name: OS_READC, target: "0x04"}
   - {name: OS_READLINE, target: "0x0E"}
+  - {name: OS_MODULE, target: "0x1E"}
   - {name: OS_READPOINT, target: "0x32"}
   - {name: OS_CLI, target: "0x05"}
   - {name: OS_FILE, target: "0x08"}
@@ -414,6 +602,9 @@ named_aliases:
   - {name: OS_GBPB, target: "0x0C"}
   - {name: OS_FIND, target: "0x0D"}
   - {name: OS_FSCONTROL, target: "0x29"}
+  - {name: OS_CHANGEDYNAMICAREA, target: "0x2A"}
+  - {name: OS_GENERATEERROR, target: "0x2B"}
+  - {name: OS_DYNAMICAREA, target: "0x66"}
   - {name: WIMP_INITIALISE, target: "0x400C0"}
   - {name: WIMP_CREATEWINDOW, target: "0x400C1"}
   - {name: WIMP_CREATEICON, target: "0x400C2"}

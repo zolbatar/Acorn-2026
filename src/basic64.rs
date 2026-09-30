@@ -89,6 +89,41 @@ pub(crate) fn run_guest_file_configured(
     )
 }
 
+pub(crate) fn run_guest_file_with_launch_options(
+    path: &str,
+    task: &mut Task,
+    dispatcher: &mut SwiDispatcher,
+    configuration: &BasicConfiguration,
+    launch: basic_compat::BasicLaunchOptions,
+) -> Result<Option<JitExecutionReport>, RuntimeError> {
+    let (bytes, metadata) = dispatcher.read_guest_file(task, path)?;
+    if metadata.file_type & 0xFFF == FILETYPE_BASIC {
+        let program = TokenizedBasicProgram::decode(&bytes)
+            .map_err(|error| RuntimeError::Program(error.to_string()))?;
+        basic_compat::run_program_with_launch_options(
+            &program,
+            task,
+            dispatcher,
+            configuration,
+            launch,
+        )
+    } else {
+        let source = std::str::from_utf8(&bytes).map_err(|error| {
+            RuntimeError::Program(format!(
+                "file type &{:03X} is not tokenized BASIC and the file is not UTF-8 text: {error}",
+                metadata.file_type & 0xFFF
+            ))
+        })?;
+        basic_compat::run_source_with_launch_options(
+            source,
+            task,
+            dispatcher,
+            configuration,
+            launch,
+        )
+    }
+}
+
 pub(crate) fn run_guest_file_with_engine_options(
     path: &str,
     task: &mut Task,

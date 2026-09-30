@@ -1279,6 +1279,7 @@ pub enum RegistryError {
         argument_register: u8,
     },
     IncompatibleContract,
+    IncompatibleModuleReplacement(String),
     FailedStart(String),
     UnsupportedInvocationBackend(InvocationBackend),
     UnsupportedManifestSchema(u16),
@@ -1363,6 +1364,9 @@ impl fmt::Display for RegistryError {
             ),
             Self::IncompatibleContract => {
                 formatter.write_str("replacement has an incompatible public SWI contract")
+            }
+            Self::IncompatibleModuleReplacement(reason) => {
+                write!(formatter, "module replacement is incompatible: {reason}")
             }
             Self::FailedStart(message) => write!(formatter, "module start failed: {message}"),
             Self::UnsupportedInvocationBackend(backend) => write!(
@@ -1632,6 +1636,24 @@ impl<T> VersionedDefinitionCell<T> {
                 .filter_map(Weak::upgrade)
                 .map(|generation| generation.active_calls.load(Ordering::Acquire))
                 .sum::<usize>()
+    }
+
+    /// Returns values from retired generations that still have an active
+    /// invocation lease. Callers use this only for source-lifetime bookkeeping;
+    /// the lease remains the authority that keeps each generation alive.
+    pub fn active_retired_values(&self) -> Vec<T>
+    where
+        T: Clone,
+    {
+        let mut state = self.state.lock().expect("definition cell poisoned");
+        Self::prune_retired(&mut state.retired);
+        state
+            .retired
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|generation| generation.active_calls.load(Ordering::Acquire) != 0)
+            .map(|generation| generation.value.as_ref().clone())
+            .collect()
     }
 
     pub fn collect_retired(&self) {
@@ -2113,6 +2135,28 @@ impl ModuleRegistry {
         Ok(())
     }
 
+    /// Rolls a never-started publication back to its linked state. This closes
+    /// the registry-side failure path if a start transition cannot begin after
+    /// an otherwise successful atomic publication.
+    pub fn rollback_module_publication(&mut self, id: ModuleId) -> Result<(), RegistryError> {
+        let record = self
+            .modules
+            .get(&id)
+            .ok_or(RegistryError::UnknownModule(id))?;
+        if record.state != ModuleState::Published {
+            return Err(RegistryError::InvalidState {
+                module: record.manifest.name.clone(),
+                state: record.state,
+            });
+        }
+        self.remove_module_exports(id);
+        self.modules
+            .get_mut(&id)
+            .expect("module was checked above")
+            .state = ModuleState::Linked;
+        Ok(())
+    }
+
     pub fn start_module(
         &mut self,
         id: ModuleId,
@@ -2227,6 +2271,97 @@ impl ModuleRegistry {
         Ok(())
     }
 
+    /// Discards a module that has not entered the active lifecycle. This is a
+    /// rollback primitive for the trusted loader; it refuses to remove a
+    /// published export or any module with active calls.
+    pub fn discard_unpublished_module(&mut self, id: ModuleId) -> Result<(), RegistryError> {
+        let record = self
+            .modules
+            .get(&id)
+            .ok_or(RegistryError::UnknownModule(id))?;
+        if !matches!(record.state, ModuleState::Validated | ModuleState::Linked) {
+            return Err(RegistryError::InvalidState {
+                module: record.manifest.name.clone(),
+                state: record.state,
+            });
+        }
+        if self
+            .by_swi_number
+            .values()
+            .any(|published| published.module == id)
+        {
+            return Err(RegistryError::InvalidManifest(format!(
+                "module {} still has published SWIs",
+                record.manifest.name
+            )));
+        }
+        let canonical_name = canonical_module_name(&record.manifest.name);
+        self.modules.remove(&id);
+        self.by_name.remove(&canonical_name);
+        Ok(())
+    }
+
+    /// Returns active or transitional modules that still declare this module
+    /// as a dependency. A manager must refuse unload while this list is
+    /// nonempty rather than leaving linked consumers dangling.
+    pub fn module_dependents(&self, id: ModuleId) -> Result<Vec<String>, RegistryError> {
+        let target = self
+            .modules
+            .get(&id)
+            .ok_or(RegistryError::UnknownModule(id))?;
+        let target_name = canonical_module_name(&target.manifest.name);
+        let mut dependents = self
+            .modules
+            .values()
+            .filter(|record| record.id != id && record.state != ModuleState::Retired)
+            .filter(|record| {
+                record
+                    .manifest
+                    .dependencies
+                    .iter()
+                    .any(|(name, _)| canonical_module_name(name) == target_name)
+                    || record
+                        .manifest
+                        .symbol_imports
+                        .iter()
+                        .any(|import| canonical_module_name(&import.module) == target_name)
+            })
+            .map(|record| record.manifest.name.clone())
+            .collect::<Vec<_>>();
+        dependents.sort_by_key(|name| name.to_ascii_lowercase());
+        Ok(dependents)
+    }
+
+    /// Forgets a successfully retired guest module so the same visible name
+    /// can be loaded again. Foundation modules are retained by the boot
+    /// manager and are never passed to this operation.
+    pub fn forget_retired_module(&mut self, id: ModuleId) -> Result<(), RegistryError> {
+        let record = self
+            .modules
+            .get(&id)
+            .ok_or(RegistryError::UnknownModule(id))?;
+        if record.state != ModuleState::Retired {
+            return Err(RegistryError::InvalidState {
+                module: record.manifest.name.clone(),
+                state: record.state,
+            });
+        }
+        if self
+            .by_swi_number
+            .values()
+            .any(|published| published.module == id)
+        {
+            return Err(RegistryError::InvalidManifest(format!(
+                "retired module {} still has public SWIs",
+                record.manifest.name
+            )));
+        }
+        let canonical_name = canonical_module_name(&record.manifest.name);
+        self.modules.remove(&id);
+        self.by_name.remove(&canonical_name);
+        Ok(())
+    }
+
     pub fn module_active_call_count(&self, id: ModuleId) -> Result<usize, RegistryError> {
         self.modules
             .get(&id)
@@ -2247,6 +2382,18 @@ impl ModuleRegistry {
         self.by_name
             .get(&canonical_module_name(name))
             .and_then(|id| self.modules.get(id))
+    }
+
+    /// Read-only metadata view used by the BASIC64 ModuleManager service.
+    /// Enumeration order is stable and only active modules are visible.
+    pub fn active_modules_sorted(&self) -> Vec<&ModuleRecord> {
+        let mut records = self
+            .modules
+            .values()
+            .filter(|record| record.state == ModuleState::Active)
+            .collect::<Vec<_>>();
+        records.sort_by_key(|record| record.manifest.name.to_ascii_lowercase());
+        records
     }
 
     pub fn module_state(&self, id: ModuleId) -> Option<ModuleState> {
@@ -2281,18 +2428,25 @@ impl ModuleRegistry {
         self.by_swi_name.get(&canonical_swi_name(name)).copied()
     }
 
+    /// Resolves the current active manifest-owned identity for a public SWI.
+    /// Names, owner, definition and generation all come from the live entry
+    /// cell; callers receive no host pointers or mutable registry access.
+    pub fn active_swi_identity(&self, number: u32) -> Option<SwiOwnership> {
+        self.acquire_swi(number)
+            .map(|(ownership, _lease)| ownership)
+    }
+
     pub(crate) fn replace_swi_definition(
         &mut self,
         number: u32,
         contract: &SwiContract,
         mut replacement: DefinitionDescriptor,
     ) -> Result<GenerationId, RegistryError> {
-        let published = self
+        let (module_id, cell) = self
             .by_swi_number
             .get(&number)
+            .map(|published| (published.module, Arc::clone(&published.cell)))
             .ok_or(RegistryError::UnknownModuleName(format!("SWI &{number:X}")))?;
-        replacement.module = published.module;
-        let module_id = published.module;
         let policy = self
             .modules
             .get(&module_id)
@@ -2302,17 +2456,195 @@ impl ModuleRegistry {
         if policy != ReplacementPolicy::CompatibleImmediate {
             return Err(RegistryError::ReplacementRequiresPolicy(policy));
         }
+        let definition_key = self
+            .modules
+            .get(&module_id)
+            .expect("published export has a module")
+            .manifest
+            .exports
+            .iter()
+            .find(|export| export.number == number)
+            .map(|export| export.definition_name.clone())
+            .ok_or_else(|| {
+                RegistryError::InvalidManifest(format!(
+                    "published SWI &{number:X} has no matching module export"
+                ))
+            })?;
+        replacement.module = module_id;
         let source_path = replacement.source_path.clone();
         let source_hash = replacement.source_hash.clone();
-        let generation = published.cell.replace(contract, replacement)?;
-        let manifest = &mut self
+        let generation = cell.replace(contract, replacement.clone())?;
+        let published = self
+            .by_swi_number
+            .get_mut(&number)
+            .expect("published SWI was validated before replacement");
+        published.definition = replacement.clone();
+        let record = self
             .modules
             .get_mut(&module_id)
-            .expect("published export has a module")
-            .manifest;
-        manifest.source_path = source_path;
-        manifest.source_hash = source_hash;
+            .expect("published export has a module");
+        record.definitions.insert(definition_key, replacement);
+        record.manifest.source_path = source_path;
+        record.manifest.source_hash = source_hash;
         Ok(generation)
+    }
+
+    /// Atomically publishes a complete compatible source generation for an
+    /// already-active module. The registry is mutably borrowed for the whole
+    /// transaction, so no dispatcher or identity query can observe a mixed
+    /// export set. Existing cells and their leases keep their identities and
+    /// retired descriptors; only their current generations change.
+    pub(crate) fn replace_module_generation(
+        &mut self,
+        module_id: ModuleId,
+        replacement_manifest: ModuleManifest,
+        replacement_definitions: BTreeMap<String, DefinitionDescriptor>,
+    ) -> Result<Vec<GenerationId>, RegistryError> {
+        validate_manifest_shape(&replacement_manifest)?;
+        let old_module = self
+            .modules
+            .get(&module_id)
+            .ok_or(RegistryError::UnknownModule(module_id))?;
+        if old_module.state != ModuleState::Active {
+            return Err(RegistryError::InvalidState {
+                module: old_module.manifest.name.clone(),
+                state: old_module.state,
+            });
+        }
+        if old_module.manifest.replacement_policy != ReplacementPolicy::CompatibleImmediate {
+            return Err(RegistryError::ReplacementRequiresPolicy(
+                old_module.manifest.replacement_policy,
+            ));
+        }
+        if !same_replacement_manifest(&old_module.manifest, &replacement_manifest) {
+            return Err(RegistryError::IncompatibleModuleReplacement(
+                "manifest identity, dependencies, capabilities, lifecycle, or public contracts changed".into(),
+            ));
+        }
+
+        let expected_name = canonical_module_name(&old_module.manifest.name);
+        if canonical_module_name(&replacement_manifest.name) != expected_name {
+            return Err(RegistryError::IncompatibleModuleReplacement(
+                "module title changed".into(),
+            ));
+        }
+
+        let mut definitions = replacement_definitions;
+        let mut definition_ids = BTreeSet::new();
+        for (key, definition) in &mut definitions {
+            let expected_definition_name = key
+                .strip_prefix("FN:")
+                .map(|name| format!("FN {name}"))
+                .unwrap_or_else(|| key.clone());
+            if !definition_ids.insert(definition.id)
+                || !definition
+                    .name
+                    .eq_ignore_ascii_case(&expected_definition_name)
+                || definition.source_path != replacement_manifest.source_path
+                || definition.source_hash != replacement_manifest.source_hash
+                || definition.language_profile != replacement_manifest.language_profile
+                || !definition
+                    .target_profile
+                    .eq_ignore_ascii_case(&replacement_manifest.target_profile)
+            {
+                return Err(RegistryError::InvalidManifest(format!(
+                    "replacement definition {key} identity does not match module source/profile metadata"
+                )));
+            }
+            definition.module = module_id;
+        }
+        for export in &replacement_manifest.exports {
+            if !definitions.contains_key(&export.definition_name) {
+                return Err(RegistryError::MissingDefinition {
+                    module: replacement_manifest.name.clone(),
+                    definition: export.definition_name.clone(),
+                });
+            }
+            let Some(published) = self.by_swi_number.get(&export.number) else {
+                return Err(RegistryError::IncompatibleModuleReplacement(format!(
+                    "published SWI &{:X} is missing",
+                    export.number
+                )));
+            };
+            if published.module != module_id
+                || published.name != export.name
+                || published.contract != export.contract
+                || published.cell.contract() != &export.contract
+            {
+                return Err(RegistryError::IncompatibleModuleReplacement(format!(
+                    "SWI &{:X} ownership, name, or register contract changed",
+                    export.number
+                )));
+            }
+        }
+        for symbol in &replacement_manifest.symbol_exports {
+            if !definitions.contains_key(symbol) {
+                return Err(RegistryError::MissingDefinition {
+                    module: replacement_manifest.name.clone(),
+                    definition: symbol.clone(),
+                });
+            }
+        }
+
+        // Prepare every update before touching a cell. After this point the
+        // contract checks are invariant under the exclusive registry borrow,
+        // so the commit loop cannot fail part-way through.
+        let updates = replacement_manifest
+            .exports
+            .iter()
+            .map(|export| {
+                let definition = definitions
+                    .get(&export.definition_name)
+                    .expect("replacement export was prevalidated")
+                    .clone();
+                (export.number, export.contract.clone(), definition)
+            })
+            .collect::<Vec<_>>();
+        let mut generations = Vec::with_capacity(updates.len());
+        for (number, contract, definition) in updates {
+            let published = self
+                .by_swi_number
+                .get_mut(&number)
+                .expect("replacement SWI was prevalidated");
+            let generation = published
+                .cell
+                .replace(&contract, definition.clone())
+                .expect("replacement contract was prevalidated");
+            published.definition = definition;
+            generations.push(generation);
+        }
+        let record = self
+            .modules
+            .get_mut(&module_id)
+            .expect("replacement module was prevalidated");
+        record.manifest = replacement_manifest;
+        record.definitions = definitions;
+        Ok(generations)
+    }
+
+    /// Definition identities for current modules plus retired generations
+    /// still leased by in-flight calls. Used to release stale parsed source
+    /// after a replacement generation drains.
+    pub fn retained_definition_ids(&self) -> BTreeSet<DefinitionId> {
+        let mut retained = BTreeSet::new();
+        for module in self
+            .modules
+            .values()
+            .filter(|module| module.state != ModuleState::Retired)
+        {
+            retained.extend(module.definitions.values().map(|definition| definition.id));
+        }
+        for published in self.by_swi_number.values() {
+            retained.insert(published.cell.current_value().id);
+            retained.extend(
+                published
+                    .cell
+                    .active_retired_values()
+                    .into_iter()
+                    .map(|definition| definition.id),
+            );
+        }
+        retained
     }
 
     pub fn current_swi_definition(&self, number: u32) -> Option<DefinitionDescriptor> {
@@ -2461,6 +2793,13 @@ fn canonical_swi_name(name: &str) -> String {
 
 fn canonical_module_name(name: &str) -> String {
     name.to_ascii_uppercase()
+}
+
+fn same_replacement_manifest(current: &ModuleManifest, candidate: &ModuleManifest) -> bool {
+    let mut current_without_source = current.clone();
+    current_without_source.source_path = candidate.source_path.clone();
+    current_without_source.source_hash = candidate.source_hash.clone();
+    current_without_source == *candidate
 }
 
 fn canonical_primitive_name(name: &str) -> String {

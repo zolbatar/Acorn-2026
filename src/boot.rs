@@ -155,17 +155,20 @@ impl BootFailure {
                 code,
                 message,
             } => (type_name.clone(), *code, message.clone()),
+            crate::error::RuntimeError::StandardErrorBlock { code, message } => {
+                ("OSError".into(), *code, message.clone())
+            }
             crate::error::RuntimeError::InvalidSwi(number) => (
                 "InvalidSwi".into(),
                 *number,
                 format!("unsupported SWI &{number:X}"),
             ),
-            crate::error::RuntimeError::EndOfInput => {
-                ("EndOfInput".into(), 1, "input ended during module start".into())
-            }
-            crate::error::RuntimeError::Io(error) => {
-                ("HostIoError".into(), 1, error.to_string())
-            }
+            crate::error::RuntimeError::EndOfInput => (
+                "EndOfInput".into(),
+                1,
+                "input ended during module start".into(),
+            ),
+            crate::error::RuntimeError::Io(error) => ("HostIoError".into(), 1, error.to_string()),
             crate::error::RuntimeError::Memory(error) => {
                 ("LogicalMemoryError".into(), 1, error.to_string())
             }
@@ -244,9 +247,10 @@ impl BootCapsule {
         for input in inputs {
             if input.source_path.is_empty()
                 || input.source_path.starts_with('/')
-                || input.source_path.split('/').any(|part| {
-                    part.is_empty() || part == "." || part == ".."
-                })
+                || input
+                    .source_path
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "." || part == "..")
             {
                 return Err(BootCapsuleError::Invalid(format!(
                     "invalid capsule source path {:?}",
@@ -259,13 +263,14 @@ impl BootCapsule {
                     input.source_path
                 )));
             }
-            let parsed = SystemModule::parse(input.source, input.source_path, &allocator)
-                .map_err(|error| {
+            let parsed = SystemModule::parse(input.source, input.source_path, &allocator).map_err(
+                |error| {
                     BootCapsuleError::Invalid(format!(
                         "module {} does not parse: {error}",
                         input.source_path
                     ))
-                })?;
+                },
+            )?;
             let mut grants = BTreeSet::new();
             for grant in input.grants {
                 let capability = CapabilityName::new(*grant)
@@ -278,6 +283,15 @@ impl BootCapsule {
                 }
             }
             let manifest = parsed.manifest;
+            for grant in &grants {
+                if !manifest.requested_capabilities.contains(grant) {
+                    return Err(BootCapsuleError::Invalid(format!(
+                        "capsule grants unrequested capability {} to module {}",
+                        grant.as_str(),
+                        manifest.name
+                    )));
+                }
+            }
             for import in &manifest.primitive_imports {
                 if !grants.contains(&import.capability) {
                     return Err(BootCapsuleError::Invalid(format!(
@@ -395,12 +409,22 @@ impl BootCapsule {
                     manifest.name
                 )));
             }
-            let parsed = SystemModule::parse(&source, path.clone(), &allocator).map_err(|error| {
-                BootCapsuleError::Invalid(format!(
-                    "module {} source validation failed: {error}",
-                    manifest.name
-                ))
-            })?;
+            for grant in &grants {
+                if !manifest.requested_capabilities.contains(grant) {
+                    return Err(BootCapsuleError::Invalid(format!(
+                        "capsule grants unrequested capability {} to module {}",
+                        grant.as_str(),
+                        manifest.name
+                    )));
+                }
+            }
+            let parsed =
+                SystemModule::parse(&source, path.clone(), &allocator).map_err(|error| {
+                    BootCapsuleError::Invalid(format!(
+                        "module {} source validation failed: {error}",
+                        manifest.name
+                    ))
+                })?;
             if parsed.manifest != manifest {
                 return Err(BootCapsuleError::Invalid(format!(
                     "module {} source and canonical manifest disagree",
@@ -478,7 +502,38 @@ pub fn embedded_capsule_bytes() -> Result<&'static [u8], BootCapsuleError> {
             BootModuleInput {
                 source_path: "modules/Boot.bas64",
                 source: include_str!("../modules/Boot.bas64"),
-                grants: &["StartupPolicy"],
+                grants: &[],
+            },
+            BootModuleInput {
+                source_path: "modules/Error.bas64",
+                source: include_str!("../modules/Error.bas64"),
+                grants: &["ErrorDispatch"],
+            },
+            BootModuleInput {
+                source_path: "modules/Memory.bas64",
+                source: include_str!("../modules/Memory.bas64"),
+                grants: &["RuntimeErrors", "TaskMemory"],
+            },
+            BootModuleInput {
+                source_path: "modules/ModuleManager.bas64",
+                source: include_str!("../modules/ModuleManager.bas64"),
+                grants: &["ModuleIntrospection", "ModuleManagement", "RuntimeErrors"],
+            },
+            BootModuleInput {
+                source_path: "modules/TaskManager.bas64",
+                source: include_str!("../modules/TaskManager.bas64"),
+                grants: &["RuntimeErrors", "TaskQuery"],
+            },
+            BootModuleInput {
+                source_path: "modules/TrellisCommands.bas64",
+                source: include_str!("../modules/TrellisCommands.bas64"),
+                grants: &[
+                    "ConfigurationStoreRead",
+                    "ConfigurationStoreWrite",
+                    "MosCommandBridge",
+                    "RuntimeErrors",
+                    "TaskMemory",
+                ],
             },
             BootModuleInput {
                 source_path: "modules/Console.bas64",
@@ -490,13 +545,15 @@ pub fn embedded_capsule_bytes() -> Result<&'static [u8], BootCapsuleError> {
                     "GraphicsVduStream",
                 ],
             },
+            BootModuleInput {
+                source_path: "modules/System.bas64",
+                source: include_str!("../modules/System.bas64"),
+                grants: &["StartupPolicy", "SystemQueries"],
+            },
         ];
         BootCapsule::build(RUNTIME_ABI_VERSION, &inputs)
     });
-    result
-        .as_ref()
-        .map(Vec::as_slice)
-        .map_err(Clone::clone)
+    result.as_ref().map(Vec::as_slice).map_err(Clone::clone)
 }
 
 fn validate_module_set(modules: &[VerifiedBootModule]) -> Result<(), BootCapsuleError> {
@@ -722,19 +779,24 @@ impl<'a> Cursor<'a> {
         let end = self.offset.checked_add(count).ok_or_else(|| {
             BootCapsuleError::Invalid("capsule length arithmetic overflow".into())
         })?;
-        let value = self.bytes.get(self.offset..end).ok_or_else(|| {
-            BootCapsuleError::Invalid("capsule is truncated".into())
-        })?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or_else(|| BootCapsuleError::Invalid("capsule is truncated".into()))?;
         self.offset = end;
         Ok(value)
     }
 
     fn u16(&mut self) -> Result<u16, BootCapsuleError> {
-        Ok(u16::from_be_bytes(self.take(2)?.try_into().expect("fixed width")))
+        Ok(u16::from_be_bytes(
+            self.take(2)?.try_into().expect("fixed width"),
+        ))
     }
 
     fn u32(&mut self) -> Result<u32, BootCapsuleError> {
-        Ok(u32::from_be_bytes(self.take(4)?.try_into().expect("fixed width")))
+        Ok(u32::from_be_bytes(
+            self.take(4)?.try_into().expect("fixed width"),
+        ))
     }
 
     fn string_u16(&mut self, maximum: usize) -> Result<String, BootCapsuleError> {
@@ -777,9 +839,11 @@ fn crc32(bytes: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{
-        BootCapsule, BootModuleInput, RUNTIME_ABI_VERSION, RecoveryAction,
-        embedded_capsule_bytes, parse_recovery_action,
+        BootCapsule, BootModuleInput, RUNTIME_ABI_VERSION, RecoveryAction, embedded_capsule_bytes,
+        parse_recovery_action,
     };
 
     const LEAF: &str = "REM @BASIC64 MODE=BASIC64\nREM @SYSTEM_PROFILE 0.1\nREM @MODULE Leaf 1.0.0\nREM @LIFECYCLE START Begin\nREM @EXPORT PROC Ping\nREM @PRIVATE PROC Begin\nDEF PROC Begin\nENDPROC\nDEF PROC Ping\nENDPROC\n";
@@ -808,6 +872,146 @@ mod tests {
     }
 
     #[test]
+    fn embedded_foundation_capsule_has_all_owners_and_startup_authority_on_system() {
+        let capsule =
+            BootCapsule::decode(embedded_capsule_bytes().unwrap(), RUNTIME_ABI_VERSION).unwrap();
+        let module_names = capsule
+            .modules
+            .iter()
+            .map(|module| module.manifest.name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            module_names,
+            BTreeSet::from([
+                "Boot",
+                "Console",
+                "Error",
+                "Memory",
+                "ModuleManager",
+                "System",
+                "TaskManager",
+                "TrellisCommands",
+            ])
+        );
+        let system = capsule
+            .modules
+            .iter()
+            .find(|module| module.manifest.name == "System")
+            .unwrap();
+        let boot = capsule
+            .modules
+            .iter()
+            .find(|module| module.manifest.name == "Boot")
+            .unwrap();
+        assert!(
+            system
+                .grants
+                .contains(&crate::trellis::CapabilityName::new("StartupPolicy").unwrap())
+        );
+        assert!(
+            system
+                .grants
+                .contains(&crate::trellis::CapabilityName::new("SystemQueries").unwrap())
+        );
+        assert!(boot.grants.is_empty());
+        for (module_name, capability) in [
+            ("Console", "ConsoleInput"),
+            ("Console", "ConsoleOutput"),
+            ("Console", "GraphicsVduStream"),
+            ("Console", "RuntimeErrors"),
+            ("System", "SystemQueries"),
+            ("Error", "ErrorDispatch"),
+            ("Memory", "TaskMemory"),
+            ("Memory", "RuntimeErrors"),
+            ("ModuleManager", "ModuleIntrospection"),
+            ("ModuleManager", "ModuleManagement"),
+            ("ModuleManager", "RuntimeErrors"),
+            ("TaskManager", "TaskQuery"),
+            ("TaskManager", "RuntimeErrors"),
+            ("TrellisCommands", "MosCommandBridge"),
+            ("TrellisCommands", "ConfigurationStoreRead"),
+            ("TrellisCommands", "ConfigurationStoreWrite"),
+            ("TrellisCommands", "TaskMemory"),
+            ("TrellisCommands", "RuntimeErrors"),
+        ] {
+            let module = capsule
+                .modules
+                .iter()
+                .find(|module| module.manifest.name == module_name)
+                .unwrap();
+            assert!(
+                module
+                    .grants
+                    .contains(&crate::trellis::CapabilityName::new(capability).unwrap())
+            );
+        }
+        let boot_dependencies = boot
+            .manifest
+            .dependencies
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            boot_dependencies,
+            BTreeSet::from([
+                "Console",
+                "Error",
+                "Memory",
+                "ModuleManager",
+                "System",
+                "TaskManager",
+                "TrellisCommands",
+            ])
+        );
+
+        let owned_exports = capsule
+            .modules
+            .iter()
+            .flat_map(|module| {
+                module.manifest.exports.iter().map(|export| {
+                    (
+                        module.manifest.name.to_ascii_uppercase(),
+                        export.name.to_ascii_uppercase(),
+                    )
+                })
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(owned_exports.len(), 20);
+        for (owner, swi) in [
+            ("ERROR", "OS_GENERATEERROR"),
+            ("MEMORY", "OS_CHANGEDYNAMICAREA"),
+            ("MEMORY", "OS_DYNAMICAREA"),
+            ("MODULEMANAGER", "ACORN_MODULEINFO"),
+            ("TASKMANAGER", "ACORN_TASKINFO"),
+            ("MODULEMANAGER", "ACORN_MODULELOOKUP"),
+            ("MODULEMANAGER", "ACORN_SWIINFO"),
+            ("MODULEMANAGER", "ACORN_MODULEEXPORT"),
+            ("MODULEMANAGER", "ACORN_DEFINITIONSOURCE"),
+            ("MODULEMANAGER", "OS_MODULE"),
+            ("TRELLISCOMMANDS", "OS_CLI"),
+            ("SYSTEM", "OS_READMONOTONICTIME"),
+            ("SYSTEM", "OS_SWINUMBERTOSTRING"),
+            ("SYSTEM", "OS_SWINUMBERFROMSTRING"),
+        ] {
+            assert!(owned_exports.contains(&(owner.into(), swi.into())));
+        }
+
+        let order = capsule
+            .start_order()
+            .into_iter()
+            .map(|index| capsule.modules[index].manifest.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            order.iter().position(|name| *name == "Console").unwrap()
+                < order.iter().position(|name| *name == "Boot").unwrap()
+        );
+        assert!(
+            order.iter().position(|name| *name == "System").unwrap()
+                < order.iter().position(|name| *name == "Boot").unwrap()
+        );
+    }
+
+    #[test]
     fn capsule_rejects_corruption_abi_mismatch_and_dependency_cycles() {
         let original = embedded_capsule_bytes().unwrap();
         let mut corrupted = original.to_vec();
@@ -832,10 +1036,12 @@ mod tests {
                 grants: &[],
             },
         ];
-        assert!(BootCapsule::build(RUNTIME_ABI_VERSION, &inputs)
-            .unwrap_err()
-            .to_string()
-            .contains("cycle"));
+        assert!(
+            BootCapsule::build(RUNTIME_ABI_VERSION, &inputs)
+                .unwrap_err()
+                .to_string()
+                .contains("cycle")
+        );
     }
 
     #[test]
@@ -854,27 +1060,37 @@ mod tests {
                 grants: &[],
             },
         ];
-        assert!(BootCapsule::build(RUNTIME_ABI_VERSION, &duplicate)
-            .unwrap_err()
-            .to_string()
-            .contains("duplicate SWI number"));
+        assert!(
+            BootCapsule::build(RUNTIME_ABI_VERSION, &duplicate)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate SWI number")
+        );
 
-        let missing = ROOT.replace("Leaf 1.0.0", "Missing 1.0.0");
+        let missing = "REM @BASIC64 MODE=BASIC64\nREM @SYSTEM_PROFILE 0.1\nREM @MODULE Root 1.0.0\nREM @IMPORT_MODULE Missing 1.0.0\nREM @LIFECYCLE START Begin\nREM @PRIVATE PROC Begin\nDEF PROC Begin\nENDPROC\n";
         let unresolved = [BootModuleInput {
             source_path: "modules/Root.bas64",
-            source: &missing,
+            source: missing,
             grants: &[],
         }];
-        assert!(BootCapsule::build(RUNTIME_ABI_VERSION, &unresolved)
-            .unwrap_err()
-            .to_string()
-            .contains("unresolved dependency"));
+        assert!(
+            BootCapsule::build(RUNTIME_ABI_VERSION, &unresolved)
+                .unwrap_err()
+                .to_string()
+                .contains("unresolved dependency")
+        );
     }
 
     #[test]
     fn recovery_actions_are_restricted_to_retry_alternate_or_exit() {
-        assert_eq!(parse_recovery_action("retry"), RecoveryAction::RetryEmbedded);
-        assert_eq!(parse_recovery_action("A /tmp/boot.cap"), RecoveryAction::SelectCapsule("/tmp/boot.cap".into()));
+        assert_eq!(
+            parse_recovery_action("retry"),
+            RecoveryAction::RetryEmbedded
+        );
+        assert_eq!(
+            parse_recovery_action("A /tmp/boot.cap"),
+            RecoveryAction::SelectCapsule("/tmp/boot.cap".into())
+        );
         assert_eq!(parse_recovery_action("quit"), RecoveryAction::Exit);
         assert_eq!(parse_recovery_action("HELP"), RecoveryAction::Invalid);
         assert_eq!(parse_recovery_action("CAT"), RecoveryAction::Invalid);

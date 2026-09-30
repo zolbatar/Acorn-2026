@@ -231,7 +231,11 @@ DEF PROCdisplay_menu_selection
 menu_choice%=!event%
 PROCclose_display_menu
 IF display_menu_kind%=0 THEN pending_colour%=menu_choice%
-IF display_menu_kind%=1 THEN pending_resolution%=menu_choice%
+IF display_menu_kind%=1 THEN
+  pending_resolution%=menu_choice%
+  IF pending_resolution%=0 THEN pending_colour%=7
+ENDIF
+IF pending_resolution%=0 THEN pending_colour%=7
 display_dirty%=1
 display_save_error%=0
 PROCrebuild_display_icons
@@ -267,9 +271,13 @@ display_icon_count%=0
 display_colour_value$=FNcolour_name$(pending_colour%)
 display_resolution_value$=FNresolution_name$(pending_resolution%)
 PROCmake_display_icon("Colours",32,-64,220,-16,&111)
-PROCmake_display_icon(display_colour_value$,246,-64,558,-16,&3135)
+display_colour_flags%=&3135
+display_colour_arrow$="v"
+display_colour_arrow_flags%=&313D
+IF pending_resolution%=0 THEN display_colour_flags%=&111:display_colour_arrow$="":display_colour_arrow_flags%=&111
+PROCmake_display_icon(display_colour_value$,246,-64,558,-16,display_colour_flags%)
 display_colour_value_icon%=display_created_icon%
-PROCmake_display_icon("v",566,-64,612,-16,&313D)
+PROCmake_display_icon(display_colour_arrow$,566,-64,612,-16,display_colour_arrow_flags%)
 display_colour_arrow_icon%=display_created_icon%
 PROCmake_display_icon("Resolution",32,-124,220,-76,&111)
 PROCmake_display_icon(display_resolution_value$,246,-124,558,-76,&3135)
