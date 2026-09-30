@@ -1,6 +1,6 @@
-# Acorn-2026 project guidance
+# Ricochet project guidance
 
-- Read `docs/acorn-2026-design.md` before making architectural or implementation changes.
+- Read `docs/ricochet-design.md` before making architectural or implementation changes.
 - Treat the design brief as the current project direction, but distinguish its firm constraints from its exploratory language features and open questions.
 - Preserve documented BBC BASIC V/VI source behavior and public SWI contracts where feasible. Do not change an external contract without stating the reason and documenting the compatibility path.
 - Keep the Rust runtime a hosted, kernel-like core unless the project explicitly adopts a different scope. Do not introduce bare-metal kernel or device-driver assumptions by default.

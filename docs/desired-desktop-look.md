@@ -4,7 +4,7 @@ Approved by the user on 29 September 2026: â€œThis is it, this is what I want.â€
 
 ![Approved desktop appearance](assets/approved-desktop-design.png)
 
-The accompanying `approved-desktop-design.png` is the authoritative visual reference for the desired look. This is an approved design concept, not a record of implemented behaviour. Earlier mockups are superseded by this image.
+The accompanying `approved-desktop-design.png` is the authoritative visual reference for the desired look. The running desktop retains the user-authored OS Icon; the saved mockup is unchanged by the rebrand. This is an approved design concept, not a record of implemented behaviour. Earlier mockups are superseded by this image.
 
 ## Design direction
 
@@ -29,6 +29,6 @@ The image is a generated mockup, so it is not a pixel-exact colour or geometry s
 
 ## Provenance
 
-Created through iterative edits with the built-in image generation tool. Final source image: `exec-f78a8a0b-2ce0-4ceb-9de1-7ef69a33da83.png`.
+Created through iterative edits with the built-in image generation tool. The final branding cleanup removed the far-right mark while preserving the layout: `exec-fe0103cf-e5cf-4014-9204-d6455f1594c1.png`.
 
 Final edit brief: change only the bottom icon-bar background to the same pale neutral grey as the filer and Save as backgrounds, preserving the established design.

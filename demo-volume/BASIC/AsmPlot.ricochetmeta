@@ -1,0 +1,7 @@
+Ricochet file metadata v1
+format-version=1
+guest-name=AsmPlot
+file-type=0x00000FFB
+load-address=0x00000000
+execution-address=0x00000000
+attributes=0x00000000

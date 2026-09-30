@@ -6,7 +6,7 @@ Implement the rendering direction agreed with the user: a modern RISC OS-inspire
 
 The user has chosen Vello + wgpu based on positive prior experience. Do not reopen the Skia-versus-Vello decision without a concrete blocker. The exact Vello crate/renderer variant and mutually compatible dependency versions still need selection against current upstream releases.
 
-Read `AGENTS.md` and `docs/acorn-2026-design.md` first. Inspect the live checkout before working: other agents may have changes in progress. Preserve unrelated edits and coordinate ownership before editing shared files. Do not commit unless requested.
+Read `AGENTS.md` and `docs/ricochet-design.md` first. Inspect the live checkout before working: other agents may have changes in progress. Preserve unrelated edits and coordinate ownership before editing shared files. Do not commit unless requested.
 
 ## Agreed requirements
 
@@ -119,7 +119,7 @@ Filer supplies names, resources, layout and state from BASIC64; common services 
 
 Preserve the accepted desktop decisions:
 
-- OS icon always at the far right of the iconbar; opened applications immediately to its left.
+- Keep the OS Icon at the far right of the iconbar; opened applications may use the space immediately to its left.
 - DemoDisk remains on the left. Do not restore inactive placeholder controls.
 - Scrollbar width aligns with title-button width.
 - Consistent border/stroke treatment; shared edges must not become double thickness.
@@ -127,7 +127,7 @@ Preserve the accepted desktop decisions:
 
 Define stroke widths in logical units and snap appropriate straight edges at the actual device scale. Do not conflate one logical pixel with one physical pixel on HiDPI displays.
 
-The approved glossy green acorn asset is `resources/branding/acorn-glossy-v1.png`; its provenance/prompt is in the neighbouring Markdown file. Keep the original master. Prepare a 256×256 derivative as a runtime source if useful and display it at a smaller logical size (roughly 32–48 logical pixels is a starting point, not a fixed requirement). Source resolution and layout size are independent.
+Use the existing user-authored OS Icon artwork in `resources/branding/desktop-flat/OSIcon.png`, retaining `OSIcon.svg` as its editable source. Preserve both assets as supplied; do not add a Ricochet wordmark to the icon bar.
 
 Use correct premultiplied-alpha handling, colour-space treatment and high-quality minification/mipmaps as appropriate. Avoid black fringes around transparency. The goal is antialiasing, fractional positioning and quality sampling, not dependence on RGB subpixel smoothing. Verify the visual result at actual icon sizes.
 
@@ -164,7 +164,7 @@ Inventory supported graphics/SWIs, surface ownership, redraw gaps and current te
 
 ### 2. Vello/wgpu presentation slice
 
-Create the modern presentation path with a native-scale host surface, a filtered acorn image, Inter text, clipped overlapping content and a restrained shadow. Compose an existing classic raster texture in the same frame. Validate alpha, scaling and device lifecycle before migrating all furniture. Retain a comparison/recovery path temporarily.
+Create the modern presentation path with a native-scale host surface, Inter text, clipped overlapping content and a restrained shadow. Compose an existing classic raster texture in the same frame. Validate alpha, scaling and device lifecycle before migrating all furniture. Retain a comparison/recovery path temporarily.
 
 ### 3. Authoritative compatibility surfaces
 
@@ -207,7 +207,7 @@ Deliver runnable vertical slices. Do not mark the overhaul complete after a stat
 
 - Inspect 1× and 2× plus fractional scale where supported. Input mapping matches visuals at each scale.
 - Inter labels, menu alignment, selections, clipping and title/scrollbar alignment remain correct.
-- Acorn is smooth at its actual displayed size, with no dark alpha fringe.
+- The user-authored OS Icon appears at the far right of the icon bar; no project wordmark appears in the desktop shell.
 - Shadows do not affect guest pixel reads or application hit regions.
 - Text measurement and painting agree; exercise fallback and bidi, not just ASCII.
 
@@ -232,7 +232,7 @@ Run focused tests for changed mechanisms, existing relevant regression suites an
 
 ## References
 
-- Project direction: `docs/acorn-2026-design.md`.
+- Project direction: `docs/ricochet-design.md`.
 - RISC OS Wimp contracts: https://www.riscos.com/support/developers/prm/wimp.html
 - Vello renderer choices: https://github.com/linebender/vello
 - wgpu: https://docs.rs/wgpu/latest/wgpu/

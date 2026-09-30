@@ -18,7 +18,7 @@ use crate::{
     },
     host::HostConsole,
     memory::{GUEST_MEMORY_BASE, Task},
-    trellis::{
+    ricochet::{
         CapabilityName, DefinitionId, DependencyFingerprint, DerivedTargetCache, InvocationBackend,
         LogicalMemoryContract, ModuleId, ModuleManagementAuthority, ModuleRegistry, ModuleState,
         RegisterKind, ResourceRight,
@@ -37,8 +37,8 @@ mod mos;
 pub(crate) use mos::MosClock;
 
 fn same_export_contracts(
-    left: &[crate::trellis::SwiExport],
-    right: &[crate::trellis::SwiExport],
+    left: &[crate::ricochet::SwiExport],
+    right: &[crate::ricochet::SwiExport],
 ) -> bool {
     left.len() == right.len()
         && left.iter().all(|export| {
@@ -87,12 +87,12 @@ pub const OS_FSCONTROL: u32 = 0x29;
 pub const OS_READ_POINT: u32 = 0x32;
 pub const OS_DYNAMIC_AREA: u32 = 0x66;
 pub const OS_PLOT: u32 = 0x45;
-pub const ACORN_MODULE_INFO: u32 = 0x4FF10;
-pub const ACORN_TASK_INFO: u32 = 0x4FF11;
-pub const ACORN_MODULE_LOOKUP: u32 = 0x4FF12;
-pub const ACORN_SWI_INFO: u32 = 0x4FF13;
-pub const ACORN_MODULE_EXPORT: u32 = 0x4FF14;
-pub const ACORN_DEFINITION_SOURCE: u32 = 0x4FF15;
+pub const RICOCHET_MODULE_INFO: u32 = 0x4FF10;
+pub const RICOCHET_TASK_INFO: u32 = 0x4FF11;
+pub const RICOCHET_MODULE_LOOKUP: u32 = 0x4FF12;
+pub const RICOCHET_SWI_INFO: u32 = 0x4FF13;
+pub const RICOCHET_MODULE_EXPORT: u32 = 0x4FF14;
+pub const RICOCHET_DEFINITION_SOURCE: u32 = 0x4FF15;
 pub use crate::wimp::{
     WIMP_CLOSE_DOWN as WIMP_CLOSE_DOWN_SWI, WIMP_CLOSE_WINDOW as WIMP_CLOSE_WINDOW_SWI,
     WIMP_CREATE_ICON as WIMP_CREATE_ICON_SWI, WIMP_CREATE_ICON_EX as WIMP_CREATE_ICON_EX_SWI,
@@ -160,9 +160,9 @@ const R7: usize = 7;
 const R8: usize = 8;
 const SWI_X_BIT: u32 = 1 << 17;
 const SWI_UNKNOWN_ERROR_CODE: u32 = 1;
-const ACORN_DISPLAY_ABI_VERSION: u32 = 1;
-const ACORN_DISPLAY_QUERY: u32 = 0;
-const ACORN_DISPLAY_APPLY: u32 = 1;
+const RICOCHET_DISPLAY_ABI_VERSION: u32 = 1;
+const RICOCHET_DISPLAY_QUERY: u32 = 0;
+const RICOCHET_DISPLAY_APPLY: u32 = 1;
 const SYSTEM_SWI_NAME_MAX_BYTES: usize = 128;
 const SYSTEM_SWI_NAME_MAX_BYTES_U32: u32 = 128;
 const HOST_FS_NUMBER: u32 = 1;
@@ -181,7 +181,7 @@ const CONFIG_VALUE_BUFFER_MAX: usize = 512;
 const CONFIG_ERROR_BUFFER_MAX: usize = 512;
 const OUTPUT_BUFFER: u32 = GUEST_MEMORY_BASE + 0x1000;
 const CLI_STRING_BUFFER: u32 = GUEST_MEMORY_BASE + 0x3000;
-const HELP_TEXT: &[u8] = b"Acorn-2026 MOS commands:\n\r  Commands can be abbreviated with a final dot (for example, *CA. and *CONF.); *. is a shortcut for *CAT.\n\r  *CAT [dir]             Catalogue a directory.\n\r  *DIR [dir]             Select the current directory.\n\r  *CDIR <dir>            Create a directory.\n\r  *DELETE <file>         Delete a file.\n\r  *RENAME <old> <new>    Rename a file or directory.\n\r  *FILETYPE <file> <id>  Set a RISC OS file type.\n\r  *TYPE <file>           Display a text file.\n\r  *DISC [name]           Read or set the volume name.\n\r  *HOSTFS                Select the HostFS filing system.\n\r  *CONFIGURE             Set preferences; use *CONFIGURE for its BASIC64-owned syntax.\n\r  *STATUS                Show saved configuration; use *STATUS for filters.\n\r  *BASIC <file>          Load and run BASIC with saved preferences.\n\r  *BASIC64 [options] <file> Run with native BASIC64 and modern text defaults.\n\r    Options: --mode CLASSIC|BASIC64|HYBRID --text CLASSIC|MODERN --override\n\r  DESKTOP                Start the hosted Wimp desktop.\n\r  RUN <file>             Run a BASIC source or tokenised file.\n\r  BASICLOAD <file>       Load a tokenised BASIC program.\n\r  BASICRUN               Run the loaded program.\n\r  BASICJIT [file]        Run with experimental native hot regions.\n\r  BASICJIT STRICT [file] Compile and run supported code without fallback.\n\r  HELP                   Show this help.\n\r  QUIT                   Exit the runtime.";
+const HELP_TEXT: &[u8] = b"Ricochet MOS commands:\n\r  Commands can be abbreviated with a final dot (for example, *CA. and *CONF.); *. is a shortcut for *CAT.\n\r  *CAT [dir]             Catalogue a directory.\n\r  *DIR [dir]             Select the current directory.\n\r  *CDIR <dir>            Create a directory.\n\r  *DELETE <file>         Delete a file.\n\r  *RENAME <old> <new>    Rename a file or directory.\n\r  *FILETYPE <file> <id>  Set a RISC OS file type.\n\r  *TYPE <file>           Display a text file.\n\r  *DISC [name]           Read or set the volume name.\n\r  *HOSTFS                Select the HostFS filing system.\n\r  *CONFIGURE             Set preferences; use *CONFIGURE for its BASIC64-owned syntax.\n\r  *STATUS                Show saved configuration; use *STATUS for filters.\n\r  *BASIC <file>          Load and run BASIC with saved preferences.\n\r  *BASIC64 [options] <file> Run with native BASIC64 and modern text defaults.\n\r    Options: --mode CLASSIC|BASIC64|HYBRID --text CLASSIC|MODERN --override\n\r  DESKTOP                Start the hosted Wimp desktop.\n\r  RUN <file>             Run a BASIC source or tokenised file.\n\r  BASICLOAD <file>       Load a tokenised BASIC program.\n\r  BASICRUN               Run the loaded program.\n\r  BASICJIT [file]        Run with experimental native hot regions.\n\r  BASICJIT STRICT [file] Compile and run supported code without fallback.\n\r  HELP                   Show this help.\n\r  QUIT                   Exit the runtime.";
 
 fn validate_boot_grants(
     module_name: &str,
@@ -205,7 +205,7 @@ fn validate_boot_grants(
         ["RuntimeErrors", "TaskMemory"].as_slice()
     } else if module_name.eq_ignore_ascii_case("ModuleManager") {
         ["ModuleIntrospection", "ModuleManagement", "RuntimeErrors"].as_slice()
-    } else if module_name.eq_ignore_ascii_case("TrellisCommands") {
+    } else if module_name.eq_ignore_ascii_case("RicochetCommands") {
         [
             "ConfigurationStoreRead",
             "ConfigurationStoreWrite",
@@ -533,7 +533,7 @@ impl Basic64ModuleManager<'_> {
         number: u32,
         source: &str,
         source_path: &str,
-    ) -> Result<crate::trellis::GenerationId, RuntimeError> {
+    ) -> Result<crate::ricochet::GenerationId, RuntimeError> {
         self.dispatcher
             .replace_basic64_swi(&self.authority, number, source, source_path)
     }
@@ -566,7 +566,7 @@ impl SwiDispatcher {
     pub(crate) fn module_primitive_signature(
         &self,
         name: &str,
-    ) -> Result<crate::trellis::PrimitiveDescriptor, RuntimeError> {
+    ) -> Result<crate::ricochet::PrimitiveDescriptor, RuntimeError> {
         let module_id = self.active_module.ok_or_else(|| {
             RuntimeError::Program(format!(
                 "primitive {name} was inspected outside a BASIC64 module invocation"
@@ -897,7 +897,7 @@ impl SwiDispatcher {
         number: u32,
         source: &str,
         source_path: impl Into<String>,
-    ) -> Result<crate::trellis::GenerationId, RuntimeError> {
+    ) -> Result<crate::ricochet::GenerationId, RuntimeError> {
         self.check_module_management_authority(authority)?;
         let source_path = source_path.into();
         let owner = self
@@ -1078,7 +1078,9 @@ impl SwiDispatcher {
             startup_target: None,
             boot_failure: None,
         };
-        if let Some(path) = std::env::var_os("ACORN_BOOT_CAPSULE") {
+        if let Some(path) = std::env::var_os("RICOCHET_BOOT_CAPSULE")
+            .or_else(|| std::env::var_os("ACORN_BOOT_CAPSULE"))
+        {
             let path = std::path::PathBuf::from(path);
             let display_path = path.display().to_string();
             match std::fs::read(&path) {
@@ -1814,7 +1816,7 @@ impl SwiDispatcher {
             "ModuleManager",
             "Error",
             "TaskManager",
-            "TrellisCommands",
+            "RicochetCommands",
             "Memory",
             "Boot",
         ] {
@@ -2219,7 +2221,7 @@ impl SwiDispatcher {
     /// operator-selected capsule read; no normal guest path or CLI exists here.
     pub(crate) fn recover_boot(&mut self) -> Result<bool, RuntimeError> {
         while let Some(failure) = self.boot_failure.clone() {
-            self.native_recovery_write(b"Trellis native recovery\n\r")?;
+            self.native_recovery_write(b"Ricochet native recovery\n\r")?;
             self.native_recovery_write(failure.summary().as_bytes())?;
             self.native_recovery_write(b"\n\r")?;
             for line in &failure.diagnostic_log {
@@ -2410,17 +2412,78 @@ impl SwiDispatcher {
         Ok(())
     }
 
+    pub(crate) fn can_keep_modern_shell_for_basic_console(
+        &self,
+        graphics_profile: GraphicsProfile,
+        text_profile: TextRenderingProfile,
+        encoding: TextEncoding,
+    ) -> bool {
+        self.modern_shell_console
+            && self.active_graphics_window.is_none()
+            && graphics_profile == self.graphics.snapshot().mode.profile
+            && text_profile == TextRenderingProfile::Modern
+            && encoding == TextEncoding::Utf8
+    }
+
+    pub(crate) fn set_basic_console_display_profiles(
+        &mut self,
+        graphics_profile: GraphicsProfile,
+        text_profile: TextRenderingProfile,
+        encoding: TextEncoding,
+    ) -> Result<(), RuntimeError> {
+        if self.can_keep_modern_shell_for_basic_console(graphics_profile, text_profile, encoding) {
+            // The immediate BASIC prompt is already running with these
+            // semantics. Leaving the responsive shell surface in place keeps
+            // its transcript and host-derived grid across each submitted line.
+            return Ok(());
+        }
+        self.set_display_profiles(graphics_profile, text_profile, encoding)
+    }
+
     /// Initialize a Runtime-owned MOS shell. Generic SWI dispatchers retain
     /// their historical Classic default; the interactive host shell opts in.
     pub(crate) fn initialize_mos_shell_console(&mut self) {
         let previous = self.graphics.snapshot().clone();
         if self.graphics.set_modern_shell_console().is_ok() {
             self.modern_shell_console = true;
+            self.sync_modern_shell_grid_from_wimp();
             let snapshot = self.graphics.snapshot().clone();
             if snapshot != previous {
                 self.publish_snapshot(snapshot);
             }
         }
+    }
+
+    fn sync_modern_shell_grid_from_wimp(&mut self) -> bool {
+        if self.active_graphics_window.is_some() || !self.graphics.snapshot().modern_shell_console {
+            return false;
+        }
+        let size_osu = self
+            .wimp
+            .as_ref()
+            .and_then(|wimp| {
+                wimp.console_work_area(self.display_task_id).map(|area| {
+                    (
+                        area.max_x.saturating_sub(area.min_x),
+                        area.max_y.saturating_sub(area.min_y),
+                    )
+                })
+            })
+            .or_else(|| {
+                self.desktop_service.as_ref().map(|wimp| {
+                    let metrics = wimp.desktop_metrics();
+                    let (host_width, host_height) = metrics.host_pixel_size();
+                    (
+                        host_width.saturating_mul(2).min(i32::MAX as u32) as i32,
+                        host_height.saturating_mul(2).min(i32::MAX as u32) as i32,
+                    )
+                })
+            });
+        let Some((width_osu, height_osu)) = size_osu else {
+            return false;
+        };
+        let size = crate::graphics::modern_shell_grid_for_area(width_osu, height_osu);
+        self.graphics.set_modern_shell_text_grid(size.0, size.1)
     }
 
     fn save_mos_shell_for_guest(&self) -> Option<GraphicsService> {
@@ -3483,7 +3546,8 @@ impl SwiDispatcher {
                 format!("module {} is not Active", old_manifest.name),
             ));
         }
-        if old_manifest.replacement_policy != crate::trellis::ReplacementPolicy::CompatibleImmediate
+        if old_manifest.replacement_policy
+            != crate::ricochet::ReplacementPolicy::CompatibleImmediate
         {
             return Err(module_service_error(
                 "ModuleReplacementIncompatible",
@@ -3755,10 +3819,11 @@ impl SwiDispatcher {
                 u64::from(mode.pixel_width) * u64::from(mode.pixel_height),
             )?;
         }
+        let grid_changed = self.sync_modern_shell_grid_from_wimp();
         let previous_mode = self.current_graphics().snapshot().mode;
         let output_byte = self.current_graphics_mut().write_byte(character)?;
         let mode_changed = self.current_graphics().snapshot().mode != previous_mode;
-        if mode_changed {
+        if mode_changed || grid_changed {
             self.publish_snapshot(self.current_graphics().snapshot().clone());
         } else if !self.display_batch_active || output_byte.is_some() {
             self.publish_display_event(DisplayEvent::WriteByte {
@@ -3864,8 +3929,8 @@ impl SwiDispatcher {
             "WIMP_SETEXTENT" => self.dispatch(WIMP_SET_EXTENT | x_bit, task, context),
             "WIMP_CLOSEDOWN" => self.dispatch(WIMP_CLOSE_DOWN | x_bit, task, context),
             "WIMP_STARTTASK" => self.dispatch(WIMP_START_TASK | x_bit, task, context),
-            "ACORN_DESKTOP" => self.acorn_desktop(task, context),
-            "ACORN_DISPLAY" => self.acorn_display(task, context),
+            "RICOCHET_DESKTOP" => self.ricochet_desktop(task, context),
+            "RICOCHET_DISPLAY" => self.ricochet_display(task, context),
             _ => Err(RuntimeError::Structured {
                 type_name: "UnknownSwi".into(),
                 code: SWI_UNKNOWN_ERROR_CODE,
@@ -3956,10 +4021,11 @@ impl SwiDispatcher {
                         u64::from(mode.pixel_width) * u64::from(mode.pixel_height),
                     )?;
                 }
+                let grid_changed = self.sync_modern_shell_grid_from_wimp();
                 let previous_mode = self.current_graphics().snapshot().mode;
                 let output_byte = self.current_graphics_mut().write_byte(character)?;
                 let mode_changed = self.current_graphics().snapshot().mode != previous_mode;
-                if mode_changed {
+                if mode_changed || grid_changed {
                     self.publish_snapshot(self.current_graphics().snapshot().clone());
                 } else if !self.display_batch_active || output_byte.is_some() {
                     self.publish_display_event(DisplayEvent::WriteByte {
@@ -4082,7 +4148,7 @@ impl SwiDispatcher {
     /// Project extension for the BASIC64 Filer. It exposes checked HostFS
     /// catalogue records and the mounted volume name; Filer navigation and
     /// activation policy remain in BASIC64.
-    fn acorn_desktop(
+    fn ricochet_desktop(
         &mut self,
         task: &mut Task,
         context: &mut SwiContext,
@@ -4094,7 +4160,7 @@ impl SwiDispatcher {
                 let capacity = context.registers[R4] as usize;
                 if capacity == 0 || capacity > crate::memory::GUEST_MEMORY_SIZE as usize {
                     return Err(RuntimeError::Program(
-                        "Acorn_Desktop entry buffer size is outside the hosted limit".into(),
+                        "desktop entry buffer size is outside the hosted limit".into(),
                     ));
                 }
                 let entries = self.file_system.enumerate(&task.file_system, &path, "*")?;
@@ -4106,7 +4172,7 @@ impl SwiDispatcher {
                 };
                 if entry.guest_name.len() + 1 > capacity {
                     return Err(RuntimeError::Program(
-                        "Acorn_Desktop entry name does not fit the caller buffer".into(),
+                        "desktop entry name does not fit the caller buffer".into(),
                     ));
                 }
                 write_guest_string(task, context.registers[R3], &entry.guest_name)?;
@@ -4131,7 +4197,7 @@ impl SwiDispatcher {
                 let name = self.file_system.volume_name();
                 if name.len() + 1 > capacity {
                     return Err(RuntimeError::Program(
-                        "Acorn_Desktop volume name does not fit the caller buffer".into(),
+                        "desktop volume name does not fit the caller buffer".into(),
                     ));
                 }
                 write_guest_string(task, context.registers[R1], name)?;
@@ -4162,7 +4228,7 @@ impl SwiDispatcher {
                 Ok(())
             }
             action => Err(RuntimeError::Program(format!(
-                "Acorn_Desktop action {action} is not supported"
+                "desktop catalogue action {action} is not supported"
             ))),
         }
     }
@@ -4170,10 +4236,10 @@ impl SwiDispatcher {
     /// Versioned, register-only Display Manager service. A combined apply is
     /// persisted before Wimp state changes; R8 reports a persistence failure
     /// without terminating the BASIC64 Desktop task.
-    fn acorn_display(&mut self, task: &Task, context: &mut SwiContext) -> Result<(), RuntimeError> {
-        if context.registers[R0] != ACORN_DISPLAY_ABI_VERSION {
+    fn ricochet_display(&mut self, task: &Task, context: &mut SwiContext) -> Result<(), RuntimeError> {
+        if context.registers[R0] != RICOCHET_DISPLAY_ABI_VERSION {
             return Err(RuntimeError::Program(format!(
-                "Acorn_Display ABI version {} is unsupported",
+                "display service ABI version {} is unsupported",
                 context.registers[R0]
             )));
         }
@@ -4182,26 +4248,26 @@ impl SwiDispatcher {
             .as_ref()
             .or(self.desktop_service.as_ref())
             .ok_or_else(|| {
-                RuntimeError::Program("Acorn_Display requires the hosted Wimp desktop".into())
+                RuntimeError::Program("display settings require the hosted Wimp desktop".into())
             })?;
         match context.registers[R1] {
-            ACORN_DISPLAY_QUERY => {
+            RICOCHET_DISPLAY_QUERY => {
                 write_display_query(wimp, context);
                 context.registers[R8] = 0;
                 Ok(())
             }
-            ACORN_DISPLAY_APPLY => {
+            RICOCHET_DISPLAY_APPLY => {
                 task.require_configuration_write()?;
                 let resolution =
                     DesktopResolution::from_id(context.registers[R2]).ok_or_else(|| {
                         RuntimeError::Program(format!(
-                            "Acorn_Display resolution ID {} is invalid",
+                            "display resolution ID {} is invalid",
                             context.registers[R2]
                         ))
                     })?;
                 let colour = DisplayColour::from_id(context.registers[R3]).ok_or_else(|| {
                     RuntimeError::Program(format!(
-                        "Acorn_Display colour ID {} is invalid",
+                        "display colour ID {} is invalid",
                         context.registers[R3]
                     ))
                 })?;
@@ -4212,7 +4278,7 @@ impl SwiDispatcher {
                 Ok(())
             }
             action => Err(RuntimeError::Program(format!(
-                "Acorn_Display action {action} is unsupported"
+                "display settings action {action} is unsupported"
             ))),
         }
     }
@@ -5113,6 +5179,7 @@ impl SwiDispatcher {
         }
         self.display_batch_active = false;
         self.last_display_batch_publish = None;
+        self.sync_modern_shell_grid_from_wimp();
         if self.display_events.is_some() {
             self.publish_snapshot(self.current_graphics().snapshot().clone());
         }
@@ -5127,6 +5194,7 @@ impl SwiDispatcher {
             return;
         }
 
+        self.sync_modern_shell_grid_from_wimp();
         let snapshot = self.current_graphics().snapshot().clone();
         self.publish_snapshot(snapshot);
         self.last_display_batch_publish = Some(Instant::now());
@@ -6290,8 +6358,8 @@ mod tests {
                 grants: &["RuntimeErrors", "TaskQuery"],
             },
             BootModuleInput {
-                source_path: "modules/TrellisCommands.bas64",
-                source: include_str!("../modules/TrellisCommands.bas64"),
+                source_path: "modules/RicochetCommands.bas64",
+                source: include_str!("../modules/RicochetCommands.bas64"),
                 grants: &[
                     "ConfigurationStoreRead",
                     "ConfigurationStoreWrite",
@@ -6308,9 +6376,9 @@ mod tests {
         let filename = format!("{guest_name}.bas64");
         std::fs::write(root.join(&filename), source).unwrap();
         std::fs::write(
-            root.join(format!("{filename}.acornmeta")),
+            root.join(format!("{filename}.ricochetmeta")),
             format!(
-                "Acorn-2026 file metadata v1\nformat-version=1\nguest-name={guest_name}\nfile-type=0x00000064\nload-address=0x00000000\nexecution-address=0x00000000\nattributes=0x00000000\n"
+                "Ricochet file metadata v1\nformat-version=1\nguest-name={guest_name}\nfile-type=0x00000064\nload-address=0x00000000\nexecution-address=0x00000000\nattributes=0x00000000\n"
             ),
         )
         .unwrap();
@@ -6381,7 +6449,7 @@ mod tests {
             wimp,
         );
         let path = std::env::temp_dir().join(format!(
-            "acorn-boot-policy-{}.configure",
+            "ricochet-boot-policy-{}.configure",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
@@ -6468,7 +6536,7 @@ mod tests {
         let mut task_info = SwiContext::default();
         task_info.registers[R0] = 1;
         dispatcher
-            .dispatch(ACORN_TASK_INFO, &mut task, &mut task_info)
+            .dispatch(RICOCHET_TASK_INFO, &mut task, &mut task_info)
             .unwrap();
         assert_eq!(task_info.registers[R1], 0x1234);
         assert_eq!(
@@ -6478,7 +6546,7 @@ mod tests {
         assert_eq!(task_info.registers[R3], 0);
         assert!(matches!(
             dispatcher.last_dispatch_route(),
-            Some(SwiDispatchRoute::ModuleOwned { number: ACORN_TASK_INFO, module, definition, .. })
+            Some(SwiDispatchRoute::ModuleOwned { number: RICOCHET_TASK_INFO, module, definition, .. })
                 if module == "TaskManager" && definition == "READTASKINFO"
         ));
 
@@ -6487,12 +6555,12 @@ mod tests {
         let mut module_names = BTreeSet::new();
         loop {
             let mut module_info = SwiContext::default();
-            module_info.registers[R0] = 1; // Acorn_ModuleInfo ABI version.
+            module_info.registers[R0] = 1; // Ricochet_ModuleInfo ABI version.
             module_info.registers[R1] = cursor;
             module_info.registers[R2] = name_buffer;
             module_info.registers[R3] = 128;
             dispatcher
-                .dispatch(ACORN_MODULE_INFO, &mut task, &mut module_info)
+                .dispatch(RICOCHET_MODULE_INFO, &mut task, &mut module_info)
                 .unwrap();
             if module_info.registers[R4] == 0 {
                 break;
@@ -6512,7 +6580,7 @@ mod tests {
         assert!(module_names.contains("TaskManager"));
         assert!(matches!(
             dispatcher.last_dispatch_route(),
-            Some(SwiDispatchRoute::ModuleOwned { number: ACORN_MODULE_INFO, module, definition, .. })
+            Some(SwiDispatchRoute::ModuleOwned { number: RICOCHET_MODULE_INFO, module, definition, .. })
                 if module == "ModuleManager" && definition == "READMODULEINFO"
         ));
     }
@@ -6656,7 +6724,7 @@ mod tests {
     #[test]
     fn module_manager_loads_inspects_and_unloads_guest_source_modules() {
         let root = std::env::temp_dir().join(format!(
-            "acorn-wp51-module-lifecycle-{}",
+            "ricochet-wp51-module-lifecycle-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -6748,13 +6816,13 @@ mod tests {
         lookup.registers[R0] = 1;
         lookup.registers[R1] = module_name_address;
         dispatcher
-            .dispatch(ACORN_MODULE_LOOKUP, &mut task, &mut lookup)
+            .dispatch(RICOCHET_MODULE_LOOKUP, &mut task, &mut lookup)
             .unwrap();
         assert!(
             matches!(
                 dispatcher.last_dispatch_route(),
                 Some(SwiDispatchRoute::ModuleOwned { number, module, definition, .. })
-                    if *number == ACORN_MODULE_LOOKUP && module == "ModuleManager" && definition == "LOOKUPMODULE"
+                    if *number == RICOCHET_MODULE_LOOKUP && module == "ModuleManager" && definition == "LOOKUPMODULE"
             ),
             "route: {:?}",
             dispatcher.last_dispatch_route()
@@ -6771,7 +6839,7 @@ mod tests {
         missing_lookup.registers[R0] = 1;
         missing_lookup.registers[R1] = module_name_address;
         dispatcher
-            .dispatch(ACORN_MODULE_LOOKUP, &mut task, &mut missing_lookup)
+            .dispatch(RICOCHET_MODULE_LOOKUP, &mut task, &mut missing_lookup)
             .unwrap();
         assert_eq!(missing_lookup.registers[R1..=R6], [0; 6]);
         task.memory
@@ -6791,7 +6859,7 @@ mod tests {
         swi_info.registers[R6] = definition_name;
         swi_info.registers[R7] = 128;
         dispatcher
-            .dispatch(ACORN_SWI_INFO, &mut task, &mut swi_info)
+            .dispatch(RICOCHET_SWI_INFO, &mut task, &mut swi_info)
             .unwrap();
         assert_eq!(swi_info.registers[R8], 1, "first definition generation");
         assert_eq!(
@@ -6894,7 +6962,7 @@ mod tests {
     #[test]
     fn module_manager_replaces_guest_exports_as_one_generation_and_preserves_workspace() {
         let root = std::env::temp_dir().join(format!(
-            "acorn-wp51-module-replacement-{}",
+            "ricochet-wp51-module-replacement-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -7096,7 +7164,7 @@ mod tests {
     #[test]
     fn module_manager_rolls_back_failed_guest_start_and_protects_foundation() {
         let root = std::env::temp_dir().join(format!(
-            "acorn-wp51-module-start-failure-{}",
+            "ricochet-wp51-module-start-failure-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -7198,7 +7266,7 @@ mod tests {
     #[test]
     fn module_manager_enforces_guest_capability_and_dependency_boundaries() {
         let root = std::env::temp_dir().join(format!(
-            "acorn-wp51-module-dependencies-{}",
+            "ricochet-wp51-module-dependencies-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -7406,7 +7474,11 @@ mod tests {
         successful_x.registers[R2] = 0x2800;
         successful_x.registers[R3] = 128;
         dispatcher
-            .dispatch(ACORN_MODULE_INFO | SWI_X_BIT, &mut task, &mut successful_x)
+            .dispatch(
+                RICOCHET_MODULE_INFO | SWI_X_BIT,
+                &mut task,
+                &mut successful_x,
+            )
             .unwrap();
         assert!(!successful_x.overflow, "successful X form clears V");
 
@@ -7621,7 +7693,7 @@ mod tests {
     #[test]
     fn native_recovery_can_select_and_retry_an_alternate_capsule_without_swis() {
         let path = std::env::temp_dir().join(format!(
-            "acorn-boot-recovery-{}-{}.capsule",
+            "ricochet-boot-recovery-{}-{}.capsule",
             std::process::id(),
             std::thread::current().name().unwrap_or("test")
         ));
@@ -7652,8 +7724,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(
             recovery_output
-                .windows("Trellis native recovery".len())
-                .any(|bytes| bytes == b"Trellis native recovery")
+                .windows("Ricochet native recovery".len())
+                .any(|bytes| bytes == b"Ricochet native recovery")
         );
         assert!(
             recovery_output
@@ -7737,7 +7809,7 @@ mod tests {
     #[test]
     fn native_recovery_missing_alternate_path_is_reported_without_guest_file_access() {
         let missing = std::env::temp_dir().join(format!(
-            "acorn-boot-missing-{}-{}.capsule",
+            "ricochet-boot-missing-{}-{}.capsule",
             std::process::id(),
             std::thread::current().name().unwrap_or("test")
         ));
@@ -8470,7 +8542,7 @@ mod tests {
                 .module_named("Console")
                 .unwrap()
                 .state,
-            crate::trellis::ModuleState::Active
+            crate::ricochet::ModuleState::Active
         );
         assert_eq!(dispatcher.module_registry().registered_swi_count(), 20);
         assert!(
@@ -8569,7 +8641,7 @@ mod tests {
                 .module_named("Console")
                 .unwrap()
                 .state,
-            crate::trellis::ModuleState::Quiescing
+            crate::ricochet::ModuleState::Quiescing
         );
         assert!(
             dispatcher
@@ -8802,10 +8874,8 @@ mod tests {
         let (display_sender, display_receiver) = mpsc::channel();
         let mut dispatcher =
             SwiDispatcher::windowed(HostConsole::windowed(input_receiver), display_sender);
-        let config_path = std::env::temp_dir().join(format!(
-            "acorn-2026-configure-cli-{}.txt",
-            std::process::id()
-        ));
+        let config_path =
+            std::env::temp_dir().join(format!("ricochet-configure-cli-{}.txt", std::process::id()));
         let _ = std::fs::remove_file(&config_path);
         dispatcher.configure = ConfigureStore::with_path(&config_path);
         let mut task = Task::trusted_configuration_manager(1);
@@ -8857,9 +8927,9 @@ mod tests {
     }
 
     #[test]
-    fn acorn_display_swi_queries_applies_and_reports_save_failure_in_registers() {
+    fn ricochet_display_swi_queries_applies_and_reports_save_failure_in_registers() {
         let path =
-            std::env::temp_dir().join(format!("acorn-2026-display-swi-{}.txt", std::process::id()));
+            std::env::temp_dir().join(format!("ricochet-display-swi-{}.txt", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let (display_sender, _display_receiver) = mpsc::channel();
         let wimp = WimpServer::new(mpsc::channel().0);
@@ -8872,10 +8942,10 @@ mod tests {
         );
         let mut task = Task::new(77);
         let mut query = SwiContext::default();
-        query.registers[R0] = ACORN_DISPLAY_ABI_VERSION;
-        query.registers[R1] = ACORN_DISPLAY_QUERY;
+        query.registers[R0] = RICOCHET_DISPLAY_ABI_VERSION;
+        query.registers[R1] = RICOCHET_DISPLAY_QUERY;
         dispatcher
-            .dispatch_named_swi("ACORN_DISPLAY", &mut task, &mut query)
+            .dispatch_named_swi("RICOCHET_DISPLAY", &mut task, &mut query)
             .unwrap();
         assert_eq!(query.registers[R2], DesktopResolution::Window.id());
         assert_eq!(query.registers[R3], DisplayColour::Rgb888.id());
@@ -8883,12 +8953,12 @@ mod tests {
         assert_eq!((query.registers[R6], query.registers[R7]), (800, 600));
 
         let mut denied_apply = SwiContext::default();
-        denied_apply.registers[R0] = ACORN_DISPLAY_ABI_VERSION;
-        denied_apply.registers[R1] = ACORN_DISPLAY_APPLY;
+        denied_apply.registers[R0] = RICOCHET_DISPLAY_ABI_VERSION;
+        denied_apply.registers[R1] = RICOCHET_DISPLAY_APPLY;
         denied_apply.registers[R2] = DesktopResolution::R640x480.id();
         denied_apply.registers[R3] = DisplayColour::Rgb555.id();
         assert!(matches!(
-            dispatcher.dispatch_named_swi("ACORN_DISPLAY", &mut task, &mut denied_apply),
+            dispatcher.dispatch_named_swi("RICOCHET_DISPLAY", &mut task, &mut denied_apply),
             Err(RuntimeError::Structured { type_name, code: 4, ref message })
                 if type_name == "TaskAuthorizationDenied"
                     && message == "caller task lacks configuration-write authority"
@@ -8902,12 +8972,12 @@ mod tests {
         let mut task = Task::trusted_mos_session(77);
 
         let mut apply = SwiContext::default();
-        apply.registers[R0] = ACORN_DISPLAY_ABI_VERSION;
-        apply.registers[R1] = ACORN_DISPLAY_APPLY;
+        apply.registers[R0] = RICOCHET_DISPLAY_ABI_VERSION;
+        apply.registers[R1] = RICOCHET_DISPLAY_APPLY;
         apply.registers[R2] = DesktopResolution::R640x480.id();
         apply.registers[R3] = DisplayColour::Rgb555.id();
         dispatcher
-            .dispatch_named_swi("ACORN_DISPLAY", &mut task, &mut apply)
+            .dispatch_named_swi("RICOCHET_DISPLAY", &mut task, &mut apply)
             .unwrap();
         assert_eq!(apply.registers[R8], 0);
         assert_eq!((apply.registers[R4], apply.registers[R5]), (640, 480));
@@ -8921,10 +8991,10 @@ mod tests {
 
         let mut invalid_version = SwiContext::default();
         invalid_version.registers[R0] = 2;
-        invalid_version.registers[R1] = ACORN_DISPLAY_QUERY;
+        invalid_version.registers[R1] = RICOCHET_DISPLAY_QUERY;
         assert!(
             dispatcher
-                .dispatch_named_swi("ACORN_DISPLAY", &mut task, &mut invalid_version)
+                .dispatch_named_swi("RICOCHET_DISPLAY", &mut task, &mut invalid_version)
                 .is_err()
         );
         let _ = std::fs::remove_file(path);
@@ -8934,7 +9004,7 @@ mod tests {
             let (failed_display_sender, _failed_display_receiver) = mpsc::channel();
             let failed_wimp = WimpServer::new(mpsc::channel().0);
             failed_wimp.set_configure_store(
-                ConfigureStore::with_path("/proc/self/acorn-2026-display-test/configure"),
+                ConfigureStore::with_path("/proc/self/ricochet-display-test/configure"),
                 DisplaySettings::default(),
             );
             let mut failed_dispatcher = SwiDispatcher::desktop_task(
@@ -8944,13 +9014,13 @@ mod tests {
                 failed_wimp.clone(),
             );
             let mut failed_apply = SwiContext::default();
-            failed_apply.registers[R0] = ACORN_DISPLAY_ABI_VERSION;
-            failed_apply.registers[R1] = ACORN_DISPLAY_APPLY;
+            failed_apply.registers[R0] = RICOCHET_DISPLAY_ABI_VERSION;
+            failed_apply.registers[R1] = RICOCHET_DISPLAY_APPLY;
             failed_apply.registers[R2] = DesktopResolution::R640x480.id();
             failed_apply.registers[R3] = DisplayColour::Grey4.id();
             failed_dispatcher
                 .dispatch_named_swi(
-                    "ACORN_DISPLAY",
+                    "RICOCHET_DISPLAY",
                     &mut Task::trusted_mos_session(78),
                     &mut failed_apply,
                 )
@@ -8963,10 +9033,10 @@ mod tests {
     #[test]
     fn pre_handoff_display_apply_shares_latched_configuration_recovery() {
         let path = std::env::temp_dir().join(format!(
-            "acorn-2026-prehandoff-recovery-{}.configure",
+            "ricochet-prehandoff-recovery-{}.configure",
             std::process::id()
         ));
-        let original = b"# Acorn-2026 MOS configuration v3\nLanguage=3\n";
+        let original = b"# Ricochet MOS configuration v3\nLanguage=3\n";
         let _ = std::fs::remove_file(&path);
         std::fs::write(&path, original).unwrap();
 
@@ -8974,7 +9044,7 @@ mod tests {
         let wimp = WimpServer::new(mpsc::channel().0);
         // A desktop host can prepare its configuration store before creating
         // the command dispatcher. The constructor must adopt that same store
-        // rather than leaving pre-handoff ACORN_DISPLAY on a fresh fallback.
+        // rather than leaving pre-handoff RICOCHET_DISPLAY on a fresh fallback.
         wimp.bind_configure_store(ConfigureStore::with_path(&path));
         let mut dispatcher = SwiDispatcher::windowed_with_desktop(
             HostConsole::windowed(mpsc::channel().1),
@@ -8989,13 +9059,13 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), original);
 
         let mut apply = SwiContext::default();
-        apply.registers[R0] = ACORN_DISPLAY_ABI_VERSION;
-        apply.registers[R1] = ACORN_DISPLAY_APPLY;
+        apply.registers[R0] = RICOCHET_DISPLAY_ABI_VERSION;
+        apply.registers[R1] = RICOCHET_DISPLAY_APPLY;
         apply.registers[R2] = DesktopResolution::R640x480.id();
         apply.registers[R3] = DisplayColour::Colour16.id();
         dispatcher
             .dispatch_named_swi(
-                "ACORN_DISPLAY",
+                "RICOCHET_DISPLAY",
                 &mut Task::trusted_mos_session(0xD15A),
                 &mut apply,
             )
@@ -9017,7 +9087,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "# Acorn-2026 MOS configuration v3\nLanguage=0\nBASICMode=AUTO\nBASICProfile=AUTO\nBASICTarget=AUTO\nBASICEngine=INTERPRETER\nWimpMode=X640 Y480 C16\n"
+            "# Ricochet MOS configuration v3\nLanguage=0\nBASICMode=AUTO\nBASICProfile=AUTO\nBASICTarget=AUTO\nBASICEngine=INTERPRETER\nWimpMode=X640 Y480 C16\n"
         );
 
         // The later Language 3 handoff must consume the same repaired store,
@@ -9298,7 +9368,7 @@ mod tests {
             context.registers[R3] = 0x1900;
             context.registers[R4] = 256;
             dispatcher
-                .dispatch_named_swi("ACORN_DESKTOP", &mut task, &mut context)
+                .dispatch_named_swi("RICOCHET_DESKTOP", &mut task, &mut context)
                 .unwrap();
             assert_eq!(
                 context.registers[R0], 1,
@@ -9309,7 +9379,7 @@ mod tests {
     }
 
     #[test]
-    fn acorn_desktop_catalogue_uses_checked_guest_buffers_and_hostfs_metadata() {
+    fn ricochet_desktop_catalogue_uses_checked_guest_buffers_and_hostfs_metadata() {
         let mut dispatcher = SwiDispatcher::new(HostConsole::stdio());
         dispatcher.set_file_system_for_test(HostFileSystem::new(
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("demo-volume"),
@@ -9326,7 +9396,7 @@ mod tests {
         context.registers[R3] = ENTRY;
         context.registers[R4] = 256;
         dispatcher
-            .dispatch_named_swi("ACORN_DESKTOP", &mut task, &mut context)
+            .dispatch_named_swi("RICOCHET_DESKTOP", &mut task, &mut context)
             .unwrap();
         assert!([1, 2, 3, 4].contains(&context.registers[R0]));
         let name = task.memory.read_c_string(ENTRY, 256).unwrap();
@@ -9343,7 +9413,7 @@ mod tests {
         date.registers[R1] = DIRECTORY;
         date.registers[R2] = 0;
         dispatcher
-            .dispatch_named_swi("ACORN_DESKTOP", &mut task, &mut date)
+            .dispatch_named_swi("RICOCHET_DESKTOP", &mut task, &mut date)
             .unwrap();
         assert_eq!(date.registers[R0], 1);
         assert!(date.registers[R1] > 0);
@@ -9351,7 +9421,7 @@ mod tests {
         date.registers[R1] = DIRECTORY;
         date.registers[R2] = u32::MAX;
         dispatcher
-            .dispatch_named_swi("ACORN_DESKTOP", &mut task, &mut date)
+            .dispatch_named_swi("RICOCHET_DESKTOP", &mut task, &mut date)
             .unwrap();
         assert_eq!((date.registers[R0], date.registers[R1]), (0, 0));
 
@@ -9363,7 +9433,7 @@ mod tests {
         invalid.registers[R4] = 256;
         assert!(
             dispatcher
-                .dispatch_named_swi("ACORN_DESKTOP", &mut task, &mut invalid)
+                .dispatch_named_swi("RICOCHET_DESKTOP", &mut task, &mut invalid)
                 .is_err()
         );
 
@@ -9375,7 +9445,7 @@ mod tests {
         bad_buffer.registers[R4] = 256;
         assert!(
             dispatcher
-                .dispatch_named_swi("ACORN_DESKTOP", &mut task, &mut bad_buffer)
+                .dispatch_named_swi("RICOCHET_DESKTOP", &mut task, &mut bad_buffer)
                 .is_err()
         );
     }

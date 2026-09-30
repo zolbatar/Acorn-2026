@@ -230,7 +230,7 @@ pub fn render_font_specimen(
         ),
         (
             FontName::Corpus,
-            "CORPUS  Acorn desktop typography",
+            "CORPUS  RISC OS desktop typography",
             "AgjpQéö£",
         ),
         (FontName::Trinity, "TRINITY  RISC OS 3.71", "AgjpQéö£"),

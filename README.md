@@ -1,15 +1,13 @@
-# Trellis (Acorn-2026)
+# Ricochet
 
-> **Build the computer Acorn might have built in 2026.**
-
-Trellis is a design and implementation project for a modern, tinkerable
-computer environment inspired by Acorn and RISC OS. Its mission is to make the
+Ricochet is a design and implementation project for a modern, tinkerable
+computer environment inspired by RISC OS. Its mission is to make the
 computer understandable, programmable and malleable by the person using it.
 It preserves useful ideas and source-compatible interfaces while replacing
 historical implementation limits. It is not a full RISC OS simulator or desktop
 remake; its desktop keeps the Wimp interaction model and Filer conventions, with
 a modern visual style by default. The live-system direction and bootstrap model
-are documented in [`docs/trellis-architecture.md`](docs/trellis-architecture.md).
+are documented in [`docs/ricochet-architecture.md`](docs/ricochet-architecture.md).
 
 This project was also inspired by [pmirvine/risc-os](https://github.com/pmirvine/risc-os).
 
@@ -23,7 +21,7 @@ The only Agon demo included is [`AgonTREE.bbc`](demo-volume/AgonTREE.bbc). Its H
 
 ## Start here
 
-- [`docs/acorn-2026-design.md`](docs/acorn-2026-design.md) — architecture, compatibility goals, memory model, SWIs and modules, rendering, desktop model, roadmap, and open questions.
+- [`docs/ricochet-design.md`](docs/ricochet-design.md) — architecture, compatibility goals, memory model, SWIs and modules, rendering, desktop model, roadmap, and open questions.
 - [`docs/phase-0-mos-prompt-plan.md`](docs/phase-0-mos-prompt-plan.md) — the saved Phase 0 prompt contract and initial SWI catalog.
 - [`docs/clocksp5-run-plan.md`](docs/clocksp5-run-plan.md) — implementation sequence and acceptance criteria for running the ClockSP5 fixture.
 - [`docs/tokenized-basic-compatibility.md`](docs/tokenized-basic-compatibility.md) — decoder, token-profile, and execution coverage by saved-program evidence.
@@ -76,8 +74,9 @@ programs launched in the desktop. A program's `REM @BASIC64` fields override
 the matching saved mode, target, or profile; the saved engine preference stays
 in effect. Settings are read again for each run, so they apply to the next
 program without restarting. On macOS they are stored in
-`~/Library/Application Support/Acorn-2026/configure`; set `ACORN_CONFIG_PATH`
-to use another file.
+`~/Library/Application Support/Ricochet/configure`; set `RICOCHET_CONFIG_PATH`
+to use another file. Existing Acorn-2026 configuration is moved to the new
+location on first launch.
 
 Use **Command+V** on macOS to paste clipboard text into the window (Control+V on other hosts). Pasted line breaks act like pressing Enter, so multiple pasted command lines run in sequence. Printable ASCII is sent to the guest input path; tabs become spaces and unsupported characters are skipped.
 
@@ -88,7 +87,7 @@ In the desktop, left-click is Select, middle-click is Menu, and right-click is A
 The editable desktop bootstrap and Filer policy are
 [`demo-volume/System/Desktop.bas64`](demo-volume/System/Desktop.bas64) and
 [`demo-volume/System/Filer.bas64`](demo-volume/System/Filer.bas64). They run as
-separate BASIC64 guest tasks through the shared runtime. `ACORN_DEMO_VOLUME`
+separate BASIC64 guest tasks through the shared runtime. `RICOCHET_DEMO_VOLUME`
 can select a different HostFS folder; the volume icon uses its mounted guest
 volume name.
 
@@ -100,7 +99,7 @@ extent follows the current page, and entries beyond the current page use
 previous/next controls. The renderer still has no guest redraw rectangles; it
 keeps the display snapshot visible while the window is moved, resized, covered,
 or scrolled. The desktop uses a modern, high-density shell by default while
-keeping classic Wimp interaction and the existing guest call shapes. Acorn's
+keeping classic Wimp interaction and the existing guest call shapes. The
 original Homerton outline face supplies shell and text-only guest labels where
 its Latin repertoire fits. Wimp text screens keep their classic character grid
 on a modern light surface; the MOS/BBC compatibility display remains pixel
@@ -120,7 +119,7 @@ Execution preferences and source directives use the same loader path as other
 BASIC runs. `WimpAlpha` and `WimpBeta` in
 [`demo-volume/Examples`](demo-volume/Examples) demonstrate shared Wimp windows.
 For a headless rendering of the default Desktop and Filer, run
-`cargo run -- --filer-snapshot /tmp/acorn-filer.ppm`.
+`cargo run -- --filer-snapshot /tmp/ricochet-filer.ppm`.
 
 The monitor icon opens Display Manager. **Window** resolution follows the host
 window's logical content size; fixed resolutions keep a stable workspace and
@@ -132,7 +131,7 @@ To exercise the real BASIC64 dialog and capture its menus and display changes
 through the GPU, run:
 
 ```sh
-ACORN_VELLO_SNAPSHOT=1 cargo run -- --display-manager-snapshots /tmp/acorn-display-manager
+RICOCHET_VELLO_SNAPSHOT=1 cargo run -- --display-manager-snapshots /tmp/ricochet-display-manager
 ```
 
 This validation command uses an isolated configuration and requires a graphics

@@ -1450,13 +1450,13 @@ impl Interpreter {
                         Value::Number(f64::from(u8::from(context.carry)))
                     } else {
                         match signature.results.get(register) {
-                            Some(crate::trellis::RegisterKind::OpaqueHandle { type_name }) => {
+                            Some(crate::ricochet::RegisterKind::OpaqueHandle { type_name }) => {
                                 Value::Handle {
                                     type_name: type_name.to_ascii_uppercase(),
                                     raw: context.registers[register],
                                 }
                             }
-                            Some(crate::trellis::RegisterKind::LogicalAddress { .. }) => {
+                            Some(crate::ricochet::RegisterKind::LogicalAddress { .. }) => {
                                 Value::LogicalAddress {
                                     owner_task: task.id,
                                     raw: context.registers[register],
@@ -3434,8 +3434,8 @@ impl Interpreter {
 pub(super) fn invoke_system_definition(
     mut program: ParsedProgram,
     definition_name: &str,
-    module_id: crate::trellis::ModuleId,
-    contract: &crate::trellis::SwiContract,
+    module_id: crate::ricochet::ModuleId,
+    contract: &crate::ricochet::SwiContract,
     workspace: &ModuleWorkspace,
     persistent_state: &std::collections::BTreeMap<String, super::parser::SystemType>,
     task: &mut Task,
@@ -3511,15 +3511,15 @@ pub(super) fn invoke_system_definition(
             .find(|register| usize::from(register.register) == index)
             .map(|register| &register.kind);
         let value = match kind {
-            Some(crate::trellis::RegisterKind::OpaqueHandle { type_name }) => Value::Handle {
+            Some(crate::ricochet::RegisterKind::OpaqueHandle { type_name }) => Value::Handle {
                 type_name: type_name.to_ascii_uppercase(),
                 raw: value,
             },
-            Some(crate::trellis::RegisterKind::LogicalAddress { .. }) => Value::LogicalAddress {
+            Some(crate::ricochet::RegisterKind::LogicalAddress { .. }) => Value::LogicalAddress {
                 owner_task: task.id,
                 raw: value,
             },
-            Some(crate::trellis::RegisterKind::Signed { .. }) => {
+            Some(crate::ricochet::RegisterKind::Signed { .. }) => {
                 Value::Number(f64::from(value as i32))
             }
             _ => Value::Number(f64::from(value)),
@@ -3565,7 +3565,7 @@ pub(super) fn invoke_system_definition(
     for register in &contract.registers {
         if matches!(
             register.direction,
-            crate::trellis::ArgumentDirection::Out | crate::trellis::ArgumentDirection::InOut
+            crate::ricochet::ArgumentDirection::Out | crate::ricochet::ArgumentDirection::InOut
         ) {
             let value = interpreter.get_variable(&format!("R{}%", register.register));
             context.registers[usize::from(register.register)] =
@@ -3574,7 +3574,7 @@ pub(super) fn invoke_system_definition(
     }
     if matches!(
         contract.program_counter,
-        Some(crate::trellis::ArgumentDirection::Out | crate::trellis::ArgumentDirection::InOut)
+        Some(crate::ricochet::ArgumentDirection::Out | crate::ricochet::ArgumentDirection::InOut)
     ) {
         context.pc = match interpreter.get_variable("PC%") {
             Value::LogicalAddress { owner_task, raw } if owner_task == task.id => raw,
@@ -3599,7 +3599,7 @@ pub(super) fn invoke_system_definition(
     }
     if matches!(
         contract.carry,
-        Some(crate::trellis::ArgumentDirection::Out | crate::trellis::ArgumentDirection::InOut)
+        Some(crate::ricochet::ArgumentDirection::Out | crate::ricochet::ArgumentDirection::InOut)
     ) {
         context.carry = interpreter.get_variable("CARRY%").number(0)? != 0.0;
     }
@@ -3611,7 +3611,7 @@ pub(crate) fn invoke_imported_system_symbol(
     name: &str,
     function: bool,
     values: Vec<Value>,
-    module_id: crate::trellis::ModuleId,
+    module_id: crate::ricochet::ModuleId,
     workspace: &ModuleWorkspace,
     persistent_state: &std::collections::BTreeMap<String, super::parser::SystemType>,
     task: &mut Task,
@@ -3648,10 +3648,10 @@ pub(crate) fn invoke_imported_system_symbol(
         *address += 2;
     }
     let argument_names = (0..values.len())
-        .map(|index| format!("__TRELLIS_IMPORTED_ARGUMENT_{index}"))
+        .map(|index| format!("__RICOCHET_IMPORTED_ARGUMENT_{index}"))
         .collect::<Vec<_>>();
     let invocation = if function {
-        let result_name = "__TRELLIS_IMPORTED_RESULT";
+        let result_name = "__RICOCHET_IMPORTED_RESULT";
         let arguments = argument_names.iter().cloned().map(Expr::Variable).collect();
         Statement::Assign(
             LValue::Variable(result_name.into()),
@@ -3736,9 +3736,9 @@ pub(crate) fn invoke_imported_system_symbol(
     Ok(function.then(|| {
         interpreter
             .variables
-            .get("__TRELLIS_IMPORTED_RESULT")
+            .get("__RICOCHET_IMPORTED_RESULT")
             .cloned()
-            .unwrap_or_else(|| default_value("__TRELLIS_IMPORTED_RESULT"))
+            .unwrap_or_else(|| default_value("__RICOCHET_IMPORTED_RESULT"))
     }))
 }
 
@@ -3902,12 +3902,12 @@ fn normalize_system_arguments(
 
 fn value_to_primitive_register(
     value: &Value,
-    kind: &crate::trellis::RegisterKind,
+    kind: &crate::ricochet::RegisterKind,
     task_id: u64,
     line: u16,
 ) -> Result<u32, RuntimeError> {
     match kind {
-        crate::trellis::RegisterKind::OpaqueHandle { type_name } => match value {
+        crate::ricochet::RegisterKind::OpaqueHandle { type_name } => match value {
             Value::Handle {
                 type_name: actual,
                 raw,
@@ -3917,7 +3917,7 @@ fn value_to_primitive_register(
                 format!("primitive requires opaque handle {type_name}"),
             )),
         },
-        crate::trellis::RegisterKind::Unsigned { bits } if *bits < 32 => {
+        crate::ricochet::RegisterKind::Unsigned { bits } if *bits < 32 => {
             let number = value.number(line)?;
             if !(0.0..(1_u32 << bits) as f64).contains(&number) || number.fract() != 0.0 {
                 return Err(program_error(
@@ -3927,14 +3927,14 @@ fn value_to_primitive_register(
             }
             Ok(number as u32)
         }
-        crate::trellis::RegisterKind::Unsigned { .. } => {
+        crate::ricochet::RegisterKind::Unsigned { .. } => {
             let number = value.number(line)?;
             if !(0.0..=f64::from(u32::MAX)).contains(&number) || number.fract() != 0.0 {
                 return Err(program_error(line, "primitive argument is not a UINT32"));
             }
             Ok(number as u32)
         }
-        crate::trellis::RegisterKind::LogicalAddress { bits: 32 } => match value {
+        crate::ricochet::RegisterKind::LogicalAddress { bits: 32 } => match value {
             Value::LogicalAddress { owner_task, raw } if *owner_task == task_id => Ok(*raw),
             Value::LogicalAddress { .. } => Err(program_error(
                 line,
@@ -3945,7 +3945,7 @@ fn value_to_primitive_register(
                 "primitive requires a caller-scoped ADDRESS32",
             )),
         },
-        crate::trellis::RegisterKind::LogicalAddress { bits } => match value {
+        crate::ricochet::RegisterKind::LogicalAddress { bits } => match value {
             Value::LogicalAddress { owner_task, raw }
                 if *owner_task == task_id && u64::from(*raw) < (1_u64 << bits) =>
             {
@@ -3959,7 +3959,7 @@ fn value_to_primitive_register(
                 format!("primitive requires ADDRESS{bits}"),
             )),
         },
-        crate::trellis::RegisterKind::Signed { bits } if *bits < 32 => {
+        crate::ricochet::RegisterKind::Signed { bits } if *bits < 32 => {
             let number = value.number(line)?;
             let bound = 2_f64.powi(i32::from(*bits) - 1);
             if !(-bound..bound).contains(&number) || number.fract() != 0.0 {
@@ -3970,7 +3970,7 @@ fn value_to_primitive_register(
             }
             Ok(number as i32 as u32)
         }
-        crate::trellis::RegisterKind::Signed { .. } => {
+        crate::ricochet::RegisterKind::Signed { .. } => {
             let number = value.number(line)?;
             if !(f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&number)
                 || number.fract() != 0.0
@@ -3995,7 +3995,7 @@ fn value_to_sys_register(value: &Value, line: u16, task_id: u64) -> Result<u32, 
 
 fn value_to_contract_register(
     value: &Value,
-    kind: &crate::trellis::RegisterKind,
+    kind: &crate::ricochet::RegisterKind,
     task_id: u64,
     line: u16,
 ) -> Result<u32, RuntimeError> {

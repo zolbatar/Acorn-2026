@@ -93,7 +93,7 @@ def main() -> int:
 
     for source in sources:
         target = source.with_suffix(".bbc")
-        with tempfile.NamedTemporaryFile(prefix="acorn-tokenize-", suffix=".bbc") as raw_file:
+        with tempfile.NamedTemporaryFile(prefix="ricochet-tokenize-", suffix=".bbc") as raw_file:
             result = subprocess.run(
                 # The corpus metadata comment is deliberately kept at BASIC line 0.
                 [tokenizer, str(source), "-start", "0", "-out", raw_file.name],

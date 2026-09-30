@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::trellis::{
+use crate::ricochet::{
     DefinitionDescriptor, ModuleManifest, PrimitiveImport, RUNTIME_ABI_VERSION, RegisterKind,
     SemanticVersion,
 };
@@ -619,7 +619,7 @@ impl PortableSystemIr {
         language_profile: String,
         target_profile: String,
         primitive_imports: &[PrimitiveImport],
-        register_contracts: &BTreeMap<String, Vec<crate::trellis::RegisterContract>>,
+        register_contracts: &BTreeMap<String, Vec<crate::ricochet::RegisterContract>>,
         descriptors: &BTreeMap<String, DefinitionDescriptor>,
         program: &ParsedProgram,
     ) -> Self {
@@ -1771,7 +1771,7 @@ fn builtin_token(builtin: SystemIrBuiltin) -> u8 {
 
 fn definition_register_types(
     current_definition: Option<&str>,
-    register_contracts: &BTreeMap<String, Vec<crate::trellis::RegisterContract>>,
+    register_contracts: &BTreeMap<String, Vec<crate::ricochet::RegisterContract>>,
 ) -> BTreeMap<String, SystemIrValueType> {
     let Some(current_definition) = current_definition else {
         return BTreeMap::new();

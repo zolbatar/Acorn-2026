@@ -1,7 +1,7 @@
 //! Host-directory-backed filing system with RISC OS-style guest paths.
 //!
 //! File contents remain ordinary host files. Per-file catalogue attributes are
-//! kept in checked-in `*.acornmeta` sidecars and are never stored in host
+//! kept in checked-in `*.ricochetmeta` sidecars and are never stored in host
 //! extended attributes.
 
 use std::{
@@ -15,15 +15,19 @@ use crate::{error::RuntimeError, memory::FileSystemContext};
 
 pub const HOST_FS_NAME: &str = "HOSTFS";
 pub const DEFAULT_VOLUME_NAME: &str = "DemoDisk";
-pub const VOLUME_DESCRIPTOR: &str = ".acorn-volume";
-pub const METADATA_SUFFIX: &str = ".acornmeta";
+pub const VOLUME_DESCRIPTOR: &str = ".ricochet-volume";
+pub const METADATA_SUFFIX: &str = ".ricochetmeta";
 pub const FILETYPE_TEXT: u32 = 0xFFF;
 pub const FILETYPE_BASIC: u32 = 0xFFB;
-/// Acorn-2026 local user-range type for UTF-8 BASIC64 source.
+/// Ricochet local user-range type for UTF-8 BASIC64 source.
 pub const FILETYPE_BASIC64: u32 = 0x064;
 
-const METADATA_MAGIC: &str = "Acorn-2026 file metadata v1";
-const VOLUME_MAGIC: &str = "Acorn-2026 folder volume v1";
+const METADATA_MAGIC: &str = "Ricochet file metadata v1";
+const VOLUME_MAGIC: &str = "Ricochet folder volume v1";
+const LEGACY_VOLUME_DESCRIPTOR: &str = ".acorn-volume";
+const LEGACY_METADATA_SUFFIX: &str = ".acornmeta";
+const LEGACY_METADATA_MAGIC: &str = "Acorn-2026 file metadata v1";
+const LEGACY_VOLUME_MAGIC: &str = "Acorn-2026 folder volume v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileMetadata {
@@ -80,7 +84,8 @@ pub struct HostFileSystem {
 
 impl HostFileSystem {
     pub fn demo_default() -> Self {
-        let root = std::env::var_os("ACORN_DEMO_VOLUME")
+        let root = std::env::var_os("RICOCHET_DEMO_VOLUME")
+            .or_else(|| std::env::var_os("ACORN_DEMO_VOLUME"))
             .map(PathBuf::from)
             .unwrap_or_else(|| {
                 std::env::current_dir()
@@ -119,6 +124,7 @@ impl HostFileSystem {
             let _ = fs::remove_file(temporary_path);
             return Err(RuntimeError::Io(error));
         }
+        let _ = fs::remove_file(self.root.join(LEGACY_VOLUME_DESCRIPTOR));
         self.volume_name = name.trim().to_string();
         Ok(())
     }
@@ -330,10 +336,17 @@ impl HostFileSystem {
         for entry in fs::read_dir(&resolved.host_path)? {
             let entry = entry?;
             let file_name = entry.file_name().to_string_lossy().into_owned();
-            if file_name == VOLUME_DESCRIPTOR {
+            if file_name == VOLUME_DESCRIPTOR || file_name == LEGACY_VOLUME_DESCRIPTOR {
                 continue;
             }
-            if file_name.ends_with(METADATA_SUFFIX) {
+            let suffix = if file_name.ends_with(METADATA_SUFFIX) {
+                Some(METADATA_SUFFIX)
+            } else if file_name.ends_with(LEGACY_METADATA_SUFFIX) {
+                Some(LEGACY_METADATA_SUFFIX)
+            } else {
+                None
+            };
+            if let Some(suffix) = suffix {
                 let file_type = entry.file_type()?;
                 if file_type.is_symlink() {
                     return Err(fs_error(
@@ -343,11 +356,16 @@ impl HostFileSystem {
                 if !file_type.is_file() {
                     continue;
                 }
-                let payload_name = file_name
-                    .strip_suffix(METADATA_SUFFIX)
-                    .unwrap_or_default()
-                    .to_string();
-                sidecars.insert(payload_name, entry.path());
+                let payload_name = file_name.strip_suffix(suffix).unwrap_or_default();
+                if suffix == LEGACY_METADATA_SUFFIX
+                    && resolved
+                        .host_path
+                        .join(format!("{payload_name}{METADATA_SUFFIX}"))
+                        .exists()
+                {
+                    continue;
+                }
+                sidecars.insert(payload_name.to_string(), entry.path());
                 continue;
             }
             let file_type = entry.file_type()?;
@@ -376,7 +394,7 @@ impl HostFileSystem {
             let sidecar = if let Some(sidecar) = sidecars.get(&file_name) {
                 Some(sidecar.clone())
             } else {
-                regular_file_if_present(&metadata_path(&entry.path()))?
+                regular_file_if_present(&metadata_path_for_read(&entry.path()))?
             };
             let metadata = match sidecar {
                 Some(sidecar) => read_metadata(&sidecar)?,
@@ -604,9 +622,13 @@ impl HostFileSystem {
             return Err(fs_error(format!("'{}' is a directory", path)));
         }
         fs::remove_file(&resolved.host_path)?;
-        let sidecar = metadata_path(&resolved.host_path);
-        if sidecar.exists() {
-            fs::remove_file(sidecar)?;
+        for sidecar in [
+            metadata_path(&resolved.host_path),
+            legacy_metadata_path(&resolved.host_path),
+        ] {
+            if sidecar.exists() {
+                fs::remove_file(sidecar)?;
+            }
         }
         Ok(())
     }
@@ -661,7 +683,7 @@ impl HostFileSystem {
         if destination.exists() {
             return Err(fs_error("destination already exists"));
         }
-        let sidecar = metadata_path(&source.host_path);
+        let sidecar = metadata_path_for_read(&source.host_path);
         if source.is_directory {
             fs::rename(source.host_path, destination)?;
         } else {
@@ -691,7 +713,7 @@ impl HostFileSystem {
         &self,
         path: &Path,
     ) -> Result<Option<FileMetadata>, RuntimeError> {
-        let sidecar = metadata_path(path);
+        let sidecar = metadata_path_for_read(path);
         if let Some(sidecar) = regular_file_if_present(&sidecar)? {
             return read_metadata(&sidecar).map(Some);
         }
@@ -754,7 +776,11 @@ impl HostFileSystem {
         for entry in fs::read_dir(directory)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name == VOLUME_DESCRIPTOR || name.ends_with(METADATA_SUFFIX) {
+            if name == VOLUME_DESCRIPTOR
+                || name == LEGACY_VOLUME_DESCRIPTOR
+                || name.ends_with(METADATA_SUFFIX)
+                || name.ends_with(LEGACY_METADATA_SUFFIX)
+            {
                 continue;
             }
             if entry.file_type()?.is_symlink() {
@@ -764,7 +790,7 @@ impl HostFileSystem {
                 return Ok(Some(entry));
             }
             if entry.file_type()?.is_file() {
-                let sidecar = metadata_path(&entry.path());
+                let sidecar = metadata_path_for_read(&entry.path());
                 if regular_file_if_present(&sidecar)?.is_some() {
                     let metadata = read_metadata(&sidecar)?;
                     if metadata.guest_name.eq_ignore_ascii_case(guest_name) {
@@ -783,10 +809,25 @@ pub fn metadata_path(file_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+fn legacy_metadata_path(file_path: &Path) -> PathBuf {
+    let mut name = file_path.as_os_str().to_os_string();
+    name.push(LEGACY_METADATA_SUFFIX);
+    PathBuf::from(name)
+}
+
+fn metadata_path_for_read(file_path: &Path) -> PathBuf {
+    let current = metadata_path(file_path);
+    if current.exists() {
+        current
+    } else {
+        legacy_metadata_path(file_path)
+    }
+}
+
 pub fn read_metadata(path: &Path) -> Result<FileMetadata, RuntimeError> {
     let contents = fs::read_to_string(path)?;
     let mut lines = contents.lines();
-    if lines.next() != Some(METADATA_MAGIC) {
+    if !matches!(lines.next(), Some(METADATA_MAGIC | LEGACY_METADATA_MAGIC)) {
         return Err(fs_error(format!(
             "unsupported metadata sidecar format in {}",
             path.display()
@@ -823,7 +864,7 @@ pub fn write_metadata(path: &Path, metadata: &FileMetadata) -> Result<(), Runtim
     if !valid_guest_leaf(&metadata.guest_name) {
         return Err(fs_error("invalid guest name in metadata"));
     }
-    let temporary = path.with_extension(format!("acornmeta.tmp-{}", std::process::id()));
+    let temporary = path.with_extension(format!("ricochetmeta.tmp-{}", std::process::id()));
     let contents = format!(
         "{METADATA_MAGIC}\nformat-version=1\nguest-name={}\nfile-type=0x{:08X}\nload-address=0x{:08X}\nexecution-address=0x{:08X}\nattributes=0x{:08X}\n",
         percent_encode(&metadata.guest_name),
@@ -834,7 +875,17 @@ pub fn write_metadata(path: &Path, metadata: &FileMetadata) -> Result<(), Runtim
     );
     fs::write(&temporary, contents)?;
     match fs::rename(&temporary, path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if let Some(file_name) = path.file_name().and_then(|name| name.to_str())
+                && let Some(payload_name) = file_name.strip_suffix(METADATA_SUFFIX)
+                && let Some(parent) = path.parent()
+            {
+                let mut legacy_name = payload_name.to_string();
+                legacy_name.push_str(LEGACY_METADATA_SUFFIX);
+                let _ = fs::remove_file(parent.join(legacy_name));
+            }
+            Ok(())
+        }
         Err(error) => {
             let _ = fs::remove_file(&temporary);
             Err(RuntimeError::Io(error))
@@ -905,14 +956,19 @@ fn split_device_prefix(path: &str) -> (Option<&str>, Option<&str>, &str) {
 }
 
 fn read_volume_name(root: &Path) -> Option<String> {
-    let descriptor_path = root.join(VOLUME_DESCRIPTOR);
+    let current_path = root.join(VOLUME_DESCRIPTOR);
+    let descriptor_path = if current_path.exists() {
+        current_path
+    } else {
+        root.join(LEGACY_VOLUME_DESCRIPTOR)
+    };
     let descriptor_metadata = fs::symlink_metadata(&descriptor_path).ok()?;
     if descriptor_metadata.file_type().is_symlink() || !descriptor_metadata.is_file() {
         return None;
     }
     let descriptor = fs::read_to_string(descriptor_path).ok()?;
     let mut lines = descriptor.lines();
-    if lines.next()? != VOLUME_MAGIC {
+    if !matches!(lines.next()?, VOLUME_MAGIC | LEGACY_VOLUME_MAGIC) {
         return None;
     }
     lines.find_map(|line| {

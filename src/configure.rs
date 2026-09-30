@@ -14,9 +14,12 @@ use std::{
 use crate::display::{DesktopResolution, DisplayColour, DisplaySettings};
 use crate::graphics::GraphicsProfile;
 
-const CONFIG_HEADER: &str = "# Acorn-2026 MOS configuration v3";
-const CONFIG_V1_HEADER: &str = "# Acorn-2026 MOS configuration v1";
-const CONFIG_V2_HEADER: &str = "# Acorn-2026 MOS configuration v2";
+const CONFIG_HEADER: &str = "# Ricochet MOS configuration v3";
+const CONFIG_V1_HEADER: &str = "# Ricochet MOS configuration v1";
+const CONFIG_V2_HEADER: &str = "# Ricochet MOS configuration v2";
+const LEGACY_CONFIG_V1_HEADER: &str = "# Acorn-2026 MOS configuration v1";
+const LEGACY_CONFIG_V2_HEADER: &str = "# Acorn-2026 MOS configuration v2";
+const LEGACY_CONFIG_V3_HEADER: &str = "# Acorn-2026 MOS configuration v3";
 /// Keep startup parsing and recovery memory bounded even if the selected file
 /// is corrupt or unexpectedly large. Valid configuration rows need far less.
 const MAX_STORED_CONFIGURATION_BYTES: usize = 64 * 1024;
@@ -391,9 +394,10 @@ impl BasicConfiguration {
     fn parse_stored(contents: &str) -> Result<Self, (ConfigurationRecoveryKind, String)> {
         let mut headers = contents.lines().filter_map(|line| {
             let line = line.trim();
-            line.to_ascii_lowercase()
-                .starts_with("# acorn-2026 mos configuration")
-                .then_some(line)
+            let lowered = line.to_ascii_lowercase();
+            (lowered.starts_with("# ricochet mos configuration")
+                || lowered.starts_with("# acorn-2026 mos configuration"))
+            .then_some(line)
         });
         let first_header = headers.next();
         if headers.next().is_some() {
@@ -404,9 +408,24 @@ impl BasicConfiguration {
         }
         let version = match first_header {
             None => None,
-            Some(header) if header.eq_ignore_ascii_case(CONFIG_V1_HEADER) => Some(1),
-            Some(header) if header.eq_ignore_ascii_case(CONFIG_V2_HEADER) => Some(2),
-            Some(header) if header.eq_ignore_ascii_case(CONFIG_HEADER) => Some(3),
+            Some(header)
+                if header.eq_ignore_ascii_case(CONFIG_V1_HEADER)
+                    || header.eq_ignore_ascii_case(LEGACY_CONFIG_V1_HEADER) =>
+            {
+                Some(1)
+            }
+            Some(header)
+                if header.eq_ignore_ascii_case(CONFIG_V2_HEADER)
+                    || header.eq_ignore_ascii_case(LEGACY_CONFIG_V2_HEADER) =>
+            {
+                Some(2)
+            }
+            Some(header)
+                if header.eq_ignore_ascii_case(CONFIG_HEADER)
+                    || header.eq_ignore_ascii_case(LEGACY_CONFIG_V3_HEADER) =>
+            {
+                Some(3)
+            }
             Some(_) => {
                 return Err((
                     ConfigurationRecoveryKind::UnsupportedVersion,
@@ -481,6 +500,7 @@ impl BasicConfiguration {
                     "WINDOWFURNITURE"
                         | "DISPLAYRESOLUTION"
                         | "DISPLAYCOLOUR"
+                        | "RICOCHETOUTPUTPROFILE"
                         | "TRELLISOUTPUTPROFILE"
                 )
             {
@@ -513,7 +533,7 @@ impl BasicConfiguration {
                 // v2 renderer-profile rows are accepted only to migrate old
                 // files. A WimpMode selector (or a v1 display pair) is the
                 // single source of truth for both size and colour depth.
-                "TRELLISOUTPUTPROFILE" => {}
+                "RICOCHETOUTPUTPROFILE" | "TRELLISOUTPUTPROFILE" => {}
                 _ => {
                     configuration.set(option, value).map_err(|error| {
                         format!("configuration line {}: {error}", line_index + 1)
@@ -769,7 +789,7 @@ impl ConfigureStore {
         recovery: Option<&ConfigurationRecovery>,
     ) -> Result<bool, String> {
         let path = self.path.as_ref().ok_or_else(|| {
-            "no user configuration directory is available; set ACORN_CONFIG_PATH".to_string()
+            "no user configuration directory is available; set RICOCHET_CONFIG_PATH".to_string()
         })?;
         if let Some(parent) = path
             .parent()
@@ -976,42 +996,64 @@ fn create_recovery_file_copy(path: &std::path::Path) -> Result<PathBuf, String> 
 }
 
 fn default_config_path() -> Option<PathBuf> {
-    if let Some(path) = env::var_os("ACORN_CONFIG_PATH") {
+    if let Some(path) = env::var_os("RICOCHET_CONFIG_PATH")
+        .or_else(|| env::var_os("ACORN_CONFIG_PATH"))
+    {
         return Some(PathBuf::from(path));
     }
 
     #[cfg(target_os = "macos")]
     {
         return env::var_os("HOME").map(|home| {
-            PathBuf::from(home)
-                .join("Library")
-                .join("Application Support")
-                .join("Acorn-2026")
-                .join("configure")
+            let support = PathBuf::from(home).join("Library").join("Application Support");
+            migrate_config_path(
+                support.join("Ricochet").join("configure"),
+                support.join("Acorn-2026").join("configure"),
+            )
         });
     }
 
     #[cfg(target_os = "windows")]
     {
-        return env::var_os("APPDATA")
-            .map(|app_data| PathBuf::from(app_data).join("Acorn-2026").join("configure"));
+        return env::var_os("APPDATA").map(|app_data| {
+            let app_data = PathBuf::from(app_data);
+            migrate_config_path(
+                app_data.join("Ricochet").join("configure"),
+                app_data.join("Acorn-2026").join("configure"),
+            )
+        });
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         if let Some(config_home) = env::var_os("XDG_CONFIG_HOME") {
-            return Some(
-                PathBuf::from(config_home)
-                    .join("acorn-2026")
-                    .join("configure"),
-            );
+            let config_home = PathBuf::from(config_home);
+            return Some(migrate_config_path(
+                config_home.join("ricochet").join("configure"),
+                config_home.join("acorn-2026").join("configure"),
+            ));
         }
         env::var_os("HOME").map(|home| {
-            PathBuf::from(home)
-                .join(".config")
-                .join("acorn-2026")
-                .join("configure")
+            let config_home = PathBuf::from(home).join(".config");
+            migrate_config_path(
+                config_home.join("ricochet").join("configure"),
+                config_home.join("acorn-2026").join("configure"),
+            )
         })
+    }
+}
+
+fn migrate_config_path(current: PathBuf, legacy: PathBuf) -> PathBuf {
+    if current.exists() || !legacy.exists() {
+        return current;
+    }
+    let Some(parent) = current.parent() else {
+        return legacy;
+    };
+    if fs::create_dir_all(parent).is_ok() && fs::rename(&legacy, &current).is_ok() {
+        current
+    } else {
+        legacy
     }
 }
 
@@ -1044,7 +1086,7 @@ mod tests {
     fn temporary_path() -> PathBuf {
         let sequence = NEXT_TEMP_PATH.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "acorn-2026-configure-test-{}-{sequence}",
+            "ricochet-configure-test-{}-{sequence}",
             std::process::id()
         ))
     }
@@ -1083,7 +1125,7 @@ mod tests {
         assert!(!old.serialized().contains("DisplayResolution"));
         assert!(!old.serialized().contains("DisplayColour"));
         assert!(old.set("WindowFurniture", "Flat").is_err());
-        assert!(old.set("TrellisOutputProfile", "BW").is_err());
+        assert!(old.set("RicochetOutputProfile", "BW").is_err());
 
         let auto = BasicConfiguration::parse(
             "DisplayResolution=Window\nDisplayColour=BW\nWindowFurniture=Bevelled\n",
@@ -1159,7 +1201,7 @@ mod tests {
             "WindowFurniture=Flat\n",
             "DisplayResolution=Window\n",
             "DisplayColour=16MRGB888\n",
-            "TrellisOutputProfile=16MRGB888\n",
+            "RicochetOutputProfile=16MRGB888\n",
         ] {
             let result = store.replace_from_payload(&format!("{base}{obsolete}"));
             assert!(
@@ -1186,7 +1228,7 @@ mod tests {
         }
         assert!(store.set("BASICMode", "Strict").is_err());
         assert!(store.set("BASICProfile", "bad profile").is_err());
-        assert!(store.set("TrellisOutputProfile", "BW").is_err());
+        assert!(store.set("RicochetOutputProfile", "BW").is_err());
         for value in ["MOS", "Desktop", "1", "4", "2_100", "&4"] {
             assert!(store.set("Language", value).is_err(), "accepted {value}");
         }
@@ -1255,7 +1297,7 @@ mod tests {
         assert_eq!(windowed.display.colour, DisplayColour::Rgb888);
 
         let v2_conflict = BasicConfiguration::parse(
-            "# Acorn-2026 MOS configuration v2\nWimpMode=X800 Y600 C16\nTrellisOutputProfile=BW\nDisplayResolution=640x480\nDisplayColour=BW\n",
+            "# Ricochet MOS configuration v2\nWimpMode=X800 Y600 C16\nRicochetOutputProfile=BW\nDisplayResolution=640x480\nDisplayColour=BW\n",
         )
         .unwrap();
         assert_eq!(
@@ -1268,7 +1310,7 @@ mod tests {
     #[test]
     fn malformed_stored_configuration_uses_defaults_until_explicit_save_and_keeps_bytes() {
         let path = temporary_path();
-        let original = b"# Acorn-2026 MOS configuration v3\nLanguage=3\n";
+        let original = b"# Ricochet MOS configuration v3\nLanguage=3\n";
         fs::write(&path, original).unwrap();
         let store = ConfigureStore::with_path(&path);
 
@@ -1292,7 +1334,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("# Acorn-2026 MOS configuration v3\n")
+                .starts_with("# Ricochet MOS configuration v3\n")
         );
         let copies = recovery_copies(&path);
         assert_eq!(copies.len(), 1);
@@ -1308,23 +1350,23 @@ mod tests {
         let rows = "Language=0\nBASICMode=Auto\nBASICProfile=Auto\nBASICTarget=Auto\nBASICEngine=Interpreter\nWimpMode=Auto\n";
         for (contents, expected_kind) in [
             (
-                format!("# Acorn-2026 MOS configuration v99\n{rows}"),
+                format!("# Ricochet MOS configuration v99\n{rows}"),
                 ConfigurationRecoveryKind::UnsupportedVersion,
             ),
             (
                 format!(
-                    "# Acorn-2026 MOS configuration v3\n# Acorn-2026 MOS configuration v3\n{rows}"
+                    "# Ricochet MOS configuration v3\n# Ricochet MOS configuration v3\n{rows}"
                 ),
                 ConfigurationRecoveryKind::Malformed,
             ),
             (
                 format!(
-                    "# Acorn-2026 MOS configuration v3\n# Acorn-2026 MOS configuration v99\n{rows}"
+                    "# Ricochet MOS configuration v3\n# Ricochet MOS configuration v99\n{rows}"
                 ),
                 ConfigurationRecoveryKind::Malformed,
             ),
             (
-                format!("# Acorn-2026 MOS configuration\n{rows}"),
+                format!("# Ricochet MOS configuration\n{rows}"),
                 ConfigurationRecoveryKind::UnsupportedVersion,
             ),
         ] {

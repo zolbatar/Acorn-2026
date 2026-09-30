@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use acorn_2026::{
+use ricochet::{
     error::RuntimeError,
     memory::Task,
     runtime::Runtime,

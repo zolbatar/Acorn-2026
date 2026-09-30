@@ -39,7 +39,7 @@ pub const WIMP_SET_EXTENT: u32 = 0x400D7;
 pub const WIMP_FORCE_REDRAW: u32 = 0x400D1;
 pub const WIMP_CLOSE_DOWN: u32 = 0x400DD;
 pub const WIMP_START_TASK: u32 = 0x400DE;
-/// Acorn-2026 extension SWI: Wimp_CreateIcon with an optional 2× RGBA asset.
+/// Ricochet extension SWI: Wimp_CreateIcon with an optional 2× RGBA asset.
 pub const WIMP_CREATE_ICON_EX: u32 = 0x4FF02;
 
 const TASK_MAGIC: u32 = 0x4B53_4154;
@@ -836,6 +836,15 @@ impl WimpServer {
             WIMP_START_TASK => self.start_task(task, context),
             _ => Err(RuntimeError::InvalidSwi(swi)),
         }
+    }
+
+    pub(crate) fn console_work_area(&self, task_id: u64) -> Option<WorkArea> {
+        let state = self.state.lock().ok()?;
+        state
+            .windows
+            .values()
+            .find(|window| window.console_window && window.owner_task_id == task_id && window.open)
+            .map(|window| window.work_area)
     }
 
     pub fn desktop_windows(&self) -> Vec<DesktopWindow> {
@@ -5221,7 +5230,7 @@ mod tests {
     fn temporary_config_path() -> PathBuf {
         let sequence = NEXT_CONFIG_PATH.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "acorn-2026-wimp-display-test-{}-{sequence}",
+            "ricochet-wimp-display-test-{}-{sequence}",
             std::process::id()
         ))
     }
@@ -6659,7 +6668,7 @@ mod tests {
     fn failed_display_persistence_keeps_the_active_metrics_unchanged() {
         let server = new_server();
         server.set_configure_store(
-            ConfigureStore::with_path("/proc/self/acorn-2026-display-test/configure"),
+            ConfigureStore::with_path("/proc/self/ricochet-display-test/configure"),
             DisplaySettings::default(),
         );
         let before_metrics = server.desktop_metrics();

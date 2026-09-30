@@ -54,7 +54,7 @@ fn run_frontend(desktop_demo: bool) -> Result<(), Box<dyn Error>> {
                     "{}/examples/wimp/two-windows/alpha.bas64",
                     env!("CARGO_MANIFEST_DIR")
                 ))?,
-                "acorn-basic-alpha",
+                "ricochet-basic-alpha",
             ),
             (
                 102,
@@ -62,7 +62,7 @@ fn run_frontend(desktop_demo: bool) -> Result<(), Box<dyn Error>> {
                     "{}/examples/wimp/two-windows/beta.bas64",
                     env!("CARGO_MANIFEST_DIR")
                 ))?,
-                "acorn-basic-beta",
+                "ricochet-basic-beta",
             ),
         ])
     } else {
@@ -71,7 +71,7 @@ fn run_frontend(desktop_demo: bool) -> Result<(), Box<dyn Error>> {
     let (updates, update_receiver) = mpsc::channel();
     let update_proxy = proxy.clone();
     thread::Builder::new()
-        .name("acorn-wimp-desktop-updates".into())
+        .name("ricochet-wimp-desktop-updates".into())
         .spawn(move || {
             while update_receiver.recv().is_ok() {
                 if update_proxy
@@ -85,7 +85,7 @@ fn run_frontend(desktop_demo: bool) -> Result<(), Box<dyn Error>> {
     let wimp = WimpServer::new(updates);
 
     thread::Builder::new()
-        .name("acorn-window-events".into())
+        .name("ricochet-window-events".into())
         .spawn(move || {
             while let Ok(event) = display_receiver.recv() {
                 if proxy.send_event(WindowUserEvent::Display(event)).is_err() {
@@ -120,7 +120,7 @@ fn run_frontend(desktop_demo: bool) -> Result<(), Box<dyn Error>> {
         let runtime_display_sender = display_sender.clone();
         let runtime_wimp = wimp.clone();
         thread::Builder::new()
-            .name("acorn-basic-runtime".into())
+            .name("ricochet-basic-runtime".into())
             .spawn(move || {
                 let mut runtime = Runtime::windowed_with_desktop(
                     input_receiver,
@@ -230,7 +230,7 @@ impl WindowApp {
             return;
         }
         let Some(wimp) = self.wimp_service.clone() else {
-            eprintln!("Acorn-2026 received DESKTOP without a hosted Wimp service");
+            eprintln!("Ricochet received DESKTOP without a hosted Wimp service");
             return;
         };
         // Resize while this is still the MOS display; resize_buffer intentionally
@@ -244,9 +244,9 @@ impl WindowApp {
         self.drag = None;
         self.desktop = Some(wimp);
         if let Some(wimp) = &self.wimp_service
-            && let Err(error) = wimp.start_system_task("$.System.Desktop", "Acorn Desktop")
+            && let Err(error) = wimp.start_system_task("$.System.Desktop", "Desktop")
         {
-            wimp.post_notice(format!("Could not start Acorn Desktop: {error}"));
+            wimp.post_notice(format!("Could not start Desktop: {error}"));
         }
         self.request_redraw();
     }
@@ -263,7 +263,7 @@ impl WindowApp {
             let title = request.title.clone();
             let guest_path = request.guest_path.clone();
             match thread::Builder::new()
-                .name(format!("acorn-task-{}", request.task_id))
+                .name(format!("ricochet-task-{}", request.task_id))
                 .spawn(move || {
                     let mut runtime = Runtime::desktop_task(
                         request.task_id,
@@ -340,7 +340,7 @@ impl WindowApp {
         let result = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text());
         match result {
             Ok(text) => self.send_pasted_text(&text),
-            Err(error) => eprintln!("Acorn-2026 clipboard paste failed: {error}"),
+            Err(error) => eprintln!("Ricochet clipboard paste failed: {error}"),
         }
     }
 
@@ -405,7 +405,7 @@ impl WindowApp {
                     &mut self.graphics
                 };
                 if let Err(error) = graphics.write_byte(byte) {
-                    eprintln!("Acorn-2026 display state error: {error}");
+                    eprintln!("Ricochet display state error: {error}");
                 }
                 if self.desktop.is_none() {
                     let mode = self.graphics.snapshot().mode;
@@ -440,7 +440,7 @@ impl WindowApp {
                     graphics.plot(code, x, y)
                 };
                 if let Err(error) = result {
-                    eprintln!("Acorn-2026 graphics state error: {error}");
+                    eprintln!("Ricochet graphics state error: {error}");
                 }
             }
             DisplayEvent::GraphicsSnapshot {
@@ -668,7 +668,7 @@ impl ApplicationHandler<WindowUserEvent> for WindowApp {
             )
         };
         let attributes = Window::default_attributes()
-            .with_title("Acorn-2026")
+            .with_title("Ricochet")
             .with_inner_size(LogicalSize::new(
                 f64::from(frame_size.0) * scale,
                 f64::from(frame_size.1) * scale,
@@ -677,7 +677,7 @@ impl ApplicationHandler<WindowUserEvent> for WindowApp {
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {
-                eprintln!("Acorn-2026 could not create its window: {error}");
+                eprintln!("Ricochet could not create its window: {error}");
                 event_loop.exit();
                 return;
             }
@@ -686,7 +686,7 @@ impl ApplicationHandler<WindowUserEvent> for WindowApp {
         let gpu = match VelloSurface::new(window.clone()) {
             Ok(gpu) => gpu,
             Err(error) => {
-                eprintln!("Acorn-2026 could not initialize Vello/wgpu: {error}");
+                eprintln!("Ricochet could not initialize Vello/wgpu: {error}");
                 event_loop.exit();
                 return;
             }
@@ -807,6 +807,7 @@ impl ApplicationHandler<WindowUserEvent> for WindowApp {
                         self.graphics.snapshot(),
                         size.width,
                         size.height,
+                        window.scale_factor(),
                     )
                 };
                 if let Some(gpu) = &mut self.gpu {
@@ -816,7 +817,7 @@ impl ApplicationHandler<WindowUserEvent> for WindowApp {
                         .map(|wimp| wimp.display_settings().colour)
                         .unwrap_or(DisplayColour::Rgb888);
                     if let Err(error) = gpu.render(&scene, colour) {
-                        eprintln!("Acorn-2026 could not present its Vello scene: {error}");
+                        eprintln!("Ricochet could not present its Vello scene: {error}");
                         event_loop.exit();
                     }
                 }
@@ -992,7 +993,7 @@ mod tests {
     #[test]
     fn window_metrics_follow_host_resizes_and_fixed_metrics_keep_their_extent() {
         let path = std::env::temp_dir().join(format!(
-            "acorn-window-display-settings-{}.cfg",
+            "ricochet-window-display-settings-{}.cfg",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);

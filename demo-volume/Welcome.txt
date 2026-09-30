@@ -1,4 +1,4 @@
-Welcome to Acorn-2026!
+Welcome to Ricochet!
 
 This is a small plain text file on DemoDisk.
 Its RISC OS filetype is Text (&FFF).

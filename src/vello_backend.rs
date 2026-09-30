@@ -47,7 +47,7 @@ struct OutputProcessor {
 impl OutputProcessor {
     fn new(device: &Device, queue: &Queue, target_format: TextureFormat) -> Self {
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Acorn-2026 display output bindings"),
+            label: Some("Ricochet display output bindings"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -82,16 +82,16 @@ impl OutputProcessor {
             ],
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Acorn-2026 display output shader"),
+            label: Some("Ricochet display output shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("display_output.wgsl").into()),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Acorn-2026 display output pipeline layout"),
+            label: Some("Ricochet display output pipeline layout"),
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Acorn-2026 display output pipeline"),
+            label: Some("Ricochet display output pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -116,7 +116,7 @@ impl OutputProcessor {
             cache: None,
         });
         let parameters = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Acorn-2026 display output parameters"),
+            label: Some("Ricochet display output parameters"),
             size: 16,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -184,7 +184,7 @@ impl OutputProcessor {
                 _ => &self.fallback_palette.view,
             };
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Acorn-2026 display output bind group"),
+                label: Some("Ricochet display output bind group"),
                 layout: &self.layout,
                 entries: &[
                     wgpu::BindGroupEntry {
@@ -211,11 +211,11 @@ impl OutputProcessor {
         queue.write_buffer(&self.parameters, 0, &parameters);
 
         let mut pass = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Acorn-2026 display output encoder"),
+            label: Some("Ricochet display output encoder"),
         });
         {
             let mut render_pass = pass.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Acorn-2026 display output pass"),
+                label: Some("Ricochet display output pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: target,
                     depth_slice: None,
@@ -246,7 +246,7 @@ fn create_palette_lookup(
     dimension: u32,
 ) -> PaletteLookup {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("Acorn-2026 desktop colour lookup"),
+        label: Some("Ricochet desktop colour lookup"),
         size: wgpu::Extent3d {
             width: dimension,
             height: dimension,
@@ -358,7 +358,7 @@ impl VelloSurface {
         }))
         .map_err(|error| format!("could not find a compute-capable graphics adapter: {error}"))?;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("Acorn-2026 Vello device"),
+            label: Some("Ricochet Vello device"),
             required_features: wgpu::Features::empty(),
             required_limits: adapter.limits(),
             memory_hints: wgpu::MemoryHints::Performance,
@@ -437,7 +437,7 @@ impl VelloSurface {
         if !matches {
             self.output_processor.invalidate_binding();
             let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Acorn-2026 Vello scene target"),
+                label: Some("Ricochet Vello scene target"),
                 size: wgpu::Extent3d {
                     width,
                     height,
@@ -516,7 +516,7 @@ impl VelloSurface {
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Acorn-2026 Vello present encoder"),
+                    label: Some("Ricochet Vello present encoder"),
                 });
             let source = if self.config.format.is_srgb() {
                 self.scene_srgb_view.as_ref().unwrap()
@@ -764,11 +764,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a GPU; run with ACORN_VELLO_SNAPSHOT=1 and --ignored"]
+    #[ignore = "requires a GPU; run with RICOCHET_VELLO_SNAPSHOT=1 and --ignored"]
     fn gpu_output_profiles_quantize_for_unorm_and_srgb_presentation() {
         assert!(
-            std::env::var_os("ACORN_VELLO_SNAPSHOT").is_some(),
-            "set ACORN_VELLO_SNAPSHOT=1 to opt into real GPU rendering"
+            std::env::var_os("RICOCHET_VELLO_SNAPSHOT")
+                .or_else(|| std::env::var_os("ACORN_VELLO_SNAPSHOT"))
+                .is_some(),
+            "set RICOCHET_VELLO_SNAPSHOT=1 to opt into real GPU rendering"
         );
 
         let scene = test_scene();

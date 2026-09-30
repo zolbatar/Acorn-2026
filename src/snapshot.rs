@@ -174,7 +174,7 @@ pub fn write_display_manager_snapshots(directory: impl AsRef<Path>) -> Result<()
     let directory = directory.as_ref().to_path_buf();
     fs::create_dir_all(&directory)?;
     let configure_path = std::env::temp_dir().join(format!(
-        "acorn-2026-display-snapshot-{}-{}.configure",
+        "ricochet-display-snapshot-{}-{}.configure",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -190,7 +190,7 @@ pub fn write_display_manager_snapshots(directory: impl AsRef<Path>) -> Result<()
     let (desktop_updates, _desktop_update_receiver) = mpsc::channel();
     let wimp = WimpServer::new(desktop_updates);
     wimp.set_configure_store(configure.clone(), initial_settings);
-    wimp.task_started(DESKTOP_TASK, "Acorn Desktop")?;
+    wimp.task_started(DESKTOP_TASK, "Desktop")?;
 
     let desktop_source = fs::read_to_string(format!(
         "{}/demo-volume/System/Desktop.bas64",
@@ -740,7 +740,7 @@ fn write_filer_snapshot_mode(
     let (task_error_sender, task_error_receiver) = mpsc::channel();
     let (desktop_updates, _desktop_update_receiver) = mpsc::channel();
     let wimp = WimpServer::new(desktop_updates);
-    wimp.task_started(DESKTOP_TASK, "Acorn Desktop")?;
+    wimp.task_started(DESKTOP_TASK, "Desktop")?;
 
     let mut guests = Vec::new();
     let desktop_source = fs::read_to_string(format!(
@@ -974,7 +974,10 @@ fn capture_filer_desktop_scene(wimp: &WimpServer) -> FilerDesktopScene {
 }
 
 fn write_filer_desktop_scene(path: &Path, scene: &FilerDesktopScene) -> io::Result<()> {
-    if std::env::var_os("ACORN_VELLO_SNAPSHOT").is_some() {
+    if std::env::var_os("RICOCHET_VELLO_SNAPSHOT")
+        .or_else(|| std::env::var_os("ACORN_VELLO_SNAPSHOT"))
+        .is_some()
+    {
         let mut builder = crate::desktop_scene::DesktopSceneBuilder::new();
         let gpu_scene = builder.build(
             &scene.windows,
@@ -2375,7 +2378,7 @@ mod display_manager_name_tests {
         let (updates, _update_receiver) = mpsc::channel();
         let wimp = WimpServer::new(updates);
         let configure_path = std::env::temp_dir().join(format!(
-            "acorn-2026-display-name-test-{}.configure",
+            "ricochet-display-name-test-{}.configure",
             std::process::id()
         ));
         let _ = fs::remove_file(&configure_path);

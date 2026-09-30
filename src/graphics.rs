@@ -1,6 +1,14 @@
 use crate::error::RuntimeError;
 use std::sync::{Arc, Mutex};
 
+/// The shell text surface is measured in Wimp OS units (two per logical host
+/// pixel). Its 32-unit font size is 16 logical pixels; cell advances and line
+/// spacing match JetBrains Mono at that size without stretching glyphs.
+pub(crate) const MODERN_SHELL_FONT_SIZE_OSU: f32 = 32.0;
+pub(crate) const MODERN_SHELL_CELL_WIDTH_OSU: f64 = 19.2;
+pub(crate) const MODERN_SHELL_LINE_HEIGHT_OSU: f64 = 40.0;
+pub(crate) const MODERN_SHELL_INSET_OSU: f64 = 16.0;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum GraphicsProfile {
     #[default]
@@ -114,9 +122,13 @@ pub struct GraphicsSnapshot {
     pub text_colour: u8,
     pub text_profile: TextRenderingProfile,
     pub text_encoding: TextEncoding,
-    /// Marks the interactive host console, whose scalable text is laid out on
-    /// a host-owned 640x512 virtual surface rather than the guest MODE raster.
+    /// Marks the interactive host console. Its effective grid follows the
+    /// available host client area; guest MODE geometry remains independent.
     pub modern_shell_console: bool,
+    /// Effective host text grid. These equal the guest MODE grid unless this
+    /// snapshot is the responsive Modern shell console.
+    pub text_grid_columns: u16,
+    pub text_grid_rows: u16,
     pub graphics_action: u8,
     pub graphics_colour: u32,
     pub text_cells: Vec<u8>,
@@ -134,16 +146,21 @@ pub struct GraphicsSnapshot {
 }
 
 impl GraphicsSnapshot {
-    /// Virtual coordinate size used to lay out Modern text. The MOS shell has
-    /// a host-owned 4:5 canvas so 80x32 JetBrains Mono cells retain their
-    /// intrinsic width-to-line-height ratio; guests keep their MODE geometry.
-    pub(crate) fn modern_text_surface_size(&self) -> (u32, u32) {
-        if self.modern_shell_console {
-            (640, 512)
-        } else {
-            (self.mode.pixel_width, self.mode.pixel_height)
-        }
+    pub(crate) fn text_grid_size(&self) -> (u16, u16) {
+        (self.text_grid_columns, self.text_grid_rows)
     }
+}
+
+pub(crate) fn modern_shell_grid_for_area(width_osu: i32, height_osu: i32) -> (u16, u16) {
+    let width = (f64::from(width_osu.max(0)) - 2.0 * MODERN_SHELL_INSET_OSU).max(0.0);
+    let height = (f64::from(height_osu.max(0)) - 2.0 * MODERN_SHELL_INSET_OSU).max(0.0);
+    let columns = (width / MODERN_SHELL_CELL_WIDTH_OSU)
+        .floor()
+        .clamp(1.0, 512.0) as u16;
+    let rows = (height / MODERN_SHELL_LINE_HEIGHT_OSU)
+        .floor()
+        .clamp(1.0, 256.0) as u16;
+    (columns, rows)
 }
 
 #[derive(Clone)]
@@ -334,6 +351,8 @@ impl Default for GraphicsService {
                 text_profile: TextRenderingProfile::Classic,
                 text_encoding: TextEncoding::ClassicBytes,
                 modern_shell_console: false,
+                text_grid_columns: mode.text_columns,
+                text_grid_rows: mode.text_rows,
                 graphics_action: 0,
                 graphics_colour: 7,
                 text_cells: vec![
@@ -385,9 +404,13 @@ impl GraphicsService {
     /// destination, including a separate authoritative true-colour raster.
     pub(crate) fn new_window_output(&self) -> Self {
         let mut snapshot = self.snapshot.clone();
-        snapshot.text_cells.fill(b' ');
-        snapshot.modern_text_cells.fill(' ');
+        let guest_cell_count =
+            usize::from(snapshot.mode.text_columns) * usize::from(snapshot.mode.text_rows);
+        snapshot.text_cells = vec![b' '; guest_cell_count];
+        snapshot.modern_text_cells = vec![' '; guest_cell_count];
         snapshot.modern_shell_console = false;
+        snapshot.text_grid_columns = snapshot.mode.text_columns;
+        snapshot.text_grid_rows = snapshot.mode.text_rows;
         snapshot.pending_utf8_bytes.clear();
         snapshot.pending_utf8_expected = 0;
         snapshot.text_cursor = Point::default();
@@ -557,6 +580,9 @@ impl GraphicsService {
         }
         self.flush_incomplete_utf8();
         if self.snapshot.text_profile != profile || self.snapshot.text_encoding != encoding {
+            if self.snapshot.modern_shell_console {
+                self.reset_shell_grid_to_mode();
+            }
             self.snapshot.modern_shell_console = false;
             self.snapshot.text_profile = profile;
             self.snapshot.text_encoding = encoding;
@@ -566,7 +592,7 @@ impl GraphicsService {
     }
 
     /// Select the Runtime-owned Modern text presentation for the interactive
-    /// shell. Its console canvas is separate from the classic guest MODE grid.
+    /// shell. Its responsive host grid is separate from the guest MODE grid.
     pub(crate) fn set_modern_shell_console(&mut self) -> Result<(), RuntimeError> {
         let mut next = self.clone();
         next.set_text_profile(TextRenderingProfile::Modern, TextEncoding::Utf8)?;
@@ -590,6 +616,7 @@ impl GraphicsService {
     ) -> Result<(), RuntimeError> {
         let mut next = self.clone();
         if next.snapshot.modern_shell_console {
+            next.reset_shell_grid_to_mode();
             next.snapshot.modern_shell_console = false;
             next.snapshot.revision = next.snapshot.revision.wrapping_add(1);
         }
@@ -787,6 +814,8 @@ impl GraphicsService {
         self.snapshot.graphics_origin = Point::default();
         self.snapshot.graphics_cursor = Point::default();
         self.snapshot.text_cursor = Point::default();
+        self.snapshot.text_grid_columns = mode.text_columns;
+        self.snapshot.text_grid_rows = mode.text_rows;
         self.snapshot.text_cells =
             vec![b' '; usize::from(mode.text_columns) * usize::from(mode.text_rows)];
         self.snapshot.modern_text_cells =
@@ -809,6 +838,79 @@ impl GraphicsService {
             self.snapshot.primitives.push(primitive);
         }
         self.snapshot.graphics_content_present = true;
+    }
+
+    pub(crate) fn set_modern_shell_text_grid(&mut self, columns: u16, rows: u16) -> bool {
+        if !self.snapshot.modern_shell_console {
+            return false;
+        }
+        let columns = columns.clamp(1, 512);
+        let rows = rows.clamp(1, 256);
+        let old_columns = self.snapshot.text_grid_columns;
+        let old_rows = self.snapshot.text_grid_rows;
+        if (columns, rows) == (old_columns, old_rows) {
+            return false;
+        }
+
+        let mut text_cells = vec![b' '; usize::from(columns) * usize::from(rows)];
+        let mut modern_text_cells = vec![' '; text_cells.len()];
+        for row in 0..usize::from(old_rows.min(rows)) {
+            let copy_columns = usize::from(old_columns.min(columns));
+            let source = row * usize::from(old_columns);
+            let destination = row * usize::from(columns);
+            text_cells[destination..destination + copy_columns]
+                .copy_from_slice(&self.snapshot.text_cells[source..source + copy_columns]);
+            modern_text_cells[destination..destination + copy_columns]
+                .copy_from_slice(&self.snapshot.modern_text_cells[source..source + copy_columns]);
+        }
+
+        let was_full_window = self.snapshot.text_window
+            == (TextWindow {
+                left: 0,
+                top: 0,
+                right: old_columns - 1,
+                bottom: old_rows - 1,
+            });
+        self.snapshot.text_grid_columns = columns;
+        self.snapshot.text_grid_rows = rows;
+        self.snapshot.text_cells = text_cells;
+        self.snapshot.modern_text_cells = modern_text_cells;
+        self.snapshot.text_window = if was_full_window {
+            TextWindow {
+                left: 0,
+                top: 0,
+                right: columns - 1,
+                bottom: rows - 1,
+            }
+        } else {
+            let left = self.snapshot.text_window.left.min(columns - 1);
+            let top = self.snapshot.text_window.top.min(rows - 1);
+            TextWindow {
+                left,
+                top,
+                right: self.snapshot.text_window.right.min(columns - 1).max(left),
+                bottom: self.snapshot.text_window.bottom.min(rows - 1).max(top),
+            }
+        };
+        self.clamp_text_cursor();
+        self.snapshot.revision = self.snapshot.revision.wrapping_add(1);
+        true
+    }
+
+    fn reset_shell_grid_to_mode(&mut self) {
+        let mode = self.snapshot.mode;
+        if self.snapshot.text_grid_columns != mode.text_columns
+            || self.snapshot.text_grid_rows != mode.text_rows
+        {
+            self.snapshot.text_grid_columns = mode.text_columns;
+            self.snapshot.text_grid_rows = mode.text_rows;
+            self.snapshot.text_cells =
+                vec![b' '; usize::from(mode.text_columns) * usize::from(mode.text_rows)];
+            self.snapshot.modern_text_cells =
+                vec![' '; usize::from(mode.text_columns) * usize::from(mode.text_rows)];
+            self.snapshot.text_window = default_text_window(mode);
+            self.snapshot.text_cursor = Point::default();
+        }
     }
 
     pub fn snapshot(&self) -> &GraphicsSnapshot {
@@ -937,6 +1039,8 @@ impl GraphicsService {
         self.snapshot.graphics_origin = Point::default();
         self.snapshot.graphics_cursor = Point::default();
         self.snapshot.text_cursor = Point::default();
+        self.snapshot.text_grid_columns = mode.text_columns;
+        self.snapshot.text_grid_rows = mode.text_rows;
         self.snapshot.text_cells =
             vec![b' '; usize::from(mode.text_columns) * usize::from(mode.text_rows)];
         self.snapshot.modern_text_cells =
@@ -969,10 +1073,10 @@ impl GraphicsService {
     }
 
     fn set_text_window(&mut self, parameters: &[u8]) {
-        let x1 = u16::from(parameters[0]).min(self.snapshot.mode.text_columns - 1);
-        let y1 = u16::from(parameters[1]).min(self.snapshot.mode.text_rows - 1);
-        let x2 = u16::from(parameters[2]).min(self.snapshot.mode.text_columns - 1);
-        let y2 = u16::from(parameters[3]).min(self.snapshot.mode.text_rows - 1);
+        let x1 = u16::from(parameters[0]).min(self.snapshot.text_grid_columns - 1);
+        let y1 = u16::from(parameters[1]).min(self.snapshot.text_grid_rows - 1);
+        let x2 = u16::from(parameters[2]).min(self.snapshot.text_grid_columns - 1);
+        let y2 = u16::from(parameters[3]).min(self.snapshot.text_grid_rows - 1);
         self.snapshot.text_window = TextWindow {
             left: x1.min(x2),
             top: y1.min(y2),
@@ -983,7 +1087,12 @@ impl GraphicsService {
     }
 
     fn reset_windows(&mut self) {
-        self.snapshot.text_window = default_text_window(self.snapshot.mode);
+        self.snapshot.text_window = TextWindow {
+            left: 0,
+            top: 0,
+            right: self.snapshot.text_grid_columns - 1,
+            bottom: self.snapshot.text_grid_rows - 1,
+        };
         self.snapshot.graphics_window = default_graphics_window(self.snapshot.mode);
         self.snapshot.text_cursor = Point::default();
     }
@@ -995,12 +1104,12 @@ impl GraphicsService {
             i32::from(self.snapshot.text_window.bottom - self.snapshot.text_window.top + 1);
         let x = self.snapshot.text_window.left + self.snapshot.text_cursor.x as u16;
         let y = self.snapshot.text_window.top + self.snapshot.text_cursor.y as u16;
-        if x < self.snapshot.mode.text_columns
-            && y < self.snapshot.mode.text_rows
+        if x < self.snapshot.text_grid_columns
+            && y < self.snapshot.text_grid_rows
             && self.text_cell_intersects_wimp_clip(x, y)
         {
             let index =
-                usize::from(y) * usize::from(self.snapshot.mode.text_columns) + usize::from(x);
+                usize::from(y) * usize::from(self.snapshot.text_grid_columns) + usize::from(x);
             self.snapshot.text_cells[index] = byte;
             self.snapshot.modern_text_cells[index] = character;
         }
@@ -1050,7 +1159,7 @@ impl GraphicsService {
                     continue;
                 }
                 let index =
-                    usize::from(y) * usize::from(self.snapshot.mode.text_columns) + usize::from(x);
+                    usize::from(y) * usize::from(self.snapshot.text_grid_columns) + usize::from(x);
                 self.snapshot.text_cells[index] = b' ';
                 self.snapshot.modern_text_cells[index] = ' ';
             }
@@ -1085,7 +1194,7 @@ impl GraphicsService {
                     continue;
                 }
                 let index =
-                    usize::from(y) * usize::from(self.snapshot.mode.text_columns) + usize::from(x);
+                    usize::from(y) * usize::from(self.snapshot.text_grid_columns) + usize::from(x);
                 self.snapshot.text_cells[index] = b' ';
                 self.snapshot.modern_text_cells[index] = ' ';
             }
@@ -1106,7 +1215,7 @@ impl GraphicsService {
     }
 
     fn scroll_text_window(&mut self) {
-        let columns = usize::from(self.snapshot.mode.text_columns);
+        let columns = usize::from(self.snapshot.text_grid_columns);
         let left = usize::from(self.snapshot.text_window.left);
         let right = usize::from(self.snapshot.text_window.right);
         let top = usize::from(self.snapshot.text_window.top);
@@ -1661,7 +1770,52 @@ mod output_surface_tests {
     };
 
     #[test]
-    fn modern_shell_uses_a_host_text_canvas_without_changing_guest_mode() {
+    fn responsive_shell_grid_uses_host_metrics_and_resizes_text_state_together() {
+        assert_eq!(super::modern_shell_grid_for_area(2000, 640), (102, 15));
+        assert_eq!(super::modern_shell_grid_for_area(640, 1600), (31, 39));
+
+        let mut graphics = GraphicsService::default();
+        graphics.set_modern_shell_console().unwrap();
+        assert!(graphics.set_modern_shell_text_grid(8, 3));
+        for byte in b"ABCD\r\nEF" {
+            graphics.write_byte(*byte).unwrap();
+        }
+        assert_eq!(graphics.snapshot().text_grid_size(), (8, 3));
+        assert_eq!(
+            &graphics.snapshot().modern_text_cells[..4],
+            &['A', 'B', 'C', 'D']
+        );
+        assert_eq!(&graphics.snapshot().modern_text_cells[8..10], &['E', 'F']);
+
+        assert!(graphics.set_modern_shell_text_grid(4, 2));
+        let snapshot = graphics.snapshot();
+        assert_eq!(snapshot.text_grid_size(), (4, 2));
+        assert_eq!(snapshot.text_cells.len(), 8);
+        assert_eq!(&snapshot.modern_text_cells[..4], &['A', 'B', 'C', 'D']);
+        assert_eq!(&snapshot.modern_text_cells[4..6], &['E', 'F']);
+        assert_eq!(snapshot.text_window.right, 3);
+        assert_eq!(snapshot.text_window.bottom, 1);
+        for byte in b"GHIJ" {
+            graphics.write_byte(*byte).unwrap();
+        }
+        assert_eq!(graphics.snapshot().text_cursor.y, 1);
+        assert_eq!(&graphics.snapshot().modern_text_cells[4..6], &['I', 'J']);
+
+        graphics
+            .set_text_profile(TextRenderingProfile::Classic, TextEncoding::ClassicBytes)
+            .unwrap();
+        assert!(!graphics.snapshot().modern_shell_console);
+        assert_eq!(
+            graphics.snapshot().text_grid_size(),
+            (
+                graphics.snapshot().mode.text_columns,
+                graphics.snapshot().mode.text_rows
+            ),
+        );
+    }
+
+    #[test]
+    fn modern_shell_uses_a_separate_host_grid_without_changing_guest_mode() {
         let mut graphics = GraphicsService::default();
         let guest_mode = graphics.snapshot().mode;
         graphics.set_modern_shell_console().unwrap();
@@ -1671,8 +1825,8 @@ mod output_surface_tests {
         assert_eq!(snapshot.mode.pixel_height, 256);
         assert_eq!(snapshot.mode.text_columns, 80);
         assert_eq!(snapshot.mode.text_rows, 32);
-        assert_eq!(snapshot.modern_text_surface_size(), (640, 512));
         assert!(snapshot.modern_shell_console);
+        assert_eq!(snapshot.text_grid_size(), (80, 32));
         assert_eq!(snapshot.text_cells.len(), 80 * 32);
 
         graphics
@@ -1857,6 +2011,35 @@ mod output_surface_tests {
         }
         assert_eq!(&window.snapshot().text_cells[..2], b" Y");
         assert_eq!(&default.snapshot().text_cells[..2], b"AB");
+    }
+
+    #[test]
+    fn new_guest_window_resizes_shell_cells_without_changing_text_window_contract() {
+        let mut shell = GraphicsService::default();
+        shell.set_modern_shell_console().unwrap();
+        assert!(shell.set_modern_shell_text_grid(8, 3));
+        for byte in [28, 1, 0, 6, 2] {
+            shell.write_byte(byte).unwrap();
+        }
+        let shell_window = shell.snapshot().text_window;
+
+        let guest_window = shell.new_window_output();
+        let snapshot = guest_window.snapshot();
+        assert!(!snapshot.modern_shell_console);
+        assert_eq!(
+            snapshot.text_grid_size(),
+            (snapshot.mode.text_columns, snapshot.mode.text_rows)
+        );
+        assert_eq!(
+            snapshot.text_cells.len(),
+            usize::from(snapshot.mode.text_columns) * usize::from(snapshot.mode.text_rows)
+        );
+        assert_eq!(snapshot.modern_text_cells.len(), snapshot.text_cells.len());
+        assert_eq!(snapshot.text_window, shell_window);
+
+        let mut guest_window = guest_window;
+        guest_window.write_byte(b'X').unwrap();
+        assert_eq!(guest_window.snapshot().modern_text_cells[1], 'X');
     }
 
     #[test]

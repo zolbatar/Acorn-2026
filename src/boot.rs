@@ -1,4 +1,4 @@
-//! Deterministic Trellis boot capsule construction and verification.
+//! Deterministic Ricochet boot capsule construction and verification.
 //!
 //! The executable embeds the visible module source with `include_str!` and
 //! assembles the canonical capsule from that source at process startup. There
@@ -12,7 +12,7 @@ use std::{
 
 use crate::{
     basic_compat::system_profile::SystemModule,
-    trellis::{CapabilityName, IdentityAllocator, ModuleManifest},
+    ricochet::{CapabilityName, IdentityAllocator, ModuleManifest},
 };
 
 pub const RUNTIME_ABI_VERSION: u32 = 1;
@@ -525,8 +525,8 @@ pub fn embedded_capsule_bytes() -> Result<&'static [u8], BootCapsuleError> {
                 grants: &["RuntimeErrors", "TaskQuery"],
             },
             BootModuleInput {
-                source_path: "modules/TrellisCommands.bas64",
-                source: include_str!("../modules/TrellisCommands.bas64"),
+                source_path: "modules/RicochetCommands.bas64",
+                source: include_str!("../modules/RicochetCommands.bas64"),
                 grants: &[
                     "ConfigurationStoreRead",
                     "ConfigurationStoreWrite",
@@ -890,7 +890,7 @@ mod tests {
                 "ModuleManager",
                 "System",
                 "TaskManager",
-                "TrellisCommands",
+                "RicochetCommands",
             ])
         );
         let system = capsule
@@ -906,12 +906,12 @@ mod tests {
         assert!(
             system
                 .grants
-                .contains(&crate::trellis::CapabilityName::new("StartupPolicy").unwrap())
+                .contains(&crate::ricochet::CapabilityName::new("StartupPolicy").unwrap())
         );
         assert!(
             system
                 .grants
-                .contains(&crate::trellis::CapabilityName::new("SystemQueries").unwrap())
+                .contains(&crate::ricochet::CapabilityName::new("SystemQueries").unwrap())
         );
         assert!(boot.grants.is_empty());
         for (module_name, capability) in [
@@ -928,11 +928,11 @@ mod tests {
             ("ModuleManager", "RuntimeErrors"),
             ("TaskManager", "TaskQuery"),
             ("TaskManager", "RuntimeErrors"),
-            ("TrellisCommands", "MosCommandBridge"),
-            ("TrellisCommands", "ConfigurationStoreRead"),
-            ("TrellisCommands", "ConfigurationStoreWrite"),
-            ("TrellisCommands", "TaskMemory"),
-            ("TrellisCommands", "RuntimeErrors"),
+            ("RicochetCommands", "MosCommandBridge"),
+            ("RicochetCommands", "ConfigurationStoreRead"),
+            ("RicochetCommands", "ConfigurationStoreWrite"),
+            ("RicochetCommands", "TaskMemory"),
+            ("RicochetCommands", "RuntimeErrors"),
         ] {
             let module = capsule
                 .modules
@@ -942,7 +942,7 @@ mod tests {
             assert!(
                 module
                     .grants
-                    .contains(&crate::trellis::CapabilityName::new(capability).unwrap())
+                    .contains(&crate::ricochet::CapabilityName::new(capability).unwrap())
             );
         }
         let boot_dependencies = boot
@@ -960,7 +960,7 @@ mod tests {
                 "ModuleManager",
                 "System",
                 "TaskManager",
-                "TrellisCommands",
+                "RicochetCommands",
             ])
         );
 
@@ -981,14 +981,14 @@ mod tests {
             ("ERROR", "OS_GENERATEERROR"),
             ("MEMORY", "OS_CHANGEDYNAMICAREA"),
             ("MEMORY", "OS_DYNAMICAREA"),
-            ("MODULEMANAGER", "ACORN_MODULEINFO"),
-            ("TASKMANAGER", "ACORN_TASKINFO"),
-            ("MODULEMANAGER", "ACORN_MODULELOOKUP"),
-            ("MODULEMANAGER", "ACORN_SWIINFO"),
-            ("MODULEMANAGER", "ACORN_MODULEEXPORT"),
-            ("MODULEMANAGER", "ACORN_DEFINITIONSOURCE"),
+            ("MODULEMANAGER", "RICOCHET_MODULEINFO"),
+            ("TASKMANAGER", "RICOCHET_TASKINFO"),
+            ("MODULEMANAGER", "RICOCHET_MODULELOOKUP"),
+            ("MODULEMANAGER", "RICOCHET_SWIINFO"),
+            ("MODULEMANAGER", "RICOCHET_MODULEEXPORT"),
+            ("MODULEMANAGER", "RICOCHET_DEFINITIONSOURCE"),
             ("MODULEMANAGER", "OS_MODULE"),
-            ("TRELLISCOMMANDS", "OS_CLI"),
+            ("RICOCHETCOMMANDS", "OS_CLI"),
             ("SYSTEM", "OS_READMONOTONICTIME"),
             ("SYSTEM", "OS_SWINUMBERTOSTRING"),
             ("SYSTEM", "OS_SWINUMBERFROMSTRING"),

@@ -1,6 +1,6 @@
 # Luna instructions: minimal desktop, slice 1
 
-Implement slice 1 of the Acorn-2026 desktop: **explore and launch**. Deliver working code, appropriate tests, documentation, and evidence of the end-to-end experience. Do not stop at a plan or a visual mock-up.
+Implement slice 1 of the Ricochet desktop: **explore and launch**. Deliver working code, appropriate tests, documentation, and evidence of the end-to-end experience. Do not stop at a plan or a visual mock-up.
 
 ## Product goal and roadmap
 
@@ -18,7 +18,7 @@ The eventual acceptance journey is: open Examples, run a program, edit a copy, s
 
 ## Read and inspect first
 
-- Read `AGENTS.md` and `docs/acorn-2026-design.md` before implementation. The brief is the current direction; distinguish requirements from unresolved proposals.
+- Read `AGENTS.md` and `docs/ricochet-design.md` before implementation. The brief is the current direction; distinguish requirements from unresolved proposals.
 - Inspect Git status and preserve unrelated work. Do not reset, discard, or include unrelated changes in a commit. This handoff does not request a commit or push.
 - Inspect the current implementation rather than assuming the brief describes every latest change.
 - Start with `src/wimp.rs`, `src/window.rs`, `src/renderer.rs`, `src/runtime.rs`, `src/filesystem.rs`, `src/swi.rs`, `src/configure.rs`, `tests/wimp_desktop.rs`, and the editable BASIC programs in `examples/wimp/two-windows`.

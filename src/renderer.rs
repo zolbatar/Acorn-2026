@@ -19,6 +19,7 @@ use crate::{
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     collections::HashMap,
+    io::Cursor,
     sync::{Arc, Mutex, OnceLock},
 };
 
@@ -450,13 +451,52 @@ fn draw_icon_bar(icons: &[DesktopIcon], frontmost_task: Option<u64>, frame: &mut
         }
     }
 
-    let control_top = top + (DESKTOP_ICONBAR_HEIGHT / DESKTOP_OS_UNITS_PER_PIXEL_Y - 48) / 2;
-    draw_system_control(
+    let icon_size = 64;
+    let icon_left = DESKTOP_PIXEL_WIDTH as i32 - ICONBAR_SYSTEM_AREA_OS;
+    let icon_top = top
+        + (DESKTOP_ICONBAR_HEIGHT / DESKTOP_OS_UNITS_PER_PIXEL_Y - icon_size) / 2;
+    draw_rgba_icon_fit(
         frame,
-        DESKTOP_PIXEL_WIDTH as i32 - ICONBAR_SYSTEM_AREA_OS,
-        control_top,
-        SystemControl::Acorn,
+        os_icon_image(),
+        icon_left,
+        icon_top,
+        icon_size,
+        PixelRect {
+            left: icon_left,
+            top: icon_top,
+            right: icon_left + icon_size,
+            bottom: icon_top + icon_size,
+        },
+        false,
     );
+}
+
+fn os_icon_image() -> &'static DesktopIconImage {
+    static IMAGE: OnceLock<DesktopIconImage> = OnceLock::new();
+    IMAGE.get_or_init(|| {
+        let decoder = png::Decoder::new(Cursor::new(include_bytes!(
+            "../resources/branding/desktop-flat/OSIcon.png"
+        )));
+        let mut reader = decoder
+            .read_info()
+            .expect("bundled OS icon PNG has valid metadata");
+        let mut rgba = vec![0; reader.output_buffer_size().expect("OS icon size is bounded")];
+        let info = reader
+            .next_frame(&mut rgba)
+            .expect("bundled OS icon PNG has valid pixels");
+        assert_eq!(info.color_type, png::ColorType::Rgba);
+        assert_eq!(info.bit_depth, png::BitDepth::Eight);
+        rgba.truncate(info.buffer_size());
+        let rgba = rgba
+            .chunks_exact(4)
+            .map(|pixel| [pixel[0], pixel[1], pixel[2], pixel[3]])
+            .collect();
+        DesktopIconImage {
+            width: info.width,
+            height: info.height,
+            rgba,
+        }
+    })
 }
 
 fn draw_modern_task_icon(frame: &mut [u8], bounds: PixelRect, bar_top: i32) {
@@ -516,158 +556,6 @@ fn draw_modern_task_icon(frame: &mut [u8], bounds: PixelRect, bar_top: i32) {
         tile.top + 13,
         [218, 176, 34, 255],
     );
-}
-
-#[derive(Clone, Copy)]
-enum SystemControl {
-    Acorn,
-}
-
-fn draw_system_control(frame: &mut [u8], x: i32, y: i32, control: SystemControl) {
-    let bounds = PixelRect {
-        left: x,
-        top: y,
-        right: x + 48,
-        bottom: y + 48,
-    };
-    match control {
-        SystemControl::Acorn => draw_acorn(frame, bounds),
-    }
-}
-
-fn draw_acorn(frame: &mut [u8], bounds: PixelRect) {
-    let center = (bounds.left + bounds.right) / 2;
-    let ink = [48, 49, 46, 255];
-    let green = [45, 126, 66, 255];
-    let ochre = [210, 164, 51, 255];
-    // The pointed ochre nut sits above its green cap, with the short stem
-    // pointing down into the icon bar.
-    draw_acorn_profile(
-        frame,
-        center,
-        bounds.top + 4,
-        &[
-            2, 5, 7, 9, 11, 12, 13, 14, 15, 16, 16, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17,
-        ],
-        ochre,
-        ink,
-        true,
-        false,
-    );
-    draw_acorn_profile(
-        frame,
-        center,
-        bounds.top + 25,
-        &[19, 19, 19, 18, 17, 16, 14, 12, 9],
-        green,
-        ink,
-        true,
-        true,
-    );
-
-    let stem_top = bounds.top + 32;
-    let stem_bottom = bounds.top + 43;
-    fill_rect(
-        frame,
-        DESKTOP_PIXEL_WIDTH,
-        DESKTOP_PIXEL_HEIGHT,
-        center - 2,
-        stem_top,
-        center + 2,
-        stem_bottom,
-        green,
-    );
-    draw_acorn_stroke(
-        frame,
-        (center - 4, stem_top),
-        (center - 4, stem_bottom - 1),
-        ink,
-    );
-    draw_acorn_stroke(
-        frame,
-        (center + 3, stem_top),
-        (center + 3, stem_bottom - 1),
-        ink,
-    );
-    draw_acorn_stroke(
-        frame,
-        (center - 4, stem_bottom - 1),
-        (center + 3, stem_bottom - 1),
-        ink,
-    );
-}
-
-fn draw_acorn_profile(
-    frame: &mut [u8],
-    center_x: i32,
-    top: i32,
-    half_widths: &[i32],
-    fill: [u8; 4],
-    ink: [u8; 4],
-    outline_top: bool,
-    outline_bottom: bool,
-) {
-    let first = half_widths[0];
-    let last = *half_widths.last().expect("acorn profile has rows");
-    for (row, half_width) in half_widths.iter().copied().enumerate() {
-        let y = top + row as i32;
-        fill_rect(
-            frame,
-            DESKTOP_PIXEL_WIDTH,
-            DESKTOP_PIXEL_HEIGHT,
-            center_x - half_width,
-            y,
-            center_x + half_width + 1,
-            y + 1,
-            fill,
-        );
-    }
-
-    for row in 0..half_widths.len().saturating_sub(1) {
-        let y = top + row as i32;
-        let next_y = y + 1;
-        let half_width = half_widths[row];
-        let next_half_width = half_widths[row + 1];
-        draw_acorn_stroke(
-            frame,
-            (center_x - half_width, y),
-            (center_x - next_half_width, next_y),
-            ink,
-        );
-        draw_acorn_stroke(
-            frame,
-            (center_x + half_width, y),
-            (center_x + next_half_width, next_y),
-            ink,
-        );
-    }
-    if outline_top {
-        draw_acorn_stroke(frame, (center_x - first, top), (center_x + first, top), ink);
-    }
-    if outline_bottom {
-        let bottom = top + half_widths.len() as i32 - 1;
-        draw_acorn_stroke(
-            frame,
-            (center_x - last, bottom),
-            (center_x + last, bottom),
-            ink,
-        );
-    }
-}
-
-fn draw_acorn_stroke(frame: &mut [u8], from: (i32, i32), to: (i32, i32), color: [u8; 4]) {
-    for offset_y in 0..2 {
-        for offset_x in 0..2 {
-            draw_line(
-                frame,
-                DESKTOP_PIXEL_WIDTH,
-                DESKTOP_PIXEL_HEIGHT,
-                (from.0 + offset_x, from.1 + offset_y),
-                (to.0 + offset_x, to.1 + offset_y),
-                color,
-            );
-        }
-    }
 }
 
 fn draw_desktop_background(frame: &mut [u8]) {

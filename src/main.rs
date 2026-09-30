@@ -1,6 +1,6 @@
 use std::{env, process::ExitCode};
 
-use acorn_2026::{runtime::Runtime, snapshot, window};
+use ricochet::{runtime::Runtime, snapshot, window};
 
 fn main() -> ExitCode {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
@@ -9,7 +9,7 @@ fn main() -> ExitCode {
         .position(|argument| argument == "--write-boot-capsule")
     {
         match arguments.get(index + 1) {
-            Some(path) => acorn_2026::boot::embedded_capsule_bytes()
+            Some(path) => ricochet::boot::embedded_capsule_bytes()
                 .map_err(|error| error.to_string())
                 .and_then(|bytes| {
                     std::fs::write(path, bytes)
@@ -25,13 +25,13 @@ fn main() -> ExitCode {
             Some(path) => std::fs::read(path)
                 .map_err(|error| format!("could not read boot capsule {path}: {error}"))
                 .and_then(|bytes| {
-                    acorn_2026::boot::BootCapsule::decode(
+                    ricochet::boot::BootCapsule::decode(
                         &bytes,
-                        acorn_2026::boot::RUNTIME_ABI_VERSION,
+                        ricochet::boot::RUNTIME_ABI_VERSION,
                     )
                     .map(|capsule| {
                         println!(
-                            "verified Trellis boot capsule: ABI {}, {} module(s)",
+                            "verified Ricochet boot capsule: ABI {}, {} module(s)",
                             capsule.runtime_abi,
                             capsule.modules.len()
                         );
@@ -134,7 +134,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("Acorn-2026: {message}");
+            eprintln!("{message}");
             ExitCode::FAILURE
         }
     }

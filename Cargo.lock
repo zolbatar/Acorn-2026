@@ -19,25 +19,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
 
 [[package]]
-name = "acorn-2026"
-version = "0.1.0"
-dependencies = [
- "arboard",
- "cranelift-codegen",
- "cranelift-frontend",
- "cranelift-jit",
- "cranelift-module",
- "cranelift-native",
- "parley",
- "png",
- "pollster",
- "skrifa",
- "vello",
- "wgpu",
- "winit",
-]
-
-[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2122,6 +2103,25 @@ name = "renderdoc-sys"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
+
+[[package]]
+name = "ricochet"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "cranelift-codegen",
+ "cranelift-frontend",
+ "cranelift-jit",
+ "cranelift-module",
+ "cranelift-native",
+ "parley",
+ "png",
+ "pollster",
+ "skrifa",
+ "vello",
+ "wgpu",
+ "winit",
+]
 
 [[package]]
 name = "roxmltree"

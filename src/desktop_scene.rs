@@ -20,7 +20,10 @@ use vello::{
 };
 
 use crate::{
-    graphics::{GraphicsSnapshot, TextRenderingProfile},
+    graphics::{
+        GraphicsSnapshot, MODERN_SHELL_CELL_WIDTH_OSU, MODERN_SHELL_FONT_SIZE_OSU,
+        MODERN_SHELL_INSET_OSU, MODERN_SHELL_LINE_HEIGHT_OSU, TextRenderingProfile,
+    },
     renderer,
     wimp::{
         DESKTOP_ICONBAR_HEIGHT, DesktopIcon, DesktopIconImage, DesktopMenu, DesktopRect,
@@ -426,6 +429,7 @@ impl DesktopSceneBuilder {
         snapshot: &GraphicsSnapshot,
         width: u32,
         height: u32,
+        scale_factor: f64,
     ) -> Scene {
         let mut scene = Scene::new();
         fill(
@@ -434,40 +438,49 @@ impl DesktopSceneBuilder {
             (0, 0, 0, 255),
             Rect::new(0.0, 0.0, f64::from(width), f64::from(height)),
         );
-        let image = if let Some((revision, image)) = &self.classic_image {
-            if *revision == snapshot.revision {
+        let shell = snapshot.modern_shell_console;
+        let image = if shell && !snapshot.graphics_content_present {
+            None
+        } else if let Some((revision, image)) = &self.classic_image {
+            Some(if *revision == snapshot.revision {
                 image.clone()
             } else {
                 self.rebuild_classic(snapshot)
-            }
+            })
         } else {
-            self.rebuild_classic(snapshot)
+            Some(self.rebuild_classic(snapshot))
         };
-        let image_size = (image.width, image.height);
-        let scale = (f64::from(width) / f64::from(image.width))
-            .min(f64::from(height) / f64::from(image.height));
-        let offset_x = (f64::from(width) - f64::from(image.width) * scale) / 2.0;
-        let offset_y = (f64::from(height) - f64::from(image.height) * scale) / 2.0;
-        scene.draw_image(
-            &ImageBrush::new(image).with_quality(ImageQuality::Low),
-            Affine::translate((offset_x, offset_y)) * Affine::scale(scale),
-        );
-        if snapshot.text_profile == TextRenderingProfile::Modern {
-            let raster_rect = Rect::new(
+        let raster_rect = if let Some(image) = image {
+            let scale = (f64::from(width) / f64::from(image.width))
+                .min(f64::from(height) / f64::from(image.height));
+            let offset_x = (f64::from(width) - f64::from(image.width) * scale) / 2.0;
+            let offset_y = (f64::from(height) - f64::from(image.height) * scale) / 2.0;
+            scene.draw_image(
+                &ImageBrush::new(image.clone()).with_quality(ImageQuality::Low),
+                Affine::translate((offset_x, offset_y)) * Affine::scale(scale),
+            );
+            Rect::new(
                 offset_x,
                 offset_y,
-                offset_x + f64::from(image_size.0) * scale,
-                offset_y + f64::from(image_size.1) * scale,
-            );
-            let text_rect = if snapshot.modern_shell_console {
-                fit_surface_rect(
-                    Rect::new(0.0, 0.0, f64::from(width), f64::from(height)),
-                    snapshot.modern_text_surface_size(),
-                )
+                offset_x + f64::from(image.width) * scale,
+                offset_y + f64::from(image.height) * scale,
+            )
+        } else {
+            Rect::new(0.0, 0.0, f64::from(width), f64::from(height))
+        };
+        if snapshot.text_profile == TextRenderingProfile::Modern {
+            let text_rect = if shell {
+                Rect::new(0.0, 0.0, f64::from(width), f64::from(height))
             } else {
                 raster_rect
             };
-            self.draw_modern_guest_text(&mut scene, Affine::IDENTITY, snapshot, text_rect);
+            self.draw_modern_guest_text(
+                &mut scene,
+                Affine::IDENTITY,
+                snapshot,
+                text_rect,
+                0.5 * scale_factor,
+            );
         }
         scene
     }
@@ -524,7 +537,12 @@ impl DesktopSceneBuilder {
         let modern_filer = window.title.starts_with("HostFS:")
             || window.title.to_ascii_lowercase().contains("filer");
         let display_manager = window.title.eq_ignore_ascii_case("Display Manager");
-        let work_color = window_work_color(&window.title);
+        let shell_console = snapshot.is_some_and(|snapshot| snapshot.modern_shell_console);
+        let work_color = if shell_console {
+            (0, 0, 0, 255)
+        } else {
+            window_work_color(&window.title)
+        };
         fill(scene, transform, work_color, work);
         scene.push_clip_layer(Fill::NonZero, transform, &work);
 
@@ -545,7 +563,9 @@ impl DesktopSceneBuilder {
                 f64::from(screen_left) + image_width,
                 f64::from(self.desktop_height_os - screen_top) + image_height,
             );
-            if let Some(image) = self.task_image(surface, snapshot) {
+            if (!snapshot.modern_shell_console || snapshot.graphics_content_present)
+                && let Some(image) = self.task_image(surface, snapshot)
+            {
                 // Nearest sampling preserves the guest pixel grid.
                 let source_size = (image.width, image.height);
                 scene.draw_image(
@@ -560,11 +580,11 @@ impl DesktopSceneBuilder {
             }
             if snapshot.text_profile == TextRenderingProfile::Modern {
                 let text_rect = if snapshot.modern_shell_console {
-                    fit_surface_rect(work, snapshot.modern_text_surface_size())
+                    work
                 } else {
                     image_rect
                 };
-                self.draw_modern_guest_text(scene, transform, snapshot, text_rect);
+                self.draw_modern_guest_text(scene, transform, snapshot, text_rect, 1.0);
             }
         }
 
@@ -621,15 +641,42 @@ impl DesktopSceneBuilder {
         transform: Affine,
         snapshot: &GraphicsSnapshot,
         image_rect: Rect,
+        shell_units_scale: f64,
     ) {
-        let columns = usize::from(snapshot.mode.text_columns);
-        let rows = usize::from(snapshot.mode.text_rows);
+        let (columns, rows) = snapshot.text_grid_size();
+        let columns = usize::from(columns);
+        let rows = usize::from(rows);
         if columns == 0 || rows == 0 || image_rect.width() <= 0.0 || image_rect.height() <= 0.0 {
             return;
         }
-        let cell_width = image_rect.width() / columns as f64;
-        let cell_height = image_rect.height() / rows as f64;
-        let font_size = (cell_height * 0.78) as f32;
+        let shell = snapshot.modern_shell_console;
+        let cell_width = if shell {
+            MODERN_SHELL_CELL_WIDTH_OSU * shell_units_scale
+        } else {
+            image_rect.width() / columns as f64
+        };
+        let cell_height = if shell {
+            MODERN_SHELL_LINE_HEIGHT_OSU * shell_units_scale
+        } else {
+            image_rect.height() / rows as f64
+        };
+        let font_size = if shell {
+            MODERN_SHELL_FONT_SIZE_OSU * shell_units_scale as f32
+        } else {
+            (cell_height * 0.78) as f32
+        };
+        let origin_x = image_rect.x0
+            + if shell {
+                MODERN_SHELL_INSET_OSU * shell_units_scale
+            } else {
+                0.0
+            };
+        let origin_y = image_rect.y0
+            + if shell {
+                MODERN_SHELL_INSET_OSU * shell_units_scale
+            } else {
+                0.0
+            };
         let ink = snapshot
             .logical_palette
             .get(usize::from(snapshot.text_colour))
@@ -667,17 +714,22 @@ impl DesktopSceneBuilder {
                 if advance <= 0.0 {
                     continue;
                 }
-                let fitted_advance = advance.min(cell_width);
-                let x = image_rect.x0
-                    + column as f64 * cell_width
-                    + (cell_width - fitted_advance) / 2.0;
-                let y = image_rect.y0
+                let x = if shell {
+                    origin_x + column as f64 * cell_width
+                } else {
+                    let fitted_advance = advance.min(cell_width);
+                    image_rect.x0 + column as f64 * cell_width + (cell_width - fitted_advance) / 2.0
+                };
+                let y = origin_y
                     + row as f64 * cell_height
                     + ((cell_height - f64::from(layout.height())) / 2.0).max(0.0);
-                // Preserve the bundled font's real monospace advance. Shrink
-                // only when a target MODE supplies an unusually narrow cell;
-                // never stretch glyphs to fill the old bitmap-cell width.
-                let horizontal_scale = (cell_width / advance).min(1.0);
+                // Guest cells may be narrower than the bundled font. Shell
+                // cells instead use JetBrains Mono's actual advance.
+                let horizontal_scale = if shell {
+                    1.0
+                } else {
+                    (cell_width / advance).min(1.0)
+                };
                 let glyph_transform = transform
                     * Affine::translate((x, 0.0))
                     * Affine::scale_non_uniform(horizontal_scale, 1.0);
@@ -692,8 +744,8 @@ impl DesktopSceneBuilder {
             && (cursor_x as usize) < columns
             && (cursor_y as usize) < rows
         {
-            let left = image_rect.x0 + f64::from(cursor_x) * cell_width;
-            let top = image_rect.y0 + f64::from(cursor_y) * cell_height;
+            let left = origin_x + f64::from(cursor_x) * cell_width;
+            let top = origin_y + f64::from(cursor_y) * cell_height;
             let thickness = 2.0_f64.min(cell_height).max(1.0);
             fill(
                 scene,
@@ -1156,6 +1208,20 @@ impl DesktopSceneBuilder {
             (0, 0, 0, 255),
             screen_rect(0, top, desktop_width_os, 2),
         );
+        let control = Rect::new(
+            f64::from(desktop_width_os - 72),
+            f64::from(top + (DESKTOP_ICONBAR_HEIGHT - 64) / 2),
+            f64::from(desktop_width_os - 8),
+            f64::from(top + (DESKTOP_ICONBAR_HEIGHT - 64) / 2 + 64),
+        );
+        draw_image_data_fit(
+            scene,
+            transform,
+            os_icon().clone(),
+            control,
+            1.0,
+            ImageQuality::High,
+        );
         let frontmost_task = windows.first().map(|window| window.owner_task_id);
         for icon in icons {
             let bounds = self.map_rect(icon.bounds);
@@ -1243,20 +1309,6 @@ impl DesktopSceneBuilder {
                 );
             }
         }
-        let control = Rect::new(
-            f64::from(desktop_width_os - 72),
-            f64::from(top + (DESKTOP_ICONBAR_HEIGHT - 64) / 2),
-            f64::from(desktop_width_os - 8),
-            f64::from(top + (DESKTOP_ICONBAR_HEIGHT - 64) / 2 + 64),
-        );
-        draw_image_data_fit(
-            scene,
-            transform,
-            acorn_logo().clone(),
-            control,
-            1.0,
-            ImageQuality::High,
-        );
     }
 
     fn draw_notice(
@@ -1706,11 +1758,11 @@ fn rgba_image_data(width: u32, height: u32, rgba: Vec<u8>) -> Option<ImageData> 
     })
 }
 
-fn acorn_logo() -> &'static ImageData {
+fn os_icon() -> &'static ImageData {
     static IMAGE: OnceLock<ImageData> = OnceLock::new();
     IMAGE.get_or_init(|| {
         decode_branding_png(include_bytes!(
-            "../resources/branding/desktop-flat/acorn.png"
+            "../resources/branding/desktop-flat/OSIcon.png"
         ))
     })
 }
@@ -1842,23 +1894,6 @@ fn trim_transparent_border(width: u32, height: u32, rgba: Vec<u8>) -> (u32, u32,
         cropped.extend_from_slice(&rgba[start..end]);
     }
     (cropped_width as u32, cropped_height as u32, cropped)
-}
-
-fn fit_surface_rect(bounds: Rect, surface_size: (u32, u32)) -> Rect {
-    if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
-        return bounds;
-    }
-    let surface_width = f64::from(surface_size.0.max(1));
-    let surface_height = f64::from(surface_size.1.max(1));
-    let aspect = surface_width / surface_height;
-    let (width, height) = if bounds.width() / bounds.height() > aspect {
-        (bounds.height() * aspect, bounds.height())
-    } else {
-        (bounds.width(), bounds.width() / aspect)
-    };
-    let x = bounds.x0 + (bounds.width() - width) / 2.0;
-    let y = bounds.y0 + (bounds.height() - height) / 2.0;
-    Rect::new(x, y, x + width, y + height)
 }
 
 fn rgba(rgba: [u8; 4]) -> (u8, u8, u8, u8) {
@@ -2012,6 +2047,11 @@ mod tests {
         let wide_advance = builder.text_layouts.get(&wide).unwrap().width();
         let narrow_advance = builder.text_layouts.get(&narrow).unwrap().width();
         assert!((wide_advance - narrow_advance).abs() < 0.01);
+        let shell_cell = builder
+            .ensure_guest_text_layout("W", MODERN_SHELL_FONT_SIZE_OSU)
+            .expect("bundled JetBrains Mono should shape at the shell size");
+        let shell_advance = builder.text_layouts.get(&shell_cell).unwrap().width();
+        assert!((f64::from(shell_advance) - MODERN_SHELL_CELL_WIDTH_OSU).abs() < 0.1);
 
         let mut graphics = crate::graphics::GraphicsService::default();
         graphics
@@ -2023,7 +2063,7 @@ mod tests {
         for byte in "A漢".bytes() {
             graphics.write_byte(byte).unwrap();
         }
-        let _scene = builder.build_classic(graphics.snapshot(), 1280, 1024);
+        let _scene = builder.build_classic(graphics.snapshot(), 1280, 1024, 1.0);
         assert!(builder.text_layout_builds >= 4);
 
         let window = DesktopWindow {
@@ -2077,11 +2117,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a GPU; run with ACORN_VELLO_SNAPSHOT=1 and --ignored"]
+    #[ignore = "requires a GPU; run with RICOCHET_VELLO_SNAPSHOT=1 and --ignored"]
     fn gpu_modern_console_renders_jetbrains_mono_glyphs_to_png() {
         assert!(
-            std::env::var_os("ACORN_VELLO_SNAPSHOT").is_some(),
-            "set ACORN_VELLO_SNAPSHOT=1 to opt into real GPU rendering"
+            std::env::var_os("RICOCHET_VELLO_SNAPSHOT")
+                .or_else(|| std::env::var_os("ACORN_VELLO_SNAPSHOT"))
+                .is_some(),
+            "set RICOCHET_VELLO_SNAPSHOT=1 to opt into real GPU rendering"
         );
 
         let mut graphics = crate::graphics::GraphicsService::default();
@@ -2100,11 +2142,11 @@ mod tests {
         empty_snapshot.modern_text_cells.fill(' ');
 
         let mut builder = DesktopSceneBuilder::new();
-        let scene = builder.build_classic(&snapshot, 1280, 1024);
+        let scene = builder.build_classic(&snapshot, 1280, 1024, 1.0);
         let rendered = crate::vello_backend::snapshot_scene(&scene, 1280, 1024)
             .expect("Vello renders real Modern console glyphs");
         let mut empty_builder = DesktopSceneBuilder::new();
-        let empty_scene = empty_builder.build_classic(&empty_snapshot, 1280, 1024);
+        let empty_scene = empty_builder.build_classic(&empty_snapshot, 1280, 1024, 1.0);
         let empty = crate::vello_backend::snapshot_scene(&empty_scene, 1280, 1024)
             .expect("Vello renders the empty control scene");
         assert!(
@@ -2112,7 +2154,7 @@ mod tests {
             "Modern text must contribute actual rendered pixels"
         );
 
-        let file = std::fs::File::create("/private/tmp/acorn-modern-console.png")
+        let file = std::fs::File::create("/private/tmp/ricochet-modern-console.png")
             .expect("create Modern console snapshot");
         let mut encoder = png::Encoder::new(file, 1280, 1024);
         encoder.set_color(png::ColorType::Rgba);
@@ -2125,18 +2167,128 @@ mod tests {
     }
 
     #[test]
-    fn approved_branding_assets_decode_once_as_rgba() {
+    #[ignore = "requires a GPU; run with RICOCHET_VELLO_SNAPSHOT=1 and --ignored"]
+    fn gpu_wimp_basic_shell_fills_wide_short_and_tall_narrow_windows() {
+        assert!(
+            std::env::var_os("RICOCHET_VELLO_SNAPSHOT").is_some(),
+            "set RICOCHET_VELLO_SNAPSHOT=1 to opt into real GPU rendering"
+        );
+
+        let (updates, _updates_receiver) = std::sync::mpsc::channel();
+        let wimp = crate::wimp::WimpServer::new(updates);
+        wimp.task_started(903, "BASIC window")
+            .expect("create the host BASIC console window");
+        let console = wimp.desktop_windows()[0].clone();
+
+        for (name, width, height) in [("wide-short", 1450, 560), ("tall-narrow", 560, 920)] {
+            let mut window = console.clone();
+            window.work_area.max_x = window.work_area.min_x + width;
+            window.work_area.min_y = window.work_area.max_y - height;
+            window.work_extent = WorkArea {
+                min_x: 0,
+                min_y: -height,
+                max_x: width,
+                max_y: 0,
+            };
+
+            let mut graphics = crate::graphics::GraphicsService::default();
+            graphics
+                .set_modern_shell_console()
+                .expect("select Modern host shell text");
+            let (columns, rows) = crate::graphics::modern_shell_grid_for_area(width, height);
+            graphics.set_modern_shell_text_grid(columns, rows);
+            for byte in b"*Commands\r\nRicochet BASIC64 shell\r\n> PRINT \"JetBrains Mono\"\r\nResponsive Wimp client area\r\nColumns follow the window width\r\nRows follow the window height\r\n" {
+                graphics.write_byte(*byte).unwrap();
+            }
+            let snapshot = graphics.snapshot().clone();
+            let expected_first_line = "*Commands";
+            let first_line = snapshot
+                .modern_text_cells
+                .iter()
+                .take(expected_first_line.len())
+                .collect::<String>();
+            assert_eq!(first_line, expected_first_line, "{name} transcript");
+            let scenes = HashMap::from([((903, None), snapshot.clone())]);
+            let viewport = Viewport::for_desktop(1280, 720, 1600, 1200);
+            let mut builder = DesktopSceneBuilder::new();
+            let scene = builder.build(&[window.clone()], &scenes, &[], &[], &[], None, viewport);
+            let rendered = crate::vello_backend::snapshot_scene(&scene, 1280, 720)
+                .expect("render complete Wimp BASIC desktop scene");
+
+            let mut empty_snapshot = snapshot.clone();
+            empty_snapshot.modern_text_cells.fill(' ');
+            let mut empty_builder = DesktopSceneBuilder::new();
+            let empty_scene = empty_builder.build(
+                &[window.clone()],
+                &HashMap::from([((903, None), empty_snapshot)]),
+                &[],
+                &[],
+                &[],
+                None,
+                viewport,
+            );
+            let empty = crate::vello_backend::snapshot_scene(&empty_scene, 1280, 720)
+                .expect("render empty Wimp BASIC console control scene");
+            let furniture = layout(
+                &window,
+                window.work_area,
+                (window.scroll_x, window.scroll_y),
+            );
+            let work = builder.map_rect(furniture.work_area);
+            let first_line_bounds = (
+                (viewport.offset_x + work.x0 * viewport.scale)
+                    .floor()
+                    .max(0.0) as u32,
+                (viewport.offset_y + work.y0 * viewport.scale)
+                    .floor()
+                    .max(0.0) as u32,
+                (viewport.offset_x + work.x1 * viewport.scale)
+                    .ceil()
+                    .clamp(0.0, 1280.0) as u32,
+                (viewport.offset_y
+                    + (work.y0
+                        + crate::graphics::MODERN_SHELL_INSET_OSU
+                        + crate::graphics::MODERN_SHELL_LINE_HEIGHT_OSU)
+                        * viewport.scale)
+                    .ceil()
+                    .clamp(0.0, 720.0) as u32,
+            );
+            assert!(
+                region_difference_count(&rendered, &empty, 1280, (0, 0, 1280, 720)) > 2_000,
+                "{name} Wimp console must render actual Modern glyph pixels"
+            );
+            assert!(
+                region_difference_count(&rendered, &empty, 1280, first_line_bounds) > 30,
+                "{name} Wimp console must render its transcript from the first row"
+            );
+
+            let file =
+                std::fs::File::create(format!("/private/tmp/ricochet-wimp-console-{name}.png"))
+                    .expect("create Wimp console visual snapshot");
+            let mut encoder = png::Encoder::new(file, 1280, 720);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&rendered)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn desktop_art_assets_decode_once_as_rgba() {
         let basic64 = basic64_file_logo();
         assert!(basic64.width > 0 && basic64.height > 0);
         assert_eq!(basic64.alpha_type, ImageAlphaType::Alpha);
-        let acorn = acorn_logo();
+        let os_icon = os_icon();
         let harddisc = harddisc_logo();
         let display = display_manager_logo();
-        assert_eq!((acorn.width, acorn.height), (556, 872));
-        assert_eq!((harddisc.width, harddisc.height), (954, 346));
+        assert_eq!((os_icon.width, os_icon.height), (1024, 1024));
+        assert_eq!((harddisc.width, harddisc.height), (854, 437));
         assert!(display.width > 0 && display.height > 0);
         assert!(display.width <= 1024 && display.height <= 1024);
-        assert_eq!(acorn.alpha_type, ImageAlphaType::Alpha);
+        assert_eq!(os_icon.alpha_type, ImageAlphaType::Alpha);
         assert_eq!(harddisc.alpha_type, ImageAlphaType::Alpha);
         assert_eq!(display.alpha_type, ImageAlphaType::Alpha);
         assert!(
@@ -2320,11 +2472,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a GPU; run with ACORN_VELLO_SNAPSHOT=1 and --ignored"]
+    #[ignore = "requires a GPU; run with RICOCHET_VELLO_SNAPSHOT=1 and --ignored"]
     fn gpu_modern_selection_changes_only_the_label_and_legacy_still_tints_art() {
         assert!(
-            std::env::var_os("ACORN_VELLO_SNAPSHOT").is_some(),
-            "set ACORN_VELLO_SNAPSHOT=1 to opt into real GPU rendering"
+            std::env::var_os("RICOCHET_VELLO_SNAPSHOT")
+                .or_else(|| std::env::var_os("ACORN_VELLO_SNAPSHOT"))
+                .is_some(),
+            "set RICOCHET_VELLO_SNAPSHOT=1 to opt into real GPU rendering"
         );
 
         let source_image = test_icon_image(64, 64, [220, 80, 30, 255]);
@@ -2487,7 +2641,9 @@ mod tests {
         legacy_before: &[u8],
         legacy_after: &[u8],
     ) -> std::io::Result<()> {
-        let Some(directory) = std::env::var_os("ACORN_VELLO_SELECTION_ARTIFACT_DIR") else {
+        let Some(directory) = std::env::var_os("RICOCHET_VELLO_SELECTION_ARTIFACT_DIR")
+            .or_else(|| std::env::var_os("ACORN_VELLO_SELECTION_ARTIFACT_DIR"))
+        else {
             return Ok(());
         };
         let directory = std::path::PathBuf::from(directory);

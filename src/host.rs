@@ -19,7 +19,7 @@ impl HostConsole {
         let echo_input = terminal_mode.enabled();
         let (sender, input) = mpsc::channel();
         let _ = thread::Builder::new()
-            .name("acorn-stdio-input".into())
+            .name("ricochet-stdio-input".into())
             .spawn(move || {
                 let stdin = io::stdin();
                 let mut stdin = stdin.lock();

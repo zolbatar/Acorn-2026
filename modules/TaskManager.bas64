@@ -5,7 +5,7 @@ REM @CAPABILITY TaskQuery
 REM @CAPABILITY RuntimeErrors
 REM @IMPORT Host.Task.ReadIdentity TaskQuery
 REM @IMPORT Host.Runtime.UnsupportedServiceReason RuntimeErrors
-REM @SWI Acorn_TaskInfo &4FF11 ReadTaskInfo REGISTERS=R0:U32:IN|R1:U32:OUT|R2:U32:OUT|R3:U32:OUT;BLOCKING=FALSE;REENTRANT=TRUE;ERROR=TaskInfoError
+REM @SWI Ricochet_TaskInfo &4FF11 ReadTaskInfo REGISTERS=R0:U32:IN|R1:U32:OUT|R2:U32:OUT|R3:U32:OUT;BLOCKING=FALSE;REENTRANT=TRUE;ERROR=TaskInfoError
 
 DEF PROC ReadTaskInfo
     IF R0% <> 1 THEN PRIMITIVE Host.Runtime.UnsupportedServiceReason, &4FF11, R0%

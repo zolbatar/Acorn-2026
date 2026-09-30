@@ -1,10 +1,10 @@
 REM BASIC64 Filer policy: sprite catalogue, selection, paging and activation.
 MODE 20
 DIM description% 31
-$description%="Acorn Filer"
+$description%="Filer"
 SYS "Wimp_Initialise",310,&4B534154,description%,0 TO version%,task%
 
-SYS "Acorn_Display",1,0,0,0 TO display_abi%,display_action%,active_resolution%,active_colour%,active_display_width%,active_display_height%,host_display_width%,host_display_height%,display_status%
+SYS "Ricochet_Display",1,0,0,0 TO display_abi%,display_action%,active_resolution%,active_colour%,active_display_width%,active_display_height%,host_display_width%,host_display_height%,display_status%
 display_extent_width%=active_display_width%*2
 display_extent_height%=active_display_height%*2
 IF display_extent_width%<1600 THEN display_extent_width%=1600
@@ -160,7 +160,7 @@ IF layout_mode%=2 THEN columns%=1:cell_width%=view_width%:cell_height%=64:entry_
 PROCbuild_sort_page
 sorted_shown%=shown%
 REM Expand the work extent before creating icons for a larger directory.
-SYS "Acorn_Display",1,0,0,0 TO display_abi%,display_action%,active_resolution%,active_colour%,active_display_width%,active_display_height%,host_display_width%,host_display_height%,display_status%
+SYS "Ricochet_Display",1,0,0,0 TO display_abi%,display_action%,active_resolution%,active_colour%,active_display_width%,active_display_height%,host_display_width%,host_display_height%,display_status%
 display_extent_width%=active_display_width%*2
 display_extent_height%=active_display_height%*2
 IF display_extent_width%<1600 THEN display_extent_width%=1600
@@ -179,7 +179,7 @@ shown%=0
 FOR slot%=0 TO sorted_shown%-1
   item%=!(sort_page%+slot%*20)
   $directory_buffer%=directory$
-  SYS "Acorn_Desktop",1,directory_buffer%,item%,entry_buffer%,256 TO kind%,filetype%,entry_size%
+  SYS "Ricochet_Desktop",1,directory_buffer%,item%,entry_buffer%,256 TO kind%,filetype%,entry_size%
   IF kind%<>0 THEN
     entry%=entry_buffer%
     PROCreadname
@@ -397,7 +397,7 @@ IF selected_count%=1 THEN context_item%=selected_item%
 IF selected_count%=0 AND clicked_item%>=0 THEN context_item%=clicked_item%
 IF context_item%>=0 THEN
   $directory_buffer%=directory$
-  SYS "Acorn_Desktop",1,directory_buffer%,context_item%,entry_buffer%,256 TO context_entry_kind%,context_filetype%,context_size%
+  SYS "Ricochet_Desktop",1,directory_buffer%,context_item%,entry_buffer%,256 TO context_entry_kind%,context_filetype%,context_size%
   entry%=entry_buffer%:PROCreadname
   context$=entry$
   IF context_entry_kind%=2 THEN context$="Dir "+context$
@@ -670,7 +670,7 @@ catalogue_count%=0
 $directory_buffer%=directory$
 scan_item%=0
 REPEAT
-  SYS "Acorn_Desktop",1,directory_buffer%,scan_item%,entry_buffer%,256 TO scan_kind%,scan_type%,scan_size%
+  SYS "Ricochet_Desktop",1,directory_buffer%,scan_item%,entry_buffer%,256 TO scan_kind%,scan_type%,scan_size%
   IF scan_kind%<>0 THEN catalogue_count%+=1
   scan_item%+=1
 UNTIL scan_kind%=0 OR scan_item%>=65535
@@ -748,7 +748,7 @@ ENDPROC
 
 DEF PROCactivate
 $directory_buffer%=directory$
-SYS "Acorn_Desktop",1,directory_buffer%,index%,entry_buffer%,256 TO kind%,filetype%
+SYS "Ricochet_Desktop",1,directory_buffer%,index%,entry_buffer%,256 TO kind%,filetype%
 activation_kind%=kind%
 IF activation_kind%=0 THEN PROCshow
 entry%=entry_buffer%
@@ -864,12 +864,12 @@ ENDPROC
 
 DEF PROCsort_fetch
 $directory_buffer%=directory$
-SYS "Acorn_Desktop",1,directory_buffer%,sort_fetch_item%,entry_buffer%,256 TO sort_candidate_kind%,sort_candidate_type%,sort_candidate_size%
+SYS "Ricochet_Desktop",1,directory_buffer%,sort_fetch_item%,entry_buffer%,256 TO sort_candidate_kind%,sort_candidate_type%,sort_candidate_size%
 sort_candidate_type%=sort_candidate_type% AND &FFF
 sort_candidate_item%=sort_fetch_item%
 sort_candidate_date%=0
 IF sort_candidate_kind%<>0 THEN
-  SYS "Acorn_Desktop",3,directory_buffer%,sort_fetch_item% TO sort_date_available%,sort_candidate_date%
+  SYS "Ricochet_Desktop",3,directory_buffer%,sort_fetch_item% TO sort_date_available%,sort_candidate_date%
   IF sort_date_available%=0 THEN sort_candidate_date%=0
 ENDIF
 ENDPROC

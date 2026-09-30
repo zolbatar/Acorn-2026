@@ -296,46 +296,46 @@ impl JitProgram {
         let mut jit_builder = JITBuilder::with_isa(isa, default_libcall_names());
         if mandelbrot_frame_region.is_some() {
             jit_builder.symbol(
-                "acorn_mandelbrot_render_pixel",
+                "ricochet_mandelbrot_render_pixel",
                 render_mandelbrot_pixel as *const () as *const u8,
             );
         }
-        jit_builder.symbol("acorn_basic_pow", basic_pow as *const () as *const u8);
-        jit_builder.symbol("acorn_basic_abs", basic_abs as *const () as *const u8);
-        jit_builder.symbol("acorn_basic_cos", basic_cos as *const () as *const u8);
-        jit_builder.symbol("acorn_basic_sin", basic_sin as *const () as *const u8);
-        jit_builder.symbol("acorn_basic_tan", basic_tan as *const () as *const u8);
-        jit_builder.symbol("acorn_basic_sqrt", basic_sqrt as *const () as *const u8);
-        jit_builder.symbol("acorn_basic_floor", basic_floor as *const () as *const u8);
-        jit_builder.symbol("acorn_basic_ln", basic_ln as *const () as *const u8);
-        jit_builder.symbol("acorn_basic_log10", basic_log10 as *const () as *const u8);
+        jit_builder.symbol("ricochet_basic_pow", basic_pow as *const () as *const u8);
+        jit_builder.symbol("ricochet_basic_abs", basic_abs as *const () as *const u8);
+        jit_builder.symbol("ricochet_basic_cos", basic_cos as *const () as *const u8);
+        jit_builder.symbol("ricochet_basic_sin", basic_sin as *const () as *const u8);
+        jit_builder.symbol("ricochet_basic_tan", basic_tan as *const () as *const u8);
+        jit_builder.symbol("ricochet_basic_sqrt", basic_sqrt as *const () as *const u8);
+        jit_builder.symbol("ricochet_basic_floor", basic_floor as *const () as *const u8);
+        jit_builder.symbol("ricochet_basic_ln", basic_ln as *const () as *const u8);
+        jit_builder.symbol("ricochet_basic_log10", basic_log10 as *const () as *const u8);
         if !numeric_procedure_regions.is_empty() {
             jit_builder.symbol(
-                "acorn_basic_jit_procedure_enter",
+                "ricochet_basic_jit_procedure_enter",
                 runtime::native_procedure_enter as *const () as *const u8,
             );
             jit_builder.symbol(
-                "acorn_basic_jit_procedure_tick",
+                "ricochet_basic_jit_procedure_tick",
                 runtime::native_procedure_tick as *const () as *const u8,
             );
             jit_builder.symbol(
-                "acorn_basic_jit_procedure_context_ok",
+                "ricochet_basic_jit_procedure_context_ok",
                 runtime::native_procedure_context_ok as *const () as *const u8,
             );
             jit_builder.symbol(
-                "acorn_basic_jit_procedure_get_variable",
+                "ricochet_basic_jit_procedure_get_variable",
                 runtime::native_procedure_get_variable as *const () as *const u8,
             );
             jit_builder.symbol(
-                "acorn_basic_jit_procedure_set_variable",
+                "ricochet_basic_jit_procedure_set_variable",
                 runtime::native_procedure_set_variable as *const () as *const u8,
             );
             jit_builder.symbol(
-                "acorn_basic_jit_procedure_graphics",
+                "ricochet_basic_jit_procedure_graphics",
                 runtime::native_procedure_graphics as *const () as *const u8,
             );
             jit_builder.symbol(
-                "acorn_basic_jit_procedure_integer",
+                "ricochet_basic_jit_procedure_integer",
                 runtime::native_procedure_integer as *const () as *const u8,
             );
         }
@@ -900,7 +900,7 @@ fn define_mandelbrot_frame_kernel<M: Module>(module: &mut M) -> Result<FuncId, S
     callback_signature.returns.push(AbiParam::new(types::I32));
     let callback = module
         .declare_function(
-            "acorn_mandelbrot_render_pixel",
+            "ricochet_mandelbrot_render_pixel",
             Linkage::Import,
             &callback_signature,
         )
@@ -1926,15 +1926,15 @@ const NUMERIC_POWER: u8 = u8::MAX;
 fn declare_numeric_helpers<M: Module>(module: &mut M) -> Result<HashMap<u8, FuncId>, String> {
     let mut helpers = HashMap::new();
     for (token, name, argument_count) in [
-        (NUMERIC_POWER, "acorn_basic_pow", 2),
-        (0x94, "acorn_basic_abs", 1),
-        (0x9B, "acorn_basic_cos", 1),
-        (0xA8, "acorn_basic_floor", 1),
-        (0xAA, "acorn_basic_ln", 1),
-        (0xAB, "acorn_basic_log10", 1),
-        (0xB5, "acorn_basic_sin", 1),
-        (0xB6, "acorn_basic_sqrt", 1),
-        (0xB7, "acorn_basic_tan", 1),
+        (NUMERIC_POWER, "ricochet_basic_pow", 2),
+        (0x94, "ricochet_basic_abs", 1),
+        (0x9B, "ricochet_basic_cos", 1),
+        (0xA8, "ricochet_basic_floor", 1),
+        (0xAA, "ricochet_basic_ln", 1),
+        (0xAB, "ricochet_basic_log10", 1),
+        (0xB5, "ricochet_basic_sin", 1),
+        (0xB6, "ricochet_basic_sqrt", 1),
+        (0xB7, "ricochet_basic_tan", 1),
     ] {
         let mut signature = module.make_signature();
         signature
@@ -1958,7 +1958,7 @@ fn declare_numeric_procedure_helpers<M: Module>(
     status_signature.returns.push(AbiParam::new(types::I32));
     let enter = module
         .declare_function(
-            "acorn_basic_jit_procedure_enter",
+            "ricochet_basic_jit_procedure_enter",
             Linkage::Import,
             &status_signature,
         )
@@ -1969,14 +1969,14 @@ fn declare_numeric_procedure_helpers<M: Module>(
     tick_signature.returns.push(AbiParam::new(types::I32));
     let tick = module
         .declare_function(
-            "acorn_basic_jit_procedure_tick",
+            "ricochet_basic_jit_procedure_tick",
             Linkage::Import,
             &tick_signature,
         )
         .map_err(|error| error.to_string())?;
     let context_ok = module
         .declare_function(
-            "acorn_basic_jit_procedure_context_ok",
+            "ricochet_basic_jit_procedure_context_ok",
             Linkage::Import,
             &status_signature,
         )
@@ -1988,7 +1988,7 @@ fn declare_numeric_procedure_helpers<M: Module>(
     get_signature.returns.push(AbiParam::new(types::F64));
     let get_variable = module
         .declare_function(
-            "acorn_basic_jit_procedure_get_variable",
+            "ricochet_basic_jit_procedure_get_variable",
             Linkage::Import,
             &get_signature,
         )
@@ -2001,7 +2001,7 @@ fn declare_numeric_procedure_helpers<M: Module>(
     set_signature.returns.push(AbiParam::new(types::I32));
     let set_variable = module
         .declare_function(
-            "acorn_basic_jit_procedure_set_variable",
+            "ricochet_basic_jit_procedure_set_variable",
             Linkage::Import,
             &set_signature,
         )
@@ -2015,7 +2015,7 @@ fn declare_numeric_procedure_helpers<M: Module>(
     graphics_signature.returns.push(AbiParam::new(types::I32));
     let graphics = module
         .declare_function(
-            "acorn_basic_jit_procedure_graphics",
+            "ricochet_basic_jit_procedure_graphics",
             Linkage::Import,
             &graphics_signature,
         )
@@ -2026,7 +2026,7 @@ fn declare_numeric_procedure_helpers<M: Module>(
     integer_signature.returns.push(AbiParam::new(types::F64));
     let integer = module
         .declare_function(
-            "acorn_basic_jit_procedure_integer",
+            "ricochet_basic_jit_procedure_integer",
             Linkage::Import,
             &integer_signature,
         )

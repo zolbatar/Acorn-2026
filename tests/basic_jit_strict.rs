@@ -2,7 +2,7 @@
 
 use std::sync::mpsc;
 
-use acorn_2026::{
+use ricochet::{
     basic_compat::{self, JitExecutionReport, StrictJitOptions},
     host::HostConsole,
     memory::Task,

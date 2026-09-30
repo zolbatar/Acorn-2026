@@ -66,7 +66,7 @@ pub fn run_program(
     dispatcher: &mut SwiDispatcher,
 ) -> Result<(), RuntimeError> {
     let parsed = parse_tokenized_program(program)?;
-    run_parsed_program(parsed, task, dispatcher)
+    run_parsed_program(parsed, task, dispatcher, false)
 }
 
 /// Run plain-text BASIC source through the same parser output and interpreter
@@ -77,7 +77,7 @@ pub fn run_source(
     dispatcher: &mut SwiDispatcher,
 ) -> Result<(), RuntimeError> {
     let parsed = parser::parse_source(source)?;
-    run_parsed_program(parsed, task, dispatcher)
+    run_parsed_program(parsed, task, dispatcher, false)
 }
 
 /// Run a program using the persisted MOS configuration, while allowing any
@@ -117,6 +117,7 @@ pub(crate) fn run_program_with_engine_options(
         configuration,
         engine_override,
         strict_options,
+        false,
     )
 }
 
@@ -137,6 +138,7 @@ pub(crate) fn run_program_with_launch_options(
         configuration,
         None,
         StrictJitOptions::default(),
+        false,
     )
 }
 
@@ -173,6 +175,7 @@ pub(crate) fn run_source_with_engine_options(
         configuration,
         engine_override,
         strict_options,
+        false,
     )
 }
 
@@ -193,6 +196,7 @@ pub(crate) fn run_source_with_launch_options(
         configuration,
         None,
         StrictJitOptions::default(),
+        false,
     )
 }
 
@@ -214,7 +218,12 @@ pub(crate) fn run_source_from_basic_console(
             ..BasicLaunchOptions::default()
         },
     )?;
-    dispatcher.with_mos_shell_suspended(|dispatcher| {
+    let preserve_shell = dispatcher.can_keep_modern_shell_for_basic_console(
+        parsed.options.target,
+        parsed.options.text_profile,
+        execution_text_encoding(&parsed),
+    );
+    let run = |dispatcher: &mut SwiDispatcher| {
         run_parsed_configured(
             parsed,
             task,
@@ -222,8 +231,14 @@ pub(crate) fn run_source_from_basic_console(
             configuration,
             None,
             StrictJitOptions::default(),
+            preserve_shell,
         )
-    })
+    };
+    if preserve_shell {
+        run(dispatcher)
+    } else {
+        dispatcher.with_mos_shell_suspended(run)
+    }
 }
 
 fn apply_configuration(parsed: &mut parser::ParsedProgram, configuration: &BasicConfiguration) {
@@ -308,15 +323,19 @@ fn run_parsed_configured(
     configuration: &BasicConfiguration,
     engine_override: Option<BasicEngine>,
     strict_options: StrictJitOptions,
+    preserve_shell: bool,
 ) -> Result<Option<JitExecutionReport>, RuntimeError> {
     match engine_override.unwrap_or(configuration.engine) {
         BasicEngine::Interpreter => {
-            run_parsed_program(parsed, task, dispatcher)?;
+            run_parsed_program(parsed, task, dispatcher, preserve_shell)?;
             Ok(None)
         }
-        BasicEngine::HybridJit => run_parsed_program_jit(parsed, task, dispatcher).map(Some),
+        BasicEngine::HybridJit => {
+            run_parsed_program_jit(parsed, task, dispatcher, preserve_shell).map(Some)
+        }
         BasicEngine::StrictJit => {
-            run_parsed_program_jit_strict(parsed, task, dispatcher, strict_options).map(Some)
+            run_parsed_program_jit_strict(parsed, task, dispatcher, strict_options, preserve_shell)
+                .map(Some)
         }
     }
 }
@@ -339,9 +358,10 @@ fn run_parsed_program(
     parsed: parser::ParsedProgram,
     task: &mut Task,
     dispatcher: &mut SwiDispatcher,
+    preserve_shell: bool,
 ) -> Result<(), RuntimeError> {
     validate_program_options(&parsed)?;
-    set_execution_display_profile(&parsed, dispatcher)?;
+    set_execution_display_profile(&parsed, dispatcher, preserve_shell)?;
     runtime::Interpreter::new(parsed).run(task, dispatcher)
 }
 
@@ -354,7 +374,7 @@ pub fn run_program_jit(
     dispatcher: &mut SwiDispatcher,
 ) -> Result<JitExecutionReport, RuntimeError> {
     let parsed = parse_tokenized_program(program)?;
-    run_parsed_program_jit(parsed, task, dispatcher)
+    run_parsed_program_jit(parsed, task, dispatcher, false)
 }
 
 pub fn run_source_jit(
@@ -363,7 +383,7 @@ pub fn run_source_jit(
     dispatcher: &mut SwiDispatcher,
 ) -> Result<JitExecutionReport, RuntimeError> {
     let parsed = parser::parse_source(source)?;
-    run_parsed_program_jit(parsed, task, dispatcher)
+    run_parsed_program_jit(parsed, task, dispatcher, false)
 }
 
 /// Compile the complete parsed program before execution. Unsupported code is
@@ -384,7 +404,7 @@ pub fn run_program_jit_strict_with_options(
     options: StrictJitOptions,
 ) -> Result<JitExecutionReport, RuntimeError> {
     let parsed = parse_tokenized_program(program)?;
-    run_parsed_program_jit_strict(parsed, task, dispatcher, options)
+    run_parsed_program_jit_strict(parsed, task, dispatcher, options, false)
 }
 
 pub fn run_source_jit_strict(
@@ -402,7 +422,7 @@ pub fn run_source_jit_strict_with_options(
     options: StrictJitOptions,
 ) -> Result<JitExecutionReport, RuntimeError> {
     let parsed = parser::parse_source(source)?;
-    run_parsed_program_jit_strict(parsed, task, dispatcher, options)
+    run_parsed_program_jit_strict(parsed, task, dispatcher, options, false)
 }
 
 fn run_parsed_program_jit_strict(
@@ -410,19 +430,21 @@ fn run_parsed_program_jit_strict(
     task: &mut Task,
     dispatcher: &mut SwiDispatcher,
     options: StrictJitOptions,
+    preserve_shell: bool,
 ) -> Result<JitExecutionReport, RuntimeError> {
     validate_program_options(&parsed)?;
     #[cfg(feature = "experimental-jit")]
     {
-        set_execution_display_profile(&parsed, dispatcher)?;
+        set_execution_display_profile(&parsed, dispatcher, preserve_shell)?;
         return strict_jit::run_parsed_program_with_options(parsed, task, dispatcher, options);
     }
 
     #[cfg(not(feature = "experimental-jit"))]
     {
-        let _ = (parsed, task, dispatcher, options);
+        let _ = (parsed, task, dispatcher, options, preserve_shell);
         Err(RuntimeError::Program(
-            "strict BASICJIT is experimental; start Acorn-2026 with `cargo run-jit` first".into(),
+            "strict BASICJIT is experimental; use the JIT-enabled executable (`cargo run-jit`)"
+                .into(),
         ))
     }
 }
@@ -431,19 +453,20 @@ fn run_parsed_program_jit(
     parsed: parser::ParsedProgram,
     task: &mut Task,
     dispatcher: &mut SwiDispatcher,
+    preserve_shell: bool,
 ) -> Result<JitExecutionReport, RuntimeError> {
     validate_program_options(&parsed)?;
     #[cfg(feature = "experimental-jit")]
     {
-        set_execution_display_profile(&parsed, dispatcher)?;
+        set_execution_display_profile(&parsed, dispatcher, preserve_shell)?;
         return jit::run_parsed_program_jit(parsed, task, dispatcher);
     }
 
     #[cfg(not(feature = "experimental-jit"))]
     {
-        let _ = (parsed, task, dispatcher);
+        let _ = (parsed, task, dispatcher, preserve_shell);
         Err(RuntimeError::Program(
-            "BASICJIT is experimental; start Acorn-2026 with `cargo run-jit` first".into(),
+            "BASICJIT is experimental; use the JIT-enabled executable (`cargo run-jit`)".into(),
         ))
     }
 }
@@ -460,23 +483,35 @@ fn validate_program_options(parsed: &parser::ParsedProgram) -> Result<(), Runtim
 fn set_execution_display_profile(
     parsed: &parser::ParsedProgram,
     dispatcher: &mut SwiDispatcher,
+    preserve_shell: bool,
 ) -> Result<(), RuntimeError> {
-    dispatcher.set_display_profiles(
-        parsed.options.target,
-        parsed.options.text_profile,
-        match parsed.options.text_profile {
-            TextRenderingProfile::Classic => match parsed.options.mode {
-                BasicLanguageMode::Basic64 => TextEncoding::Utf8,
-                BasicLanguageMode::Classic | BasicLanguageMode::Hybrid => {
-                    TextEncoding::ClassicBytes
-                }
-            },
-            TextRenderingProfile::Modern if parsed.options.mode == BasicLanguageMode::Classic => {
-                TextEncoding::Latin1
-            }
-            TextRenderingProfile::Modern => TextEncoding::Utf8,
+    let encoding = execution_text_encoding(parsed);
+    if preserve_shell {
+        dispatcher.set_basic_console_display_profiles(
+            parsed.options.target,
+            parsed.options.text_profile,
+            encoding,
+        )
+    } else {
+        dispatcher.set_display_profiles(
+            parsed.options.target,
+            parsed.options.text_profile,
+            encoding,
+        )
+    }
+}
+
+fn execution_text_encoding(parsed: &parser::ParsedProgram) -> TextEncoding {
+    match parsed.options.text_profile {
+        TextRenderingProfile::Classic => match parsed.options.mode {
+            BasicLanguageMode::Basic64 => TextEncoding::Utf8,
+            BasicLanguageMode::Classic | BasicLanguageMode::Hybrid => TextEncoding::ClassicBytes,
         },
-    )
+        TextRenderingProfile::Modern if parsed.options.mode == BasicLanguageMode::Classic => {
+            TextEncoding::Latin1
+        }
+        TextRenderingProfile::Modern => TextEncoding::Utf8,
+    }
 }
 
 #[cfg(test)]

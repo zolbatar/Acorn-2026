@@ -1,4 +1,4 @@
-use acorn_2026::{
+use ricochet::{
     basic_compat,
     host::HostConsole,
     memory::{GUEST_MEMORY_BASE, GUEST_MEMORY_SIZE, SWI_ERROR_BLOCK_SIZE, Task},

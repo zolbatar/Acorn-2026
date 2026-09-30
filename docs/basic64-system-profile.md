@@ -3,7 +3,7 @@
 ## Status
 
 This document records the agreed language direction and the provisional,
-executable grammar for the native BASIC64 profile used to implement Trellis
+executable grammar for the native BASIC64 profile used to implement Ricochet
 modules and system policy.
 
 The feature categories and semantic boundaries are firm. The spelling below has
@@ -21,8 +21,9 @@ The first vertical slice now exercises more than parser-only syntax:
 - `REM @SYSTEM_PROFILE 0.1` modules declare versioned dependencies, symbol and
   primitive imports, requested capabilities, SWI contracts, lifecycle hooks,
   replacement policy, private state, and public/private symbols. A deterministic
-  `TRELLIS-MANIFEST\t1` wire form round-trips the resolved manifest and rejects
-  missing, duplicate, unknown, or invalid fields.
+  `RICOCHET-MANIFEST\t1` wire form round-trips the resolved manifest. The
+  decoder also accepts the previous pre-release `TRELLIS-MANIFEST\t1` header;
+  both forms reject missing, duplicate, unknown, or invalid fields.
 - `RECORD`, `ENUM`, `FLAGS`, `ERROR`, and `HANDLE` declarations are resolved
   against typed signatures, state, fields, primitive results, and SWI register
   contracts. Records and errors are managed values; handles remain nominal and
@@ -94,7 +95,7 @@ Error, FileSwitch, and Wimp fragments are executable unit-test fixtures in
 `src/basic_compat/system_profile.rs`; the Console example is the real source
 module at [`../modules/Console.bas64`](../modules/Console.bas64). The original
 Phase 4 capsule comprised seven native foundation modules; the current capsule
-adds `TrellisCommands` for BASIC64-owned `OS_CLI` routing of its own command
+adds `RicochetCommands` for BASIC64-owned `OS_CLI` routing of its own command
 family. The source files are
 [`../modules/System.bas64`](../modules/System.bas64),
 [`../modules/Boot.bas64`](../modules/Boot.bas64),
@@ -103,11 +104,11 @@ family. The source files are
 [`../modules/TaskManager.bas64`](../modules/TaskManager.bas64),
 [`../modules/Memory.bas64`](../modules/Memory.bas64), and Console.
 The current capsule also loads
-[`../modules/TrellisCommands.bas64`](../modules/TrellisCommands.bas64).
+[`../modules/RicochetCommands.bas64`](../modules/RicochetCommands.bas64).
 System is a source-visible startup facade and owns the bounded
 `OS_SWINumberToString`, `OS_SWINumberFromString`, and `OS_ReadMonotonicTime`
 services; its `StartupPolicy` capability limits configuration read and
-MOS/desktop handoff to three declared protected primitives. `TrellisCommands` parses and presents
+MOS/desktop handoff to three declared protected primitives. `RicochetCommands` parses and presents
 read-only `*INSPECT MODULES`, `MODULE`, `SWI`, and bounded retained-source
 `DEFINITION` queries (`SOURCE` is a read-only alias). Classic module commands
 are `*Modules`, `*RMLoad`, `*RMRun`, `*RMKill`, and conditional `*RMEnsure`;
@@ -139,23 +140,23 @@ normal calls still propagate through the existing hosted `RuntimeError` path
 rather than a RISC OS error vector/handler. BBC `SYS ... TO ... ; flags` can
 capture NZCV (V is bit 0) in this hosted subset.
 
-`TrellisCommands` also owns the hosted six-key v3 `*CONFIGURE`/`*STATUS`
+`RicochetCommands` also owns the hosted six-key v3 `*CONFIGURE`/`*STATUS`
 contract. The standard analogues are `Language` (only module 0/3) and
 `WimpMode`/`Mode` (`Auto` or a supported `X<width> Y<height> C/G<depth>`
 selector). WimpMode alone controls resolution and palette: Auto means
 host-sized, full-colour C16M/Rgb888; fixed selectors choose both dimensions
 and palette. Old `DisplayResolution` and `DisplayColour` file keys migrate to
-WimpMode, v2 WimpMode takes precedence over retired `TrellisOutputProfile`,
+WimpMode, v2 WimpMode takes precedence over retired `RicochetOutputProfile`,
 and old `WindowFurniture` is discarded. These are not public options. There is
 no bevelled furniture option or rendering path. See the MOS configuration
 audit for defaults, mappings, and unsupported PRM mode selectors.
 
-ModuleManager's `Acorn_ModuleInfo` extension (&4FF10, ABI 1) enumerates active
+ModuleManager's `Ricochet_ModuleInfo` extension (&4FF10, ABI 1) enumerates active
 module names, versions, and lifecycle states into checked caller memory.
 ModuleManager also owns post-boot
-`OS_Module` (&1E) reasons 1 Load and 4 Delete, plus `Acorn_ModuleLookup`
-(&4FF12), `Acorn_SwiInfo` (&4FF13), `Acorn_ModuleExport` (&4FF14), and
-`Acorn_DefinitionSource` (&4FF15). Load accepts bounded caller-path,
+`OS_Module` (&1E) reasons 1 Load and 4 Delete, plus `Ricochet_ModuleLookup`
+(&4FF12), `Ricochet_SwiInfo` (&4FF13), `Ricochet_ModuleExport` (&4FF14), and
+`Ricochet_DefinitionSource` (&4FF15). Load accepts bounded caller-path,
 UTF-8 BASIC64 source of filetype `&064`; guests cannot request protected
 capabilities, and public imports must resolve to active dependencies. A same-
 title reload supports only the compatible-immediate class: it preserves module
@@ -165,34 +166,34 @@ capability, dependency, public-contract, or complete persistent type/schema
 changes rather than attempting state migration. Candidate Start and old
 Quiesce/Finalise do not run. Delete uses transactional Quiesce/Finalise,
 protects foundation and depended-on modules, and allows retry after failed
-Finalise. `Acorn_ModuleExport` enumerates active manifest SWI exports;
-`Acorn_DefinitionSource` reads retained current PROC/FN source in bounded
-caller-memory chunks. `Acorn_ModuleExport` is public metadata, while
-`Acorn_DefinitionSource` requires `SourceRead` before retained bytes are read
-or returned. Its CLI projection has the same check. `TrellisCommands.bas64` owns
+Finalise. `Ricochet_ModuleExport` enumerates active manifest SWI exports;
+`Ricochet_DefinitionSource` reads retained current PROC/FN source in bounded
+caller-memory chunks. `Ricochet_ModuleExport` is public metadata, while
+`Ricochet_DefinitionSource` requires `SourceRead` before retained bytes are read
+or returned. Its CLI projection has the same check. `RicochetCommands.bas64` owns
 `*INSPECT` query presentation and the documented classic module command subset;
 other MOS command parsing remains on the legacy Rust adapter.
 Other historical `OS_Module` reasons are structured rejections, particularly reason 18 because
 it returns process pointers; `%` instantiations and native `&FFA` images are
 unsupported. The project queries return manifest identity through checked
 caller buffers, never pointers. Exact OS_Module reasons and register shapes
-are documented in [`trellis-boot-capsule.md`](trellis-boot-capsule.md) and the
+are documented in [`ricochet-boot-capsule.md`](ricochet-boot-capsule.md) and the
 [RISC OS PRM](https://www.riscos.com/support/developers/prm/modules.html).
 
 TaskManager's
-`Acorn_TaskInfo` extension (&4FF11, ABI 1) reports the caller task ID, logical
+`Ricochet_TaskInfo` extension (&4FF11, ABI 1) reports the caller task ID, logical
 address-space span, and dynamic-area count, not task-creation or scheduler
 control. Memory owns standard `OS_ChangeDynamicArea` (&2A) and
 `OS_DynamicArea` (&66) reason dispatch. Its hosted areas use automatic
 caller-local IDs/bases and checked task memory, with a 16 MiB per-area cap,
 32 MiB per-task reservation cap, and no callbacks, physical pages, or
 doubly-mapped support. Exact public ownership and compatibility gaps are listed
-in [`trellis-boot-capsule.md`](trellis-boot-capsule.md) and
-[`trellis-compatibility-matrix.md`](trellis-compatibility-matrix.md).
+in [`ricochet-boot-capsule.md`](ricochet-boot-capsule.md) and
+[`ricochet-compatibility-matrix.md`](ricochet-compatibility-matrix.md).
 
 ## Purpose
 
-Trellis should not encode its module system, primitive boundary, capabilities,
+Ricochet should not encode its module system, primitive boundary, capabilities,
 and live identities as strings, magic integers, parallel arrays, or informal
 register conventions merely because BASIC64 has not yet acquired appropriate
 syntax.
@@ -207,7 +208,7 @@ The design test is:
 > directness and readability of BBC BASIC.**
 
 The profile is requirements-driven. It is not permission to design an entire
-general-purpose language before implementing Trellis.
+general-purpose language before implementing Ricochet.
 
 ## Compatibility boundary
 
@@ -592,7 +593,7 @@ System Profile 0.1 deliberately separates:
 - **modules** for behaviour, namespace, and owned state;
 - **procedures/functions** for executable definitions.
 
-This combination is sufficient to test the first Trellis modules. Records do
+This combination is sufficient to test the first Ricochet modules. Records do
 not acquire identity merely because they contain fields, and handles do not
 imply a conventional class hierarchy.
 
@@ -616,7 +617,7 @@ First-class functions and lexical closures are likely useful. They should follow
 the first module slice unless a concrete lifecycle, callback, or service-handler
 requirement proves they are necessary earlier.
 
-Deferred features must be justified by executable Trellis requirements rather
+Deferred features must be justified by executable Ricochet requirements rather
 than general language fashion.
 
 ## Implementation obligations

@@ -1,4 +1,4 @@
-use acorn_2026::tokenized_basic::{TokenizedBasicProgram, TokenizedBasicRecordLayout};
+use ricochet::tokenized_basic::{TokenizedBasicProgram, TokenizedBasicRecordLayout};
 
 struct Fixture {
     name: &'static str,

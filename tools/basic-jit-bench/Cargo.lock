@@ -19,7 +19,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
 
 [[package]]
-name = "acorn-2026"
+name = "ricochet"
 version = "0.1.0"
 dependencies = [
  "arboard",
@@ -154,7 +154,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 name = "basic-jit-bench"
 version = "0.1.0"
 dependencies = [
- "acorn-2026",
+ "ricochet",
  "cranelift-codegen",
  "cranelift-frontend",
  "cranelift-jit",

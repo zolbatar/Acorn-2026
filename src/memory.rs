@@ -102,7 +102,7 @@ impl GuestMemory {
             0,
             0,
             0,
-            "TrellisCommands scratch".into(),
+            "command scratch".into(),
         )?;
         self.command_scratch_areas.insert(area.number);
         Ok(area)
@@ -112,7 +112,7 @@ impl GuestMemory {
     pub fn release_command_scratch(&mut self, number: u32) -> Result<(), MemoryError> {
         if !self.command_scratch_areas.contains(&number) {
             return Err(MemoryError::InvalidDynamicArea(
-                "area is not a Trellis command scratch allocation".into(),
+                "area is not a command scratch allocation".into(),
             ));
         }
         self.remove_dynamic_area(number)

@@ -1,0 +1,670 @@
+schema_version: 1
+inventory_version: 1
+scope:
+  source: src/swi.rs, src/wimp.rs, and active modules/*.bas64 manifests
+  note: >-
+    This describes the hosted dispatcher currently in the repository, including
+    named-only project services. It is an implementation inventory, not a
+    claim of complete RISC OS coverage. Register and memory descriptions use
+    the currently implemented hosted contract; public compatibility gaps are
+    recorded in ricochet-compatibility-matrix.md.
+
+dispatch_routes:
+  module_owned:
+    - "0x00 OS_WriteC -> Console.WriteC"
+    - "0x01 OS_WriteS -> Console.WriteS"
+    - "0x02 OS_Write0 -> Console.Write0"
+    - "0x03 OS_NewLine -> Console.NewLine"
+    - "0x04 OS_ReadC -> Console.ReadC"
+    - "0x0E OS_ReadLine -> Console.ReadLine"
+    - "0x38 OS_SWINumberToString -> System.SwiNumberToString"
+    - "0x39 OS_SWINumberFromString -> System.SwiNumberFromString"
+    - "0x42 OS_ReadMonotonicTime -> System.ReadMonotonicTime"
+    - "0x2A OS_ChangeDynamicArea -> Memory.ChangeDynamicArea"
+    - "0x2B OS_GenerateError -> Error.GenerateError"
+    - "0x66 OS_DynamicArea -> Memory.DynamicArea"
+    - "0x4FF10 Ricochet_ModuleInfo -> ModuleManager.ReadModuleInfo (project extension)"
+    - "0x1E OS_Module -> ModuleManager.OperateModule"
+    - "0x4FF12 Ricochet_ModuleLookup -> ModuleManager.LookupModule (project extension)"
+    - "0x4FF13 Ricochet_SwiInfo -> ModuleManager.ReadSwiInfo (project extension)"
+    - "0x4FF11 Ricochet_TaskInfo -> TaskManager.ReadTaskInfo (project extension)"
+    - "0x4FF14 Ricochet_ModuleExport -> ModuleManager.LookupModuleExport (project extension)"
+    - "0x4FF15 Ricochet_DefinitionSource -> ModuleManager.ReadDefinitionSource (project extension)"
+    - "0x05 OS_CLI -> RicochetCommands.ExecuteCli"
+  transitional_numeric: all numeric services below without a module-owned route
+  transitional_named_only:
+    - COLOURTRANS_CONVERTHSVTORGB
+    - COLOURTRANS_SETGCOL
+    - COLOURTRANS_WRITEPALETTE
+    - RICOCHET_DESKTOP
+    - RICOCHET_DISPLAY
+
+system_query_identity:
+  authority: "Active module manifest exports; numeric/name constants in host code are routing metadata, not an identity source."
+  lookup_scope: "Only currently active manifest-owned exports are mapped. Transitional Rust-only SWIs, the OS_WriteI encoding range, and unknown numbers/names are not synthesized."
+  to_string: "OS_SWINumberToString strips bit 17 for the active identity lookup, prepends X when set, returns a NUL-terminated name, and reports the name length excluding NUL in R2. A checked caller buffer must fit name plus NUL."
+  from_string: "OS_SWINumberFromString scans a caller-scoped logical string until an ASCII control/space byte, recognizes leading uppercase X as bit 17, matches names exactly/case-sensitively, preserves R1 and returns R0. Unknown names return a structured identity error."
+  monotonic_time: "OS_ReadMonotonicTime returns wrapping low-32-bit centiseconds since hosted runtime initialization; unlike the PRM hard-reset/power-on epoch, this hosted epoch is not hardware reset time."
+  limits: "The historical PRM also defines fallback names for unmigrated OS SWIs, OS_WriteI character forms, numeric module-chunk suffixes, and User fallback names. Ricochet intentionally does not guess identities for services absent from active manifests."
+  prm_references:
+    - https://www.riscos.com/support/developers/prm/conversions.html
+    - https://www.riscos.com/support/developers/prm/timedate.html
+
+numeric_services:
+  - number: "0x00"
+    name: OS_WriteC
+    current_handler: SwiDispatcher::dispatch (transitional fallback); module route takes precedence
+    contract: "R0 low byte input; other registers, PC, and carry preserved"
+    logical_memory: none
+    blocking: false
+    owner: Console
+    final_form: "BASIC64 definition with ConsoleStream and ConsoleOutput primitive imports"
+    current_tests: "WP3 console module end-to-end test; existing Wimp/graphics output tests"
+
+  - number: "0x01"
+    name: OS_WriteS
+    current_handler: SwiDispatcher::write_inline_string (transitional fallback)
+    contract: "PC points at inline NUL-terminated bytes; PC advances to next word-aligned instruction"
+    logical_memory: "read from caller task at PC, at most 4096 bytes"
+    blocking: false
+    owner: Console
+    final_form: "BASIC64 definition using typed caller-scoped PC/address traversal and byte output primitives"
+    current_tests: "WP3 module test checks PC alignment; 4096-byte missing-terminator test verifies the original PC error address"
+
+  - number: "0x02"
+    name: OS_Write0
+    current_handler: SwiDispatcher::write_indirect_string (transitional fallback)
+    contract: "R0 logical address input; R0 returns first address after NUL"
+    logical_memory: "read caller task at R0, at most 4096 bytes"
+    blocking: false
+    owner: Console
+    final_form: "BASIC64 definition using ADDRESS32-typed caller memory and byte output primitives"
+    current_tests: "WP3 module test checks returned R0; 4096-byte missing-terminator test verifies the original R0 address"
+
+  - number: "0x03"
+    name: OS_NewLine
+    current_handler: SwiDispatcher::dispatch (transitional fallback)
+    contract: "emits LF then CR through OS_WriteC; registers, PC, and carry preserved"
+    logical_memory: none
+    blocking: false
+    owner: Console
+    final_form: "BASIC64 definition composing the Console byte definition"
+    current_tests: "WP3 module end-to-end test"
+
+  - number: "0x04"
+    name: OS_ReadC
+    current_handler: SwiDispatcher::read_character (transitional fallback)
+    contract: "R0 receives byte; carry is set for Escape; EndOfInput is a runtime error"
+    logical_memory: none
+    blocking: true
+    owner: Console
+    final_form: "BASIC64 definition over ConsoleInput primitive"
+    current_tests: "WP3 module test checks byte and Escape carry; tests/mos_calls.rs checks input bridge"
+
+  - number: "0x05"
+    name: OS_CLI
+    current_handler: "RicochetCommands.ExecuteCli BASIC64 definition; Host.MOS.ExecuteLegacy protected fallback"
+    contract: "R0 unmasked caller logical address of command; command runs synchronously and preserves R0 on success. BASIC64 parser recognizes NUL, LF, or CR line endings."
+    logical_memory: "checked caller task read at R0, bounded to 256 bytes; unterminated input is rejected, never truncated"
+    blocking: true
+    owner: RicochetCommands
+    final_form: "BASIC64 `*INSPECT`, supported classic module commands, `*CONFIGURE`, and `*STATUS` parsing/selection/validation/presentation plus explicit `Host.MOS.ExecuteLegacy` bridge for remaining MOS commands"
+    current_tests: "tests/ricochet_classic_module_commands.rs; tests/ricochet_mos_introspection.rs; tests/ricochet_mos_configuration.rs; tests/ricochet_configuration_recovery.rs; tests/ricochet_authorization.rs; src/swi.rs CLI abbreviation/configuration/desktop tests; tests/mos_calls.rs"
+    configuration_contract: "Current v3 schema has six keys: Language (PRM decimal/&hex/base_num spelling, hosted values 0/3), WimpMode (Mode alias; Auto or canonical X<width> Y<height> C/G<depth>; zero-padded 3/4 digit dimensions canonicalize), BASICMode, BASICProfile, BASICTarget, and BASICEngine. WimpMode alone chooses both resolution and palette: fixed selectors support six logical sizes and C2/C16/C256/C32K/C16M/G4/G16/G256; Auto is host-sized and full-colour C16M/Rgb888. Physical mode IDs, EX/EY scaling and frame rate are unsupported. Defaults: Language=0, BASICMode=AUTO, BASICProfile=AUTO, BASICTarget=AUTO, BASICEngine=INTERPRETER, WimpMode=AUTO. Old DisplayResolution/DisplayColour pairs migrate to WimpMode (Window becomes Auto/full-colour); explicit WimpMode in v2 wins over retired RicochetOutputProfile. WindowFurniture and RicochetOutputProfile rows are discarded on file load; legacy keys are file-load migration only and rejected by command/reset APIs. Renderer appearance is flat-only. Stored reads are bounded to 64 KiB."
+    compatibility: "The interim `*RICOCHET` family is not recognized or advertised. `*INSPECT` is read-only: MODULES [filter], MODULE title, SWI name|number, DEFINITION module/definition [strict decimal byte offset], with SOURCE as a read-only alias. Classic supported routes are *Modules, *RMLoad, *RMRun, *RMKill, and conditional *RMEnsure. Final-dot prefixes use a fixed BASIC64 table and exact routes win; ambiguous prefixes error. The current table includes `*I.`, `*M.`, `*Mod.`, and `*INSPE.`; it does not reproduce PRM's dynamic alias/module-order resolution. Repeated leading `*` and command whitespace are stripped. RMLoad/RMRun accept one guest path to BASIC64 filetype &064; init strings are rejected. RMRun equals RMLoad because hosted modules have no app-entry address. RMKill does not model `%instance`. RMEnsure compares numeric major.minor[.patch] components, no-ops when installed version is sufficient, and executes its bounded tail only when missing/older; an unsatisfied check without tail raises CliError. `*Modules` lists logical hosted title/version/state without invented RMA/workspace addresses or instance rows. RMReInit/RMInsert/RMTidy/RMClear/RMFaster/ROMModules/Unplug are explicit unsupported errors without state change because hosted ROM/RMA/unplug support does not exist. CONFIGURE/CONF. and STATUS policy is BASIC64-owned. OS_CLI accepts NUL/LF/CR terminators, preserves R0, and uses checked task-local dynamic scratch released on normal or exceptional exit. Configuration writes require separate caller Task ConfigurationWrite authority deliberately granted to interactive MOS, not inherited by spawned tasks; source reading and module management remain separate rights. Malformed, unsupported, unreadable, invalid-UTF-8, and oversized stored configuration now boots with safe defaults and a path-redacted warning/status; the file remains unchanged until an authorized successful repair preserves recoverable bytes in a `.recovery-*` sibling and atomically writes canonical v3. Oversized input is copied by streaming. This post-foundation route is separate from native capsule recovery. Remaining MOS command semantics are transitional Rust; full OS_CLI migration is open."
+
+  - number: "0x06"
+    name: OS_Byte
+    current_handler: SwiDispatcher::os_byte via MosState
+    contract: "R0 low byte reason; R1/R2 inputs and reason-specific return registers/carry"
+    logical_memory: none
+    blocking: false
+    owner: MOS
+    final_form: "BASIC64 MOS policy over typed input, configuration, and clock primitives"
+    current_tests: "tests/mos_calls.rs: osbyte_keyboard_queue_and_cli_use_existing_services; input/register preservation tests"
+
+  - number: "0x07"
+    name: OS_Word
+    current_handler: SwiDispatcher::os_word and MosState
+    contract: "R0 reason; R1 caller logical pointer to reason-specific control block"
+    logical_memory: "checked caller memory; reason-specific size (clock reasons 1-4 are tested)"
+    blocking: false
+    owner: MOS
+    final_form: "BASIC64 reason dispatch over typed caller-memory and clock primitives"
+    current_tests: "tests/mos_calls.rs: call_osword_uses_checked_full_and_split_pointers"
+
+  - number: "0x08"
+    name: OS_File
+    current_handler: SwiDispatcher::os_file
+    contract: "R0 action; R1 filename pointer; R2-R5 action-specific input/output registers"
+    logical_memory: "checked caller strings and action-specific control data"
+    blocking: false
+    owner: FileSwitch
+    final_form: "BASIC64 FileSwitch semantics over filesystem and caller-memory primitives"
+    current_tests: "src/swi.rs FileSwitch/guest catalogue tests; compatibility gaps are listed in the matrix"
+
+  - number: "0x09"
+    name: OS_Args
+    current_handler: SwiDispatcher::os_args
+    contract: "R0 reason; R1 open-file handle; R2/R3 reason-specific position/value"
+    logical_memory: "no block pointer in the currently hosted reasons"
+    blocking: false
+    owner: FileSwitch
+    final_form: "BASIC64 FileSwitch operation over task-owned file-channel primitives"
+    current_tests: "FileSwitch unit coverage is partial; see ricochet-compatibility-matrix.md"
+
+  - number: "0x0A"
+    name: OS_BGet
+    current_handler: SwiDispatcher::os_bget
+    contract: "R0 file handle input; R0 byte result; carry reports EOF"
+    logical_memory: none
+    blocking: false
+    owner: FileSwitch
+    final_form: "BASIC64 byte-read service over a checked task file-channel primitive"
+    current_tests: "src/swi.rs guest catalogue/type tests; focused EOF/handle matrix remains incomplete"
+
+  - number: "0x0B"
+    name: OS_BPut
+    current_handler: SwiDispatcher::os_bput
+    contract: "R0 file handle; R1 byte input"
+    logical_memory: none
+    blocking: false
+    owner: FileSwitch
+    final_form: "BASIC64 byte-write service over a checked task file-channel primitive"
+    current_tests: "FileSwitch unit coverage is partial; see ricochet-compatibility-matrix.md"
+
+  - number: "0x0C"
+    name: OS_GBPB
+    current_handler: SwiDispatcher::os_gbpb / os_gbpb_file / os_gbpb_names
+    contract: "R0 reason; R1 handle; R2 caller buffer; R3 count; R4/R5 operation-specific state"
+    logical_memory: "checked caller buffer for byte and catalogue operations"
+    blocking: false
+    owner: FileSwitch
+    final_form: "BASIC64 reason handling over checked memory and file-channel primitives"
+    current_tests: "src/swi.rs catalogue and guest-buffer tests; full reason set not implemented"
+
+  - number: "0x0D"
+    name: OS_Find
+    current_handler: SwiDispatcher::os_find
+    contract: "R0 open/close action; R1 filename pointer or handle; R0 returns allocated handle"
+    logical_memory: "checked caller NUL-terminated filename"
+    blocking: false
+    owner: FileSwitch
+    final_form: "BASIC64 channel lifecycle over filesystem primitives"
+    current_tests: "src/swi.rs guest catalogue tests; exact historical flag combinations remain incomplete"
+
+  - number: "0x0E"
+    name: OS_ReadLine
+    current_handler: "Console.ReadLine via module entry cell; SwiDispatcher::read_line remains an explicit transitional fallback"
+    contract: "R0 buffer/options; R1 maximum length; R2/R3 accepted byte range; R4 optional echo byte; returns R0=0, R1=length, R2=R3=0 and carry on Escape"
+    logical_memory: "checked caller buffer, at most requested length"
+    blocking: true
+    owner: Console
+    final_form: "BASIC64 edit/echo policy over ConsoleInput, ConsoleOutput, and checked caller-scoped memory"
+    current_tests: "swi::tests::os_read_line_* cover module route, editing/backspace, accepted range, echo-only and R4 substitution flags, buffer-full bell, Escape, EOF, CR and memory bounds; exhaustive option combinations and exact error-block details remain gaps"
+
+  - number: "0x1E"
+    name: OS_Module
+    current_handler: "ModuleManager.OperateModule BASIC64 definition; Host.ModuleManager.LoadSource/Unload protected primitives"
+    contract: "Historical reason 1 Load (R0=1,R1 pathname) and reason 4 Delete (R0=4,R1 full module title); both require ModuleManagement on the original caller Task; R0/R1 preserved on success. Load reads a HostFS guest path to UTF-8 BASIC64 source filetype &064 and links/starts a new module, or performs a compatible-immediate same-title source replacement. Delete quiesces/finalises an active guest module."
+    logical_memory: "R1 is a checked caller-scoped NUL-terminated logical string (256 bytes for Load, 128 for Delete)"
+    blocking: true
+    owner: ModuleManager
+    final_form: "BASIC64 reason selection and public policy over protected HostFS/registry/lifecycle mechanisms"
+    current_tests: "swi::tests::module_manager_loads_inspects_and_unloads_guest_source_modules; swi::tests::module_manager_replaces_guest_exports_as_one_generation_and_preserves_workspace; wp51_os_module_replacement_is_atomic_compatible_and_preserves_active_calls; swi::tests::module_manager_rolls_back_failed_guest_start_and_protects_foundation; swi::tests::module_manager_enforces_guest_capability_and_dependency_boundaries; swi::tests::swi_errors_and_x_form_errors_use_the_documented_task_scoped_block"
+    compatibility: "Deliberate hosted adaptation: &064 visible BASIC64 source replaces historical &FFA relocatable ARM image. The requestor Task must carry ModuleManagement; ModuleManager's provider capability does not confer it. Titles are ASCII alphanumeric and matched case-insensitively; case-only replacement preserves the installed spelling. A same-title Load atomically replaces all exports only when module identity/version/dependencies/capabilities/lifecycle, SWI names/numbers/definition names/register contracts, exported PROC/FN signatures, and full persistent/type schema are unchanged. It preserves ModuleId, entry-cell IDs and workspace; active leases keep old code. Candidate Start and old Quiesce/Finalise are not rerun. Incompatible candidates are rejected without disturbing the installed module. This is intentionally safer than PRM reason 1, which kills the old module and all instantiations before initialization. No init parameters or %instantiations. Only reasons 1 and 4 are supported. Reasons 0, 2-3, 5-17, and 19-20 return UnsupportedServiceReason. Reasons 12 and 18 are specifically rejected because their outputs include raw module/private-word/postfix pointers; safe inventory and name lookup are provided by Ricochet_ModuleInfo and Ricochet_ModuleLookup."
+
+  - number: "0x29"
+    name: OS_FSControl
+    current_handler: SwiDispatcher::os_fscontrol
+    contract: "R0 reason; R1 filesystem number or string pointer; R2-R5 reason-specific data"
+    logical_memory: "checked caller strings and reason-specific control data"
+    blocking: false
+    owner: FileSwitch
+    final_form: "BASIC64 filing-system policy over host volume and checked memory primitives"
+    current_tests: "src/swi.rs guest catalogue/type tests; filing-system reason coverage is partial"
+
+  - number: "0x32"
+    name: OS_ReadPoint
+    current_handler: SwiDispatcher::dispatch
+    contract: "R0/R1 input coordinates; R2/R3 result colour/tint; R4 indicates outside-surface result"
+    logical_memory: none
+    blocking: false
+    owner: Graphics
+    final_form: "BASIC64 graphics service over caller-owned surface query primitive"
+    current_tests: "src/swi.rs os_read_point_reads_immediate_pixels_and_preserves_coordinates"
+
+  - number: "0x38"
+    name: OS_SWINumberToString
+    current_handler: "System.SwiNumberToString BASIC64 definition; Host.System.SwiNumberToString protected primitive"
+    contract: "R0 SWI number and R1 buffer pointer are preserved; R2 is the maximum buffer length on entry and name length on exit. Output is NUL-terminated; bit 17 adds a leading X."
+    logical_memory: "R1 is a checked caller-scoped logical output buffer; capacity is 1..128 bytes and must fit the returned name plus NUL."
+    blocking: false
+    owner: System
+    final_form: "BASIC64 conversion policy over active manifest identity lookup and checked caller memory"
+    current_tests: "swi::tests::system_query_swis_use_active_manifest_identity_and_checked_buffers; wp51_public_contracts_cover_modules_errors_identity_and_system_queries"
+    compatibility: "Only active manifest-owned SWIs are returned. Transitional Rust-only handlers, OS_WriteI aliases, numeric module-chunk names, and unknown User names are not synthesized; unsupported identity and short-buffer cases return structured errors."
+
+  - number: "0x39"
+    name: OS_SWINumberFromString
+    current_handler: "System.SwiNumberFromString BASIC64 definition; Host.System.SwiNumberFromString protected primitive"
+    contract: "R1 points to a control/space-terminated name; R1 is preserved and R0 receives the SWI number. Leading uppercase X sets bit 17. Names are case-sensitive."
+    logical_memory: "R1 is a checked caller-scoped logical input string, scanned to ASCII control/space within 128 bytes."
+    blocking: false
+    owner: System
+    final_form: "BASIC64 name/X policy over active manifest identity lookup and checked caller memory"
+    current_tests: "swi::tests::system_query_swis_use_active_manifest_identity_and_checked_buffers; wp51_public_contracts_cover_modules_errors_identity_and_system_queries"
+    compatibility: "Only active manifest-owned names resolve. Historical module numeric suffix forms and OS_WriteI aliases are not parsed; non-ASCII/unterminated/unknown names return structured errors."
+
+  - number: "0x42"
+    name: OS_ReadMonotonicTime
+    current_handler: "System.ReadMonotonicTime BASIC64 definition; Host.System.ReadMonotonicTime protected primitive"
+    contract: "No inputs; R0 returns wrapping 32-bit centiseconds from the hosted monotonic epoch."
+    logical_memory: none
+    blocking: false
+    owner: System
+    final_form: "BASIC64 public dispatch over an independent hosted monotonic clock mechanism"
+    current_tests: "swi::tests::system_query_swis_use_active_manifest_identity_and_checked_buffers; wp51_public_contracts_cover_modules_errors_identity_and_system_queries"
+    compatibility: "The epoch begins at hosted runtime initialization rather than the hardware's last hard reset or power-on."
+
+  - number: "0x45"
+    name: OS_Plot
+    current_handler: SwiDispatcher::dispatch
+    contract: "R0 plot code; R1/R2 signed logical coordinates"
+    logical_memory: none
+    blocking: false
+    owner: Graphics
+    final_form: "BASIC64 plot policy over protected graphics submission primitive"
+    current_tests: "src/swi.rs Wimp redraw/graphics routing tests; no complete plot-code conformance suite"
+
+  - number: "0x400C0"
+    name: Wimp_Initialise
+    current_handler: SwiDispatcher::dispatch_wimp -> WimpServer::initialise
+    contract: "R0 requested version in/result version; R1 'TASK' magic in/task handle out; R2 description pointer; R3 optional terminated message-list pointer"
+    logical_memory: "checked caller strings and optional word list"
+    blocking: false
+    owner: Wimp
+    final_form: "BASIC64 Wimp validation and task registration over task/window primitives"
+    current_tests: "src/wimp.rs initialization tests; tests/wimp_desktop.rs multi-task tests"
+
+  - number: "0x400C1"
+    name: Wimp_CreateWindow
+    current_handler: WimpServer::create_window
+    contract: "R1 pointer to 88-byte window definition; R0 returns window handle"
+    logical_memory: "checked caller window definition and referenced title"
+    blocking: false
+    owner: Wimp
+    final_form: "BASIC64 validation/layout policy over protected window creation primitive"
+    current_tests: "src/swi.rs Wimp helpers; tests/wimp_desktop.rs window lifecycle/layout tests"
+
+  - number: "0x400C2"
+    name: Wimp_CreateIcon
+    current_handler: WimpServer::create_icon
+    contract: "R0 window handle; R1 caller pointer to icon definition; R0 returns icon handle/index"
+    logical_memory: "checked caller icon definition and text"
+    blocking: false
+    owner: Wimp
+    final_form: "BASIC64 icon policy over protected window/icon primitives"
+    current_tests: "src/wimp.rs and tests/wimp_desktop.rs icon/task interaction tests"
+
+  - number: "0x400C4"
+    name: Wimp_DeleteIcon
+    current_handler: WimpServer::delete_icon
+    contract: "R0 window handle; R1 icon index"
+    logical_memory: none
+    blocking: false
+    owner: Wimp
+    final_form: "BASIC64 validation over protected icon removal primitive"
+    current_tests: "src/wimp.rs icon lifecycle tests"
+
+  - number: "0x400C5"
+    name: Wimp_OpenWindow
+    current_handler: WimpServer::open_window
+    contract: "R1 caller pointer to 32-byte open block; block contains window handle, scroll position, and visible rectangle"
+    logical_memory: "checked caller open block"
+    blocking: false
+    owner: Wimp
+    final_form: "BASIC64 open/stack policy over protected window operation primitive"
+    current_tests: "tests/wimp_desktop.rs stacking, scroll, resize, and open-request tests"
+
+  - number: "0x400C6"
+    name: Wimp_CloseWindow
+    current_handler: WimpServer::close_window
+    contract: "R1 window handle"
+    logical_memory: none
+    blocking: false
+    owner: Wimp
+    final_form: "BASIC64 lifecycle policy over protected window operation primitive"
+    current_tests: "src/wimp.rs and tests/wimp_desktop.rs close/focus tests"
+
+  - number: "0x400C7"
+    name: Wimp_Poll
+    current_handler: WimpServer::poll
+    contract: "R0 event mask; R1 caller event-block pointer; returns R0 event reason and writes event block"
+    logical_memory: "checked caller poll block (256 bytes)"
+    blocking: true
+    owner: Wimp
+    final_form: "BASIC64 event filtering over task event-queue primitive"
+    current_tests: "src/wimp.rs poll-mask tests; tests/wimp_desktop.rs event/task polling tests"
+
+  - number: "0x400C8"
+    name: Wimp_RedrawWindow
+    current_handler: WimpServer::redraw_window
+    contract: "R1 caller redraw block; R0/R1/R2 updated by redraw iteration"
+    logical_memory: "checked caller redraw block and returned clip rectangle"
+    blocking: false
+    owner: Wimp
+    final_form: "BASIC64 redraw lifecycle over checked graphics/window primitives"
+    current_tests: "src/swi.rs redraw-to-independent-surfaces and clip mapping tests"
+
+  - number: "0x400C9"
+    name: Wimp_UpdateWindow
+    current_handler: WimpServer::update_window
+    contract: "R1 caller update block; R0/R1/R2 updated by update iteration"
+    logical_memory: "checked caller update block and returned clip rectangle"
+    blocking: false
+    owner: Wimp
+    final_form: "BASIC64 update lifecycle over checked graphics/window primitives"
+    current_tests: "src/wimp.rs update iteration tests"
+
+  - number: "0x400CA"
+    name: Wimp_GetRectangle
+    current_handler: WimpServer::get_rectangle
+    contract: "R1 caller rectangle block; advances active redraw/update loop"
+    logical_memory: "checked caller rectangle block"
+    blocking: false
+    owner: Wimp
+    final_form: "BASIC64 redraw/update iteration over checked window primitive"
+    current_tests: "src/swi.rs redraw loop/clip tests; src/wimp.rs rectangle iteration tests"
+
+  - number: "0x400CB"
+    name: Wimp_GetWindowState
+    current_handler: WimpServer::get_window_state
+    contract: "R1 caller window-state block containing handle and returned state/bounds"
+    logical_memory: "checked caller window-state block"
+    blocking: false
+    owner: Wimp
+    final_form: "BASIC64 state view over protected window query primitive"
+    current_tests: "src/wimp.rs window state tests"
+
+  - number: "0x400CD"
+    name: Wimp_SetIconState
+    current_handler: WimpServer::set_icon_state
+    contract: "R0 window handle; R1 icon index; R2 clear flags; R3 set flags"
+    logical_memory: none
+    blocking: false
+    owner: Wimp
+    final_form: "BASIC64 icon-state policy over protected icon primitive"
+    current_tests: "src/wimp.rs icon-state/event tests"
+
+  - number: "0x400CF"
+    name: Wimp_GetPointerInfo
+    current_handler: WimpServer::get_pointer_info
+    contract: "R1 caller pointer-info block; returns pointer coordinates/window/button state"
+    logical_memory: "checked caller 20-byte pointer-info block"
+    blocking: false
+    owner: Wimp
+    final_form: "BASIC64 pointer result adaptation over input-state primitive"
+    current_tests: "src/wimp.rs pointer-info tests"
+
+  - number: "0x400D1"
+    name: Wimp_ForceRedraw
+    current_handler: WimpServer::force_redraw
+    contract: "R0 window handle; R1-R4 requested rectangle"
+    logical_memory: none
+    blocking: false
+    owner: Wimp
+    final_form: "BASIC64 redraw request policy over protected window primitive"
+    current_tests: "src/wimp.rs force-redraw scheduling tests"
+
+  - number: "0x400D4"
+    name: Wimp_CreateMenu
+    current_handler: WimpServer::create_menu
+    contract: "R0 caller menu-tree pointer; R1 anchor x; R2 anchor y"
+    logical_memory: "checked caller menu tree and item strings"
+    blocking: false
+    owner: Wimp
+    final_form: "BASIC64 menu validation/interaction over protected menu primitives"
+    current_tests: "src/wimp.rs menu-tree and task event tests; tests/wimp_desktop.rs menu pointer tests"
+
+  - number: "0x400D7"
+    name: Wimp_SetExtent
+    current_handler: WimpServer::set_extent
+    contract: "R0 window handle; R1 caller extent block with four signed coordinates"
+    logical_memory: "checked caller extent block"
+    blocking: false
+    owner: Wimp
+    final_form: "BASIC64 scroll/extent policy over protected window primitive"
+    current_tests: "tests/wimp_desktop.rs extent/scrollbar range tests"
+
+  - number: "0x400DD"
+    name: Wimp_CloseDown
+    current_handler: WimpServer::close_down
+    contract: "R0 task handle; R1 'TASK' magic"
+    logical_memory: none
+    blocking: false
+    owner: Wimp
+    final_form: "BASIC64 shutdown policy over task/window lifecycle primitives"
+    current_tests: "src/wimp.rs task cleanup tests"
+
+  - number: "0x400DE"
+    name: Wimp_StartTask
+    current_handler: WimpServer::start_task
+    contract: "R0 task launch flags; R1 caller command-line pointer; R2 output task handle"
+    logical_memory: "checked caller command line"
+    blocking: false
+    owner: Wimp
+    final_form: "BASIC64 launch policy over protected task creation primitive"
+    current_tests: "src/wimp.rs task launch/input/cleanup tests"
+
+  - number: "0x4FF02"
+    name: Wimp_CreateIconEx
+    current_handler: WimpServer::create_icon_ex
+    contract: "hosted extension to Wimp_CreateIcon; icon definition plus optional RGBA asset description"
+    logical_memory: "checked caller definition and optional RGBA source buffer"
+    blocking: false
+    owner: Wimp
+    final_form: "BASIC64 extension owned by Wimp; retained as a documented hosted addition"
+    current_tests: "src/wimp.rs custom icon asset and ownership tests"
+
+  - number: "0x2A"
+    name: OS_ChangeDynamicArea
+    current_handler: "Memory.ChangeDynamicArea BASIC64 definition; Host.Memory.ChangeDynamicArea protected primitive"
+    contract: "R0 caller-task dynamic-area number; R1 signed byte delta; R1 returns amount moved"
+    logical_memory: none
+    blocking: false
+    owner: Memory
+    final_form: "BASIC64 service over caller-scoped checked logical memory"
+    current_tests: "swi::tests::basic64_memory_module_owns_task_scoped_dynamic_area_lifecycle"
+
+  - number: "0x2B"
+    name: OS_GenerateError
+    current_handler: "Error.GenerateError BASIC64 definition; Host.Error.RaiseErrorBlock protected primitive"
+    contract: "R0 caller logical address of a 256-byte standard error block"
+    logical_memory: "checked read of four-byte error number plus bounded NUL-terminated message"
+    blocking: false
+    owner: Error
+    final_form: "BASIC64 error service translating caller error blocks to structured runtime errors"
+    current_tests: "swi::tests::error_task_and_module_foundation_sw_is_are_owned_by_basic64_modules; swi::tests::swi_errors_and_x_form_errors_use_the_documented_task_scoped_block"
+    compatibility: "OS_GenerateError preserves the checked standard error-block input shape and raises a structured OSError in normal form. X bit 17 returns a caller-task-local standard block in R0 and sets V on failure; XOS_GenerateError specifically preserves its input R0 block and sets V. Exhaustive historical error handling is not claimed."
+
+  - number: "0x66"
+    name: OS_DynamicArea
+    current_handler: "Memory.DynamicArea BASIC64 reason dispatch; Host.Memory.* protected primitives"
+    contract: "R0 reason 0 create, 1 remove, 2 information, 3 enumeration; R1-R8 are reason-specific"
+    logical_memory: "reason 0 reads the caller NUL-terminated name at R8; returned area addresses remain caller-scoped"
+    blocking: false
+    owner: Memory
+    final_form: "BASIC64 service over task-local checked logical dynamic areas"
+    current_tests: "swi::tests::basic64_memory_module_owns_task_scoped_dynamic_area_lifecycle"
+    compatibility: "Automatic IDs and bases only; 16 MiB per area and 32 MiB total reservation; callback and physical mapping features are unsupported."
+
+  - number: "0x4FF10"
+    name: Ricochet_ModuleInfo
+    current_handler: "ModuleManager.ReadModuleInfo BASIC64 definition; Host.ModuleManager.ReadInfo protected primitive"
+    contract: "Project extension ABI 1: R1 cursor, R2 output name buffer, R3 capacity; R1 next cursor, R4 found, R5-R7 semantic version, R8 lifecycle state"
+    logical_memory: "checked caller buffer write, at most 128 bytes"
+    blocking: false
+    owner: ModuleManager
+    final_form: "BASIC64 read-only module registry query"
+    current_tests: "swi::tests::error_task_and_module_foundation_sw_is_are_owned_by_basic64_modules"
+    compatibility: "Hosted Ricochet extension; not a historical RISC OS SWI. Module enumeration is read-only, while post-boot load/delete are owned by OS_Module."
+
+  - number: "0x4FF11"
+    name: Ricochet_TaskInfo
+    current_handler: "TaskManager.ReadTaskInfo BASIC64 definition; Host.Task.ReadIdentity protected primitive"
+    contract: "Project extension ABI 1: R1 caller task ID, R2 logical address-space span, R3 dynamic-area count"
+    logical_memory: none
+    blocking: false
+    owner: TaskManager
+    final_form: "BASIC64 caller-task query"
+    current_tests: "swi::tests::error_task_and_module_foundation_sw_is_are_owned_by_basic64_modules"
+    compatibility: "Hosted Ricochet extension; not a historical RISC OS SWI and does not create or schedule tasks."
+
+  - number: "0x4FF12"
+    name: Ricochet_ModuleLookup
+    current_handler: "ModuleManager.LookupModule BASIC64 definition; Host.ModuleManager.LookupModule protected primitive"
+    contract: "Project extension ABI 1: R0 version, R1 exact case-insensitive module-title pointer; returns R1 found, R2 one-based deterministic active-module ordinal, R3-R5 semantic version, R6 lifecycle state"
+    logical_memory: "checked caller name read, at most 128 bytes"
+    blocking: false
+    owner: ModuleManager
+    final_form: "BASIC64 active-manifest lookup without historical pointer results"
+    current_tests: "swi::tests::module_manager_loads_inspects_and_unloads_guest_source_modules"
+    compatibility: "Hosted Ricochet extension, not historical OS_Module reason 18. Ordinal is transient and may shift as active modules change; exact full case-insensitive title only, with no abbreviations or instantiations. Guest load titles follow RISC OS ASCII-alphanumeric form."
+
+  - number: "0x4FF13"
+    name: Ricochet_SwiInfo
+    current_handler: "ModuleManager.ReadSwiInfo BASIC64 definition; Host.ModuleManager.LookupSwi protected primitive"
+    contract: "Project extension ABI 1: R0 version, R1 active SWI number; R2/R3 checked name output buffer/capacity, R4/R5 owner-module buffer/capacity, R6/R7 current definition buffer/capacity; R8 active generation number"
+    logical_memory: "checked caller output strings, each capacity 1..128 bytes"
+    blocking: false
+    owner: ModuleManager
+    final_form: "BASIC64 active-manifest and entry-cell identity query"
+    current_tests: "swi::tests::module_manager_loads_inspects_and_unloads_guest_source_modules"
+    compatibility: "Hosted Ricochet extension; reports only active entries and returns names through caller buffers rather than raw module pointers."
+
+  - number: "0x4FF14"
+    name: Ricochet_ModuleExport
+    current_handler: "ModuleManager.LookupModuleExport BASIC64 definition; Host.ModuleManager.LookupModuleExport protected primitive"
+    contract: "Project extension ABI 1: R0 version, R1 module-title input; R2 zero-based cursor in/out; R3/R4 SWI-name output/capacity; R5 SWI number; R6/R7 definition-name output/capacity; R8 generation; R9 found flag"
+    logical_memory: "checked caller-owned module-title read and SWI/definition output buffers, each bounded to 128 bytes"
+    blocking: false
+    owner: ModuleManager
+    final_form: "BASIC64 read-only enumeration of the active module's manifest-owned SWI exports"
+    current_tests: "tests/ricochet_mos_introspection.rs::wp51_mos_introspection_matches_read_only_queries_and_tracks_live_generations"
+    compatibility: "Hosted extension, not a historical RISC OS SWI. Cursor order is deterministic by SWI number. It reports only currently active SWI exports/current generations, not private PROC/FN exports or historical generations. Active module/SWI identity is explicitly public metadata and the query is read-only."
+
+  - number: "0x4FF15"
+    name: Ricochet_DefinitionSource
+    current_handler: "ModuleManager.ReadDefinitionSource BASIC64 definition; Host.ModuleManager.ReadDefinitionSource protected primitive"
+    contract: "Project extension ABI 1: the original caller Task must carry SourceRead; R0 bytes copied in/out; R1 `Module/Definition` selector input (`FN:` marks functions); R2 source byte offset in/out; R3/R4 chunk buffer/capacity; R5 total source bytes; R6 current generation when unambiguous; R7/R8 source-path buffer/capacity; R9/R10 stable DefinitionId low/high"
+    logical_memory: "checked caller selector/path buffers and source chunk; capacities up to 128 bytes for selectors/path and 1025 bytes for source including NUL; chunks copy at most 1024 source bytes, UTF-8 boundaries only. CLI offset is strict decimal 0..2147483647."
+    blocking: false
+    owner: ModuleManager
+    final_form: "BASIC64 read-only query of retained active BASIC64 definition source; no HostFS reopen"
+    current_tests: "tests/ricochet_mos_introspection.rs::wp51_mos_introspection_matches_read_only_queries_and_tracks_live_generations"
+    compatibility: "Hosted extension, not historical. Selects active PROC/FN definitions, including private ones, by stable logical identity; source bytes preserve source line endings and trailing newline. Offset past end or inside a UTF-8 scalar is rejected. Capacity is 2..=1025 while data remains (one byte only at EOF). No historical generations are selectable. The same Task::require_source_read policy applies to direct SWI and *INSPECT DEFINITION/SOURCE calls; denied callers receive TaskAuthorizationDenied before source bytes are read or returned. Public metadata does not imply SourceRead."
+
+caller_authorization:
+  owner: Task
+  policy: >-
+    Public active module/version/state and SWI identity metadata do not require a
+    grant. Retained definition source requires SourceRead. OS_Module reason 1
+    Load/compatible replacement and reason 4 Delete require the separate
+    ModuleManagement right. BASIC64 ModuleManager procedures request the right;
+    Rust service handlers recheck it against the same original Task supplied to
+    nested SWI/provider calls. Provider module capabilities never upgrade the
+    caller. Rights are private task-object state, not keyed by numeric task ID
+    or guest-controlled data. `Task::new` grants nothing. Only explicit host
+    bootstrap constructors grant a trusted MOS session, source inspector, or
+    manager-only task; ordinary spawned desktop tasks do not inherit. Code
+    running within a trusted session shares its task principal and rights.
+    Grants last for the Task object's lifetime and are revoked by host task
+    teardown/replacement; no guest-visible grant/revoke API exists.
+  denial: "TaskAuthorizationDenied code 1 = missing SourceRead; code 2 = missing ModuleManagement. Normal and X forms retain the same structured code/message; X sets V and returns a caller-task error block."
+
+named_aliases:
+  - {name: OS_BYTE, target: "0x06"}
+  - {name: OS_WORD, target: "0x07"}
+  - {name: OS_WRITEC, target: "0x00"}
+  - {name: OS_WRITES, target: "0x01"}
+  - {name: OS_WRITE0, target: "0x02"}
+  - {name: OS_NEWLINE, target: "0x03"}
+  - {name: OS_READC, target: "0x04"}
+  - {name: OS_READLINE, target: "0x0E"}
+  - {name: OS_MODULE, target: "0x1E"}
+  - {name: OS_READPOINT, target: "0x32"}
+  - {name: OS_CLI, target: "0x05"}
+  - {name: OS_FILE, target: "0x08"}
+  - {name: OS_ARGS, target: "0x09"}
+  - {name: OS_BGET, target: "0x0A"}
+  - {name: OS_BPUT, target: "0x0B"}
+  - {name: OS_GBPB, target: "0x0C"}
+  - {name: OS_FIND, target: "0x0D"}
+  - {name: OS_FSCONTROL, target: "0x29"}
+  - {name: OS_CHANGEDYNAMICAREA, target: "0x2A"}
+  - {name: OS_GENERATEERROR, target: "0x2B"}
+  - {name: OS_DYNAMICAREA, target: "0x66"}
+  - {name: WIMP_INITIALISE, target: "0x400C0"}
+  - {name: WIMP_CREATEWINDOW, target: "0x400C1"}
+  - {name: WIMP_CREATEICON, target: "0x400C2"}
+  - {name: WIMP_DELETEICON, target: "0x400C4"}
+  - {name: WIMP_OPENWINDOW, target: "0x400C5"}
+  - {name: WIMP_CLOSEWINDOW, target: "0x400C6"}
+  - {name: WIMP_POLL, target: "0x400C7"}
+  - {name: WIMP_REDRAWWINDOW, target: "0x400C8"}
+  - {name: WIMP_UPDATEWINDOW, target: "0x400C9"}
+  - {name: WIMP_GETRECTANGLE, target: "0x400CA"}
+  - {name: WIMP_GETWINDOWSTATE, target: "0x400CB"}
+  - {name: WIMP_SETICONSTATE, target: "0x400CD"}
+  - {name: WIMP_GETPOINTERINFO, target: "0x400CF"}
+  - {name: WIMP_FORCEREDRAW, target: "0x400D1"}
+  - {name: WIMP_CREATEMENU, target: "0x400D4"}
+  - {name: WIMP_SETEXTENT, target: "0x400D7"}
+  - {name: WIMP_CLOSEDOWN, target: "0x400DD"}
+  - {name: WIMP_STARTTASK, target: "0x400DE"}
+  - {name: WIMP_CREATEICONEX, target: "0x4FF02"}
+
+named_only_services:
+  - name: COLOURTRANS_CONVERTHSVTORGB
+    current_handler: SwiDispatcher::dispatch_named_swi (inline conversion)
+    contract: "R0 16.16 hue; R1/R2 scaled saturation/value; R0-R2 return 8-bit RGB"
+    logical_memory: none
+    blocking: false
+    owner: ColourTrans
+    final_form: "BASIC64 colour conversion definition"
+    current_tests: "named-only service currently lacks focused direct tests"
+  - name: COLOURTRANS_SETGCOL
+    current_handler: SwiDispatcher::dispatch_named_swi (GraphicsService mutation)
+    contract: "R0 packed RGB colour selects current graphics context colour"
+    logical_memory: none
+    blocking: false
+    owner: ColourTrans
+    final_form: "BASIC64 colour state policy over graphics-state primitive"
+    current_tests: "graphics snapshots exercise colour use; direct contract test missing"
+  - name: COLOURTRANS_WRITEPALETTE
+    current_handler: SwiDispatcher::dispatch_named_swi (hosted no-op)
+    contract: "currently accepts registers and performs no operation"
+    logical_memory: none
+    blocking: false
+    owner: ColourTrans
+    final_form: "BASIC64 service with explicitly documented hosted compatibility behavior"
+    current_tests: "no focused test; incomplete hosted implementation"
+  - name: RICOCHET_DESKTOP
+    current_handler: SwiDispatcher::ricochet_desktop
+    contract: "R0 operation selector; R1-R7 operation-specific settings and results"
+    logical_memory: "selected operations use checked caller logical pointers"
+    blocking: false
+    owner: Desktop
+    final_form: "BASIC64 desktop configuration/service definition over protected host display operations"
+    current_tests: "src/swi.rs desktop API query/update/error tests"
+  - name: RICOCHET_DISPLAY
+    current_handler: SwiDispatcher::ricochet_display
+    contract: "R0 ABI version and query/apply command; R1-R7 return or supply display settings"
+    logical_memory: none
+    blocking: false
+    owner: DisplayManager
+    final_form: "BASIC64 display policy over protected host display adapter"
+    current_tests: "src/swi.rs ricochet_display_swi_queries_applies_and_reports_save_failure_in_registers"
+
+compatibility_matrix: docs/ricochet-compatibility-matrix.md

@@ -13,7 +13,7 @@ use crate::{
     memory::Task,
     swi::{SwiContext, SwiDispatcher},
     tokenized_basic::TokenizedBasicLine,
-    trellis::{
+    ricochet::{
         ArgumentDirection, CapabilityName, DefinitionDescriptor, IdentityAllocator,
         LogicalMemoryContract, ModuleId, ModuleLifecycle, ModuleManifest, ModuleSymbolImport,
         PrimitiveImport, PrimitiveRegistry, RegisterContract, RegisterKind, ReplacementPolicy,
@@ -2840,7 +2840,7 @@ mod tests {
             }]
         );
 
-        let mut registry = crate::trellis::ModuleRegistry::new();
+        let mut registry = crate::ricochet::ModuleRegistry::new();
         let provider_id = registry
             .stage_module(provider.manifest.clone(), provider.definitions.clone())
             .unwrap();
@@ -2861,7 +2861,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             registry.link_module(hidden_id, BTreeSet::new()),
-            Err(crate::trellis::RegistryError::MissingSymbol { symbol, .. }) if symbol == "HIDDEN"
+            Err(crate::ricochet::RegistryError::MissingSymbol { symbol, .. }) if symbol == "HIDDEN"
         ));
     }
 
@@ -2898,7 +2898,7 @@ mod tests {
     #[test]
     fn typed_function_parameters_are_checked_by_the_interpreter() {
         let source = "REM @BASIC64 MODE=BASIC64\nREM @SYSTEM_PROFILE 0.1\nREM @MODULE TypedFunctions 1.0.0\nREM @SWI Typed_Test &100 Entry REGISTERS=R0:U32:INOUT\nDEF PROC Entry\n    R0% = FN Check(300)\nENDPROC\nDEF FN Check(byteValue% AS BYTE) AS BYTE\n=byteValue%\n";
-        let mut registry = crate::trellis::ModuleRegistry::new();
+        let mut registry = crate::ricochet::ModuleRegistry::new();
         let module = SystemModule::parse(
             source,
             "modules/TypedFunctions.bas64",
@@ -2935,7 +2935,7 @@ mod tests {
     #[test]
     fn records_flags_typed_results_readonly_and_structured_errors_execute() {
         let source = "REM @BASIC64 MODE=BASIC64\nREM @SYSTEM_PROFILE 0.1\nREM @MODULE FileSwitch 1.0.0\nREM @SWI FileSwitch_Test &100 Entry\nERROR FileError\n    Code AS UINT32 READONLY\n    Message AS STRING READONLY\nEND ERROR\nRECORD FileInfo\n    LoadAddress AS UINT64 READONLY\n    Access AS FileAccess\nEND RECORD\nENUM FileReason AS UINT32\n    Load = 0\n    NotFound = 73\nEND ENUM\nFLAGS FileAccess AS UINT32\n    Read = 1\n    Write = 2\nEND FLAGS\nHANDLE FileHandle\nREM @STATE INFO FileInfo\nREM @STATE ACCESS FileAccess\nREM @STATE REASON FileReason\nREM @STATE RESULTACCESS FileAccess\nREM @STATE RESULT% UINT64\nREM @STATE ROERROR% UINT32\nREM @STATE THROWERR% UINT32\nREM @STATE FNERROR% UINT32\nREM @STATE BOOT% UINT32 READONLY\nDEF PROC Entry\n    BOOT% = 1\n    INFO = FN FileInfo()\n    TRY\n        INFO.LoadAddress = 99\n    CATCH fault AS FileError\n        ROERROR% = fault.Code\n    ENDTRY\n    INFO.Access = FileAccess.Read OR FileAccess.Write\n    RESULTACCESS = FN CopyAccess(INFO.Access)\n    RESULT% = FN ReadLoadAddress(INFO)\n    REASON = FileReason.NotFound\n    TRY\n        PROC Fail\n    CATCH fault AS FileError\n        THROWERR% = fault.Code\n    ENDTRY\n    TRY\n        FNERROR% = FN Failing()\n    CATCH fault AS FileError\n        FNERROR% = fault.Code\n    ENDTRY\nENDPROC\nDEF FN CopyAccess(access AS FileAccess) AS FileAccess\n=access\nDEF FN ReadLoadAddress(info AS FileInfo) AS UINT64\n=info.LoadAddress\nDEF FN Failing() AS UINT32 THROWS FileError\n=1 DIV 0\nDEF PROC Fail THROWS FileError\n    THROW FileError, 73, \"file not found\"\nENDPROC\n";
-        let mut registry = crate::trellis::ModuleRegistry::new();
+        let mut registry = crate::ricochet::ModuleRegistry::new();
         let module =
             SystemModule::parse(source, "modules/FileSwitch.bas64", &registry.allocator()).unwrap();
         assert!(matches!(
@@ -3009,7 +3009,7 @@ mod tests {
     #[test]
     fn uint64_and_int64_literals_arithmetic_and_comparisons_remain_exact() {
         let source = "REM @BASIC64 MODE=BASIC64\nREM @SYSTEM_PROFILE 0.1\nREM @MODULE ExactIntegers 1.0.0\nREM @SWI Exact_Test &100 Entry\nREM @STATE U UINT64\nREM @STATE I INT64\nREM @STATE CHECK% UINT32\nREM @STATE LOOPS% UINT32\nDEF PROC Entry\n    U = 18446744073709551615\n    I = -9223372036854775808\n    IF U = 18446744073709551615 THEN CHECK% = CHECK% + 1\n    IF I = -9223372036854775808 THEN CHECK% = CHECK% + 2\n    IF U THEN CHECK% = CHECK% + 4\n    IF ABS(U) = 18446744073709551615 THEN CHECK% = CHECK% + 8\n    IF INT(U) = 18446744073709551615 THEN CHECK% = CHECK% + 16\n    IF STR$(U) = \"18446744073709551615\" THEN CHECK% = CHECK% + 32\n    U = U - 1\n    IF U = 18446744073709551614 THEN CHECK% = CHECK% + 64\n    I = I + 1\n    IF I = -9223372036854775807 THEN CHECK% = CHECK% + 128\n    FOR U = 9007199254740992 TO 9007199254740994\n        LOOPS% = LOOPS% + 1\n    NEXT U\n    IF LOOPS% = 3 THEN CHECK% = CHECK% + 256\n    FOR I = -9223372036854775807 TO -9223372036854775805\n        LOOPS% = LOOPS% + 1\n    NEXT I\n    IF LOOPS% = 6 THEN CHECK% = CHECK% + 512\nENDPROC\n";
-        let mut registry = crate::trellis::ModuleRegistry::new();
+        let mut registry = crate::ricochet::ModuleRegistry::new();
         let module =
             SystemModule::parse(source, "modules/ExactIntegers.bas64", &registry.allocator())
                 .unwrap();
@@ -3041,7 +3041,7 @@ mod tests {
     #[test]
     fn uint64_arithmetic_overflow_is_checked_instead_of_rounding() {
         let source = "REM @BASIC64 MODE=BASIC64\nREM @SYSTEM_PROFILE 0.1\nREM @MODULE IntegerOverflow 1.0.0\nREM @SWI Integer_Test &100 Entry\nREM @STATE U UINT64\nDEF PROC Entry\n    U = 18446744073709551615\n    U = U + 1\nENDPROC\n";
-        let mut registry = crate::trellis::ModuleRegistry::new();
+        let mut registry = crate::ricochet::ModuleRegistry::new();
         let module = SystemModule::parse(
             source,
             "modules/IntegerOverflow.bas64",
@@ -3075,7 +3075,7 @@ mod tests {
     #[test]
     fn int64_arithmetic_underflow_is_checked_instead_of_wrapping() {
         let source = "REM @BASIC64 MODE=BASIC64\nREM @SYSTEM_PROFILE 0.1\nREM @MODULE SignedIntegerUnderflow 1.0.0\nREM @SWI SignedInteger_Test &100 Entry\nREM @STATE I INT64\nDEF PROC Entry\n    I = -9223372036854775808\n    I = I - 1\nENDPROC\n";
-        let mut registry = crate::trellis::ModuleRegistry::new();
+        let mut registry = crate::ricochet::ModuleRegistry::new();
         let module = SystemModule::parse(
             source,
             "modules/SignedIntegerUnderflow.bas64",
@@ -3107,7 +3107,7 @@ mod tests {
     #[test]
     fn local_readonly_binding_is_typed_scoped_and_immutable() {
         let source = "REM @BASIC64 MODE=BASIC64\nREM @SYSTEM_PROFILE 0.1\nREM @MODULE ReadonlyLocal 1.0.0\nREM @SWI Readonly_Test &100 Entry\nREM @STATE RESULT% UINT32\nDEF PROC Entry\n    PROC InitLimit\n    limit = 0\n    RESULT% = 1\nENDPROC\nDEF PROC InitLimit\n    LET READONLY limit AS UINT64 = 18446744073709551615\nENDPROC\n";
-        let mut registry = crate::trellis::ModuleRegistry::new();
+        let mut registry = crate::ricochet::ModuleRegistry::new();
         let module =
             SystemModule::parse(source, "modules/ReadonlyLocal.bas64", &registry.allocator())
                 .unwrap();
@@ -3185,7 +3185,7 @@ mod tests {
     #[test]
     fn readonly_local_record_cannot_be_mutated_through_a_field_place() {
         let source = "REM @BASIC64 MODE=BASIC64\nREM @SYSTEM_PROFILE 0.1\nREM @MODULE ReadonlyRecord 1.0.0\nREM @STATE SOURCE FileInfo\nREM @SWI Readonly_RecordTest &100 Entry\nRECORD FileInfo\n    Length AS UINT32\nEND RECORD\nDEF PROC Entry\n    LET READONLY localInfo AS FileInfo = SOURCE\n    localInfo.Length = 42\nENDPROC\n";
-        let mut registry = crate::trellis::ModuleRegistry::new();
+        let mut registry = crate::ricochet::ModuleRegistry::new();
         let module = SystemModule::parse(
             source,
             "modules/ReadonlyRecord.bas64",
@@ -3217,7 +3217,7 @@ mod tests {
     #[test]
     fn local_readonly_binding_is_available_in_function_bodies() {
         let source = "REM @BASIC64 MODE=BASIC64\nREM @SYSTEM_PROFILE 0.1\nREM @MODULE ReadonlyFunction 1.0.0\nREM @SWI Readonly_FunctionTest &100 Entry\nREM @STATE RESULT UINT64\nDEF PROC Entry\n    RESULT = FN Twice(21) + FN Twice(20)\nENDPROC\nDEF FN Twice(amount AS UINT64) AS UINT64\n    LET READONLY incremented AS UINT64 = amount + 1\n=incremented + amount\n";
-        let mut registry = crate::trellis::ModuleRegistry::new();
+        let mut registry = crate::ricochet::ModuleRegistry::new();
         let module = SystemModule::parse(
             source,
             "modules/ReadonlyFunction.bas64",
@@ -3272,7 +3272,7 @@ mod tests {
     #[test]
     fn caught_errors_restore_nested_procedure_bindings_before_resuming() {
         let source = "REM @BASIC64 MODE=BASIC64\nREM @SYSTEM_PROFILE 0.1\nREM @MODULE FileSwitch 1.0.0\nREM @SWI FileSwitch_UnwindTest &100 Entry\nERROR FileError\n    Code AS UINT32 READONLY\n    Message AS STRING READONLY\nEND ERROR\nREM @STATE BASE% UINT32\nREM @STATE AFTER% UINT32\nDEF PROC Entry\n    BASE% = 7\n    TRY\n        PROC Fail(BASE%)\n    CATCH failure AS FileError\n        AFTER% = BASE%\n    ENDTRY\nENDPROC\nDEF PROC Fail(base% AS UINT32) THROWS FileError\n    base% = 99\n    THROW FileError, 73, \"not found\"\nENDPROC\n";
-        let mut registry = crate::trellis::ModuleRegistry::new();
+        let mut registry = crate::ricochet::ModuleRegistry::new();
         let module = SystemModule::parse(
             source,
             "modules/FileSwitch.unwind.bas64",
@@ -3306,7 +3306,7 @@ mod tests {
     #[test]
     fn opaque_handles_round_trip_by_type_and_cannot_be_used_as_numbers() {
         let source = "REM @BASIC64 MODE=BASIC64\nREM @SYSTEM_PROFILE 0.1\nREM @MODULE Wimp 1.0.0\nREM @SWI Wimp_HandleTest &100 Entry REGISTERS=R0:HANDLE<WindowHandle>:INOUT|R1:U32:OUT\nHANDLE WindowHandle\nERROR TypeError\n    Code AS UINT32 READONLY\n    Message AS STRING READONLY\nEND ERROR\nREM @STATE CAUGHT% UINT32\nDEF PROC Entry\n    TRY\n        R1% = R0%\n    CATCH failure AS TypeError\n        CAUGHT% = failure.Code\n    ENDTRY\n    R0% = FN Echo(R0%)\nENDPROC\nDEF FN Echo(window AS HANDLE<WindowHandle>) AS HANDLE<WindowHandle>\n=window\n";
-        let mut registry = crate::trellis::ModuleRegistry::new();
+        let mut registry = crate::ricochet::ModuleRegistry::new();
         let module =
             SystemModule::parse(source, "modules/Wimp.handles.bas64", &registry.allocator())
                 .unwrap();
@@ -3340,7 +3340,7 @@ mod tests {
     #[test]
     fn lifecycle_hooks_share_private_workspace_across_interpreted_calls() {
         let source = "REM @BASIC64 MODE=BASIC64\nREM @SYSTEM_PROFILE 0.1\nREM @MODULE Stateful 1.0.0\nREM @STATE STARTS% UINT32\nREM @STATE INVOKES% UINT32\nREM @STATE QUIESCES% UINT32\nREM @STATE FINALS% UINT32\nREM @LIFECYCLE START Start\nREM @LIFECYCLE QUIESCE Quiesce\nREM @LIFECYCLE FINALISE Finalise\nREM @SWI Stateful_Test &100 Entry\nDEF PROC Start\n    STARTS% = STARTS% + 1\nENDPROC\nDEF PROC Quiesce\n    QUIESCES% = QUIESCES% + 1\nENDPROC\nDEF PROC Finalise\n    FINALS% = FINALS% + 1\nENDPROC\nDEF PROC Entry\n    INVOKES% = INVOKES% + 1\nENDPROC\n";
-        let mut registry = crate::trellis::ModuleRegistry::new();
+        let mut registry = crate::ricochet::ModuleRegistry::new();
         let module =
             SystemModule::parse(source, "modules/Stateful.bas64", &registry.allocator()).unwrap();
         let id = registry
@@ -3396,7 +3396,7 @@ mod tests {
     #[test]
     fn failing_basic64_start_rolls_back_all_published_exports_and_workspace_updates() {
         let source = "REM @BASIC64 MODE=BASIC64\nREM @SYSTEM_PROFILE 0.1\nREM @MODULE StartFailure 1.0.0\nREM @STATE STARTS% UINT32\nREM @LIFECYCLE START Start\nREM @SWI StartFailure_First &100 First\nREM @SWI StartFailure_Second &101 Second\nERROR StartError\n    Code AS UINT32 READONLY\n    Message AS STRING READONLY\nEND ERROR\nDEF PROC Start THROWS StartError\n    STARTS% = STARTS% + 1\n    THROW StartError, 99, \"startup failed\"\nENDPROC\nDEF PROC First\nENDPROC\nDEF PROC Second\nENDPROC\n";
-        let mut registry = crate::trellis::ModuleRegistry::new();
+        let mut registry = crate::ricochet::ModuleRegistry::new();
         let module =
             SystemModule::parse(source, "modules/StartFailure.bas64", &registry.allocator())
                 .unwrap();
@@ -3415,7 +3415,7 @@ mod tests {
         registry.fail_module_start(id, error.to_string()).unwrap();
         assert_eq!(
             registry.module_state(id),
-            Some(crate::trellis::ModuleState::Linked)
+            Some(crate::ricochet::ModuleState::Linked)
         );
         assert_eq!(registry.registered_swi_count(), 0);
         assert!(registry.acquire_swi(0x100).is_none());
@@ -3426,7 +3426,7 @@ mod tests {
     #[test]
     fn logical_addresses_remain_typed_and_are_resolved_in_the_invoking_task() {
         let source = "REM @BASIC64 MODE=BASIC64\nREM @SYSTEM_PROFILE 0.1\nREM @MODULE AddressTest 1.0.0\nREM @SWI Address_Test &100 Entry REGISTERS=R0:ADDRESS32:INOUT|R1:U32:OUT\nERROR AddressError\n    Code AS UINT32 READONLY\n    Message AS STRING READONLY\nEND ERROR\nREM @STATE ERRORCODE% UINT32\nDEF PROC Entry\n    PROC ReadByte(R0%)\n    TRY\n        R1% = R0% * 2\n    CATCH failure AS AddressError\n        ERRORCODE% = failure.Code\n    ENDTRY\nENDPROC\nDEF PROC ReadByte(pointer AS ADDRESS32)\n    R1% = ?pointer\n    pointer = pointer + 1\n    R0% = pointer\nENDPROC\n";
-        let mut registry = crate::trellis::ModuleRegistry::new();
+        let mut registry = crate::ricochet::ModuleRegistry::new();
         let module =
             SystemModule::parse(source, "modules/AddressTest.bas64", &registry.allocator())
                 .unwrap();

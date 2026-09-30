@@ -1,7 +1,7 @@
 REM BASIC64 policy for the hosted desktop icon bar.
 MODE 20
 DIM description% 31
-$description%="Acorn Desktop"
+$description%="Desktop"
 SYS "Wimp_Initialise",310,&4B534154,description%,0 TO version%,task%
 
 DIM icon% 55
@@ -19,7 +19,7 @@ dmresolutions$(0)="Window (800 x 600)"
 dmresolutions$(1)="640 x 480":dmresolutions$(2)="800 x 600"
 dmresolutions$(3)="1024 x 768":dmresolutions$(4)="1152 x 864"
 dmresolutions$(5)="1280 x 1024":dmresolutions$(6)="1600 x 1200"
-SYS "Acorn_Desktop",2,volume_buffer%,256 TO volume_length%
+SYS "Ricochet_Desktop",2,volume_buffer%,256 TO volume_length%
 IF volume_length%>12 THEN volume_length%=12
 volume_name$=""
 FOR character_index%=0 TO volume_length%-1
@@ -80,7 +80,7 @@ FOR menu_item%=0 TO 1
   IF menu_item%=1 THEN !(menu_row%+12)=basic_label%
   !(menu_row%+16)=0:!(menu_row%+20)=32
 NEXT
-SYS "Acorn_Desktop",4
+SYS "Ricochet_Desktop",4
 REPEAT
   SYS "Wimp_Poll",1,event% TO reason%
   IF reason%=1 THEN
@@ -151,7 +151,7 @@ display_window_open%=1
 ENDPROC
 
 DEF PROCquery_display
-SYS "Acorn_Display",1,0,0,0 TO display_abi%,display_action%,active_resolution%,active_colour%,active_width%,active_height%,host_width%,host_height%,display_status%
+SYS "Ricochet_Display",1,0,0,0 TO display_abi%,display_action%,active_resolution%,active_colour%,active_width%,active_height%,host_width%,host_height%,display_status%
 dmresolutions$(0)="Window ("+STR$(host_width%)+" x "+STR$(host_height%)+")"
 IF display_dirty%=0 THEN
   pending_resolution%=active_resolution%
@@ -248,7 +248,7 @@ ENDPROC
 
 DEF PROCapply_display
 PROCclose_display_menu
-SYS "Acorn_Display",1,1,pending_resolution%,pending_colour% TO display_abi%,display_action%,active_resolution%,active_colour%,active_width%,active_height%,host_width%,host_height%,display_status%
+SYS "Ricochet_Display",1,1,pending_resolution%,pending_colour% TO display_abi%,display_action%,active_resolution%,active_colour%,active_width%,active_height%,host_width%,host_height%,display_status%
 IF display_status%=0 THEN
   pending_resolution%=active_resolution%
   pending_colour%=active_colour%

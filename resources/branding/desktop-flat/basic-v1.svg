@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title description">
+  <title id="title">BASIC program tile</title>
+  <desc id="description">A flat cobalt program tile with an editable white BASIC listing.</desc>
+
+  <defs>
+    <!-- Adjust these named style colours to recolour this tile and its lettering. -->
+    <style>
+      .tile-panel {
+        fill: #155FD2;
+        fill: var(--tile-blue, #155FD2);
+        stroke: #202124;
+        stroke: var(--tile-outline, #202124);
+        stroke-width: 18;
+      }
+      .source-line {
+        fill: #F8F8F6;
+        fill: var(--source-white, #F8F8F6);
+        font-family: "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", "DejaVu Sans Mono", monospace;
+        font-size: 64px;
+        font-weight: 700;
+        letter-spacing: 0.2px;
+      }
+    </style>
+    <!-- One quiet shadow beneath the tile; the panel itself stays completely flat. -->
+    <filter id="tile-shadow" x="-8%" y="-8%" width="116%" height="120%" color-interpolation-filters="sRGB" primitiveUnits="userSpaceOnUse">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="10" result="soft-edge"/>
+      <feOffset in="soft-edge" dx="0" dy="8" result="lower-edge"/>
+      <feFlood flood-color="#202124" flood-opacity="0.18" result="shadow-colour"/>
+      <feComposite in="shadow-colour" in2="lower-edge" operator="in" result="soft-shadow"/>
+      <feMerge>
+        <feMergeNode in="soft-shadow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <g id="program-tile">
+    <g id="tile-face">
+      <rect class="tile-panel" x="112" y="96" width="800" height="832" rx="56" filter="url(#tile-shadow)"/>
+    </g>
+    <g id="editable-basic-source" class="source-line" aria-label="BASIC source listing">
+      <text x="180" y="330">10 REM BASIC</text>
+      <text x="180" y="438">20 FOR I=1 TO 10</text>
+      <text x="180" y="546">30 PRINT I</text>
+      <text x="180" y="654">40 NEXT I</text>
+      <text x="180" y="762">50 END</text>
+    </g>
+  </g>
+</svg>

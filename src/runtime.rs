@@ -292,7 +292,8 @@ impl Runtime {
     }
 
     pub fn report_error(&mut self, error: &RuntimeError) -> Result<(), RuntimeError> {
-        let message = format!("Acorn-2026 error: {error}");
+        // Errors shown by BASIC describe the fault, not the host application.
+        let message = error.to_string();
         self.dispatcher
             .write_inline(&mut self.task, message.as_bytes())?;
         self.dispatcher.dispatch(
@@ -366,7 +367,7 @@ mod tests {
     fn desktop_mandelbrot_publishes_extended_mode_and_coloured_raster() {
         // Exercise the actual desktop file-launch entry point with the original
         // listing, reducing only resolution/iteration count; a queued key ends its wait.
-        let root = std::env::temp_dir().join(format!("acorn-mandelbrot-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("ricochet-mandelbrot-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let mut bytes = include_bytes!("../demo-volume/mandelbrot.bbc").to_vec();
         for (from, to) in [(b"1680", b"0128"), (b"1050", b"0096"), (b"8192", b"0048")] {
@@ -378,8 +379,8 @@ mod tests {
         }
         std::fs::write(root.join("test"), bytes).unwrap();
         std::fs::write(
-            root.join("test.acornmeta"),
-            include_str!("../demo-volume/mandelbrot.bbc.acornmeta")
+            root.join("test.ricochetmeta"),
+            include_str!("../demo-volume/mandelbrot.bbc.ricochetmeta")
                 .replace("guest-name=mandelbrot", "guest-name=test"),
         )
         .unwrap();
@@ -428,7 +429,9 @@ mod tests {
         let window = &wimp.desktop_windows()[0];
         assert_eq!(window.work_area.max_x - window.work_area.min_x, 256);
         assert_eq!(window.work_area.max_y - window.work_area.min_y, 192);
-        if let Ok(path) = std::env::var("ACORN_CONSOLE_SNAPSHOT") {
+        if let Ok(path) = std::env::var("RICOCHET_CONSOLE_SNAPSHOT")
+            .or_else(|_| std::env::var("ACORN_CONSOLE_SNAPSHOT"))
+        {
             let mut builder = crate::desktop_scene::DesktopSceneBuilder::new();
             let scene = builder.build(
                 &wimp.desktop_windows(),
@@ -479,6 +482,219 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_mos_shell_regrids_to_host_viewport_after_resize() {
+        let (input_sender, input_receiver) = mpsc::channel();
+        drop(input_sender);
+        let (display_sender, _display_receiver) = mpsc::channel();
+        let wimp = WimpServer::new(mpsc::channel().0);
+        wimp.set_host_window_size(900, 400);
+        let mut runtime =
+            Runtime::windowed_with_desktop(input_receiver, display_sender, wimp.clone());
+
+        let metrics = wimp.desktop_metrics();
+        assert_eq!(
+            runtime.dispatcher.graphics().snapshot().text_grid_size(),
+            crate::graphics::modern_shell_grid_for_area(metrics.os_width(), metrics.os_height()),
+        );
+
+        wimp.set_host_window_size(700, 520);
+        runtime
+            .dispatcher
+            .write_inline(&mut runtime.task, b"resized fullscreen")
+            .unwrap();
+        let metrics = wimp.desktop_metrics();
+        assert_eq!(
+            runtime.dispatcher.graphics().snapshot().text_grid_size(),
+            crate::graphics::modern_shell_grid_for_area(metrics.os_width(), metrics.os_height()),
+        );
+        assert!(
+            runtime
+                .dispatcher
+                .graphics()
+                .snapshot()
+                .modern_shell_console
+        );
+    }
+
+    #[test]
+    fn fullscreen_shell_grid_tracks_host_viewport_with_fixed_desktop_settings() {
+        let (input_sender, input_receiver) = mpsc::channel();
+        drop(input_sender);
+        let (display_sender, _display_receiver) = mpsc::channel();
+        let wimp = WimpServer::new(mpsc::channel().0);
+        wimp.set_host_window_size(900, 400);
+        let configure_root = std::env::temp_dir().join(format!(
+            "ricochet-fixed-display-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&configure_root).unwrap();
+        wimp.bind_configure_store(ConfigureStore::with_path(configure_root.join("configure")));
+
+        let mut runtime =
+            Runtime::windowed_with_desktop(input_receiver, display_sender, wimp.clone());
+        wimp.apply_display_settings(crate::display::DisplaySettings {
+            resolution: crate::display::DesktopResolution::R640x480,
+            colour: crate::display::DisplayColour::Rgb888,
+        })
+        .unwrap();
+        wimp.set_host_window_size(700, 520);
+        runtime
+            .dispatcher
+            .write_inline(&mut runtime.task, b"resize")
+            .unwrap();
+
+        let metrics = wimp.desktop_metrics();
+        assert_eq!(metrics.pixel_size(), (640, 480));
+        assert_eq!(metrics.host_pixel_size(), (700, 520));
+        assert_eq!(
+            runtime.dispatcher.graphics().snapshot().text_grid_size(),
+            crate::graphics::modern_shell_grid_for_area(1400, 1040),
+        );
+        assert_ne!(
+            runtime.dispatcher.graphics().snapshot().text_grid_size(),
+            crate::graphics::modern_shell_grid_for_area(metrics.os_width(), metrics.os_height()),
+            "the fixed desktop extent must not size fullscreen host-console cells"
+        );
+
+        std::fs::remove_dir_all(configure_root).unwrap();
+    }
+
+    #[test]
+    fn desktop_basic_shell_regrids_to_console_work_area_after_resize() {
+        let (input_sender, input_receiver) = mpsc::channel();
+        drop(input_sender);
+        let (display_sender, _display_receiver) = mpsc::channel();
+        let (updates, _updates_receiver) = mpsc::channel();
+        let wimp = WimpServer::new(updates);
+        wimp.task_started(902, "BASIC window").unwrap();
+        let mut runtime = Runtime::desktop_task(902, input_receiver, display_sender, wimp.clone());
+        runtime.dispatcher.initialize_mos_shell_console();
+
+        let initial_area = wimp.console_work_area(902).unwrap();
+        assert_eq!(
+            runtime.dispatcher.graphics().snapshot().text_grid_size(),
+            crate::graphics::modern_shell_grid_for_area(
+                initial_area.max_x - initial_area.min_x,
+                initial_area.max_y - initial_area.min_y,
+            ),
+        );
+
+        let window = wimp.desktop_windows()[0].clone();
+        let grip = crate::wimp::desktop_window_furniture(&window)
+            .adjust_size_icon
+            .unwrap();
+        let x = (grip.min_x + grip.max_x) / 2;
+        let y = (grip.min_y + grip.max_y) / 2;
+        let drag = wimp.mouse_down(x, y, 4).unwrap();
+        wimp.drag_to(drag, x - 200, y + 100);
+        wimp.finish_drag(drag);
+        let resized_area = wimp.console_work_area(902).unwrap();
+        assert_ne!(resized_area, initial_area);
+
+        runtime
+            .dispatcher
+            .write_inline(&mut runtime.task, b"responsive shell")
+            .unwrap();
+        let snapshot = runtime.dispatcher.graphics().snapshot();
+        assert_eq!(
+            snapshot.text_grid_size(),
+            crate::graphics::modern_shell_grid_for_area(
+                resized_area.max_x - resized_area.min_x,
+                resized_area.max_y - resized_area.min_y,
+            ),
+        );
+        assert_eq!(
+            snapshot.modern_text_cells.len(),
+            usize::from(snapshot.text_grid_columns) * usize::from(snapshot.text_grid_rows),
+        );
+        assert!(snapshot.modern_shell_console);
+    }
+
+    #[test]
+    fn immediate_basic_lines_keep_the_responsive_wimp_console_transcript() {
+        let (updates, _updates_receiver) = mpsc::channel();
+        let wimp = WimpServer::new(updates);
+        wimp.task_started(904, "BASIC window").unwrap();
+
+        // Resize the host-owned console to a wide, short Wimp client area
+        // before the BASIC prompt starts, so input, output and wrapping all
+        // exercise the responsive host grid rather than MODE 20's guest grid.
+        let window = wimp.desktop_windows()[0].clone();
+        let grip = crate::wimp::desktop_window_furniture(&window)
+            .adjust_size_icon
+            .unwrap();
+        let x = (grip.min_x + grip.max_x) / 2;
+        let y = (grip.min_y + grip.max_y) / 2;
+        let drag = wimp.mouse_down(x, y, 4).unwrap();
+        wimp.drag_to(drag, x + 180, y + 360);
+        wimp.finish_drag(drag);
+        let area = wimp.console_work_area(904).unwrap();
+        let (columns, rows) = crate::graphics::modern_shell_grid_for_area(
+            area.max_x - area.min_x,
+            area.max_y - area.min_y,
+        );
+        assert!(
+            columns > 64,
+            "expected a wide console, got {columns} columns"
+        );
+        assert!(rows < 25, "expected a short console, got {rows} rows");
+
+        let long_text = "Z".repeat(usize::from(columns) + 8);
+        let input = format!(
+            "PRINT \"first\"\rPRINT \"second\"\rINPUT N$\rAda Lovelace\rPRINT N$\rPRINT \"{long_text}\"\rQUIT\r"
+        );
+        let (input_sender, input_receiver) = mpsc::channel();
+        for byte in input.bytes() {
+            input_sender.send(byte).unwrap();
+        }
+        drop(input_sender);
+        let (display_sender, _display_receiver) = mpsc::channel();
+        let mut runtime = Runtime::desktop_task(904, input_receiver, display_sender, wimp);
+
+        let config_root = std::env::temp_dir().join(format!(
+            "ricochet-basic-shell-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&config_root).unwrap();
+        let configure = ConfigureStore::with_path(config_root.join("configure"));
+        configure.set("BASICEngine", "INTERPRETER").unwrap();
+        runtime.dispatcher.set_configure_store_for_test(configure);
+
+        runtime.run_desktop_console(true).unwrap();
+
+        let snapshot = runtime.dispatcher.graphics().snapshot();
+        assert!(snapshot.modern_shell_console);
+        assert_eq!(snapshot.text_grid_size(), (columns, rows));
+        assert_eq!(
+            snapshot.modern_text_cells.len(),
+            usize::from(columns) * usize::from(rows),
+        );
+        let transcript = snapshot.modern_text_cells.iter().collect::<String>();
+        assert!(transcript.contains("first"), "{transcript:?}");
+        assert!(transcript.contains("second"), "{transcript:?}");
+        assert!(transcript.contains("Ada Lovelace"), "{transcript:?}");
+        assert!(transcript.contains("Z"), "{transcript:?}");
+        assert!(
+            (0..usize::from(rows).saturating_sub(1)).any(|row| {
+                let start = row * usize::from(columns);
+                let end = start + usize::from(columns);
+                snapshot.modern_text_cells[end - 1] == 'Z' && snapshot.modern_text_cells[end] == 'Z'
+            }),
+            "long PRINT output should wrap at the host-derived {columns}-cell width"
+        );
+
+        std::fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
     fn desktop_task_prompts_initialize_a_modern_shell_for_mos_and_basic() {
         for basic in [false, true] {
             let (input_sender, input_receiver) = mpsc::channel();
@@ -518,7 +734,7 @@ mod tests {
         let wimp = WimpServer::new(updates);
         let runtime_wimp = wimp.clone();
         let config_path = std::env::temp_dir().join(format!(
-            "acorn-2026-desktop-engine-{}.configure",
+            "ricochet-desktop-engine-{}.configure",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&config_path);
@@ -607,7 +823,7 @@ mod tests {
         let wimp = WimpServer::new(updates);
         let runtime_wimp = wimp.clone();
         let config_path = std::env::temp_dir().join(format!(
-            "acorn-2026-language-mos-startup-{}.configure",
+            "ricochet-language-mos-startup-{}.configure",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&config_path);
@@ -650,7 +866,7 @@ mod tests {
         let wimp = WimpServer::new(updates);
         let runtime_wimp = wimp.clone();
         let config_path = std::env::temp_dir().join(format!(
-            "acorn-2026-language-startup-{}.configure",
+            "ricochet-language-startup-{}.configure",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&config_path);
@@ -685,7 +901,7 @@ mod tests {
     #[test]
     fn stdio_keeps_the_mos_recovery_path_when_desktop_startup_is_saved() {
         let config_path = std::env::temp_dir().join(format!(
-            "acorn-2026-language-stdio-{}.configure",
+            "ricochet-language-stdio-{}.configure",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&config_path);
@@ -710,7 +926,7 @@ mod tests {
     fn basic64_desktop_browses_scrolls_and_launches_mounted_programs() {
         let volume = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("demo-volume");
         let configure_path = std::env::temp_dir().join(format!(
-            "acorn-2026-desktop-slice-{}.configure",
+            "ricochet-desktop-slice-{}.configure",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&configure_path);

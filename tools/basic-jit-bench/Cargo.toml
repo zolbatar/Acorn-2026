@@ -13,7 +13,7 @@ name = "clocksp5-jit-bench"
 path = "src/clocksp5.rs"
 
 [dependencies]
-acorn-2026 = { path = "../.." }
+ricochet = { path = "../.." }
 cranelift-codegen = "=0.135.2"
 cranelift-frontend = "=0.135.2"
 cranelift-jit = "=0.135.2"

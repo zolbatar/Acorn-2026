@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use acorn_2026::{
+use ricochet::{
     basic_compat::run_program,
     host::HostConsole,
     memory::Task,

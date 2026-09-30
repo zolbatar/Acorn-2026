@@ -7,7 +7,7 @@ REM @IMPORT_MODULE Error 1.0.0
 REM @IMPORT_MODULE Memory 1.0.0
 REM @IMPORT_MODULE ModuleManager 1.0.0
 REM @IMPORT_MODULE TaskManager 1.0.0
-REM @IMPORT_MODULE TrellisCommands 1.0.0
+REM @IMPORT_MODULE RicochetCommands 1.0.0
 REM @IMPORT_SYMBOL System PROC ReadStartupLanguage
 REM @IMPORT_SYMBOL System FN StartupLanguage
 REM @IMPORT_SYMBOL System FN StartupConfigurationRecovery

@@ -12,12 +12,13 @@ skeuomorphic material rendering. Flat Remix can inform colour and polish, but
 the RISC OS silhouette and details take priority.
 
 Keep transparent canvas margins so icons remain legible at desktop sizes.
-These icons are separate from the earlier glossy branding masters.
+These icons are separate from the earlier glossy icon studies.
 Device icons use mostly white and neutral grey casing with dark details; reserve
 saturated colour for small indicators, as in the Flat Remix device reference.
 
 | SVG source | PNG export | Subject |
 | --- | --- | --- |
+| `OSIcon.svg` | `OSIcon.png` | User-authored OS Icon artwork used at the far right of the running desktop icon bar |
 | `floppy-v1.svg` | `floppy-v1-1024.png` | Earlier flat drive drawing, retained as the floppy icon |
 | `harddisk-v1.svg` | `harddisk-v1-1024.png` | Second RISC OS 3.11 icon-bar device: pale face, five black vents, red status light |
 | `harddisk-v2.svg` | `harddisk-v2-1024.png` | Flat Remix-inspired neutral-white reinterpretation of the same hard disk icon |
