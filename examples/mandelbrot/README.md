@@ -13,8 +13,7 @@ python3 tools/tokenize_full_mandelbrot.py
 Run it in the windowed app from the repository root:
 
 ```text
-BASICLOAD $.mandelbrot.mandelbrot
-BASICRUN
+BASIC $.mandelbrot.mandelbrot
 ```
 
 All three `.bbc` fixtures from this folder are also staged under `demo-volume/mandelbrot`. HostFS metadata gives them the BASIC file type and exposes extensionless guest names.
@@ -37,8 +36,8 @@ The generator reuses the project's limited ARM BASIC V fixture encoder. These by
 Run it in the windowed app from the repository root:
 
 ```text
-BASICLOAD $.mandelbrot.reduced
-BASICRUN
+CONFIGURE BASICEngine Hybrid
+BASIC $.mandelbrot.reduced
 ```
 
 The reduced program publishes scene snapshots no more than once per 16.667 ms (about 60 Hz). The windowed app is required to see graphics; the stdio frontend runs the BASIC interpreter without a visible display.

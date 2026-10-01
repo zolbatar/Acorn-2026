@@ -11,6 +11,12 @@ scope:
 
 dispatch_routes:
   module_owned:
+    - "0x08 OS_File -> FileSwitch.FileService (hosted reasons 0-12, 16-18, 255; path deviations documented)"
+    - "0x09 OS_Args -> FileSwitch.ArgsService (supported reasons 0-5 and 7)"
+    - "0x0A OS_BGet -> FileSwitch.ByteGetService"
+    - "0x0B OS_BPut -> FileSwitch.BytePutService"
+    - "0x0C OS_GBPB -> FileSwitch.BulkTransferService (reasons 1-10)"
+    - "0x0D OS_Find -> FileSwitch.FindService"
     - "0x00 OS_WriteC -> Console.WriteC"
     - "0x01 OS_WriteS -> Console.WriteS"
     - "0x02 OS_Write0 -> Console.Write0"
@@ -20,6 +26,8 @@ dispatch_routes:
     - "0x38 OS_SWINumberToString -> System.SwiNumberToString"
     - "0x39 OS_SWINumberFromString -> System.SwiNumberFromString"
     - "0x42 OS_ReadMonotonicTime -> System.ReadMonotonicTime"
+    - "0x23 OS_ReadVarVal -> System.ReadVarVal"
+    - "0x24 OS_SetVarVal -> System.SetVarVal"
     - "0x2A OS_ChangeDynamicArea -> Memory.ChangeDynamicArea"
     - "0x2B OS_GenerateError -> Error.GenerateError"
     - "0x66 OS_DynamicArea -> Memory.DynamicArea"
@@ -31,6 +39,10 @@ dispatch_routes:
     - "0x4FF14 Ricochet_ModuleExport -> ModuleManager.LookupModuleExport (project extension)"
     - "0x4FF15 Ricochet_DefinitionSource -> ModuleManager.ReadDefinitionSource (project extension)"
     - "0x05 OS_CLI -> RicochetCommands.ExecuteCli"
+    - "0x06 OS_Byte -> Mos.ByteService"
+    - "0x07 OS_Word -> Mos.WordService"
+    - "0x32 OS_ReadPoint -> Graphics.ReadPointService"
+    - "0x45 OS_Plot -> Graphics.PlotService"
   transitional_numeric: all numeric services below without a module-owned route
   transitional_named_only:
     - COLOURTRANS_CONVERTHSVTORGB
@@ -103,95 +115,96 @@ numeric_services:
 
   - number: "0x05"
     name: OS_CLI
-    current_handler: "RicochetCommands.ExecuteCli BASIC64 definition; Host.MOS.ExecuteLegacy protected fallback"
+    current_handler: "RicochetCommands.ExecuteCli BASIC64 definition; active @COMMAND registry with explicit closed-allowlist Rust bridges"
     contract: "R0 unmasked caller logical address of command; command runs synchronously and preserves R0 on success. BASIC64 parser recognizes NUL, LF, or CR line endings."
     logical_memory: "checked caller task read at R0, bounded to 256 bytes; unterminated input is rejected, never truncated"
     blocking: true
     owner: RicochetCommands
-    final_form: "BASIC64 `*INSPECT`, supported classic module commands, `*CONFIGURE`, and `*STATUS` parsing/selection/validation/presentation plus explicit `Host.MOS.ExecuteLegacy` bridge for remaining MOS commands"
+    final_form: "BASIC64 `@COMMAND` registry owns OS_CLI recognition, abbreviation order, and BASIC64 command policy; *HELP reads the same active registry. Transitional Rust behavior is reachable only through explicit closed-allowlist BRIDGE descriptors; there is no catch-all ExecuteLegacy route."
     current_tests: "tests/ricochet_classic_module_commands.rs; tests/ricochet_mos_introspection.rs; tests/ricochet_mos_configuration.rs; tests/ricochet_configuration_recovery.rs; tests/ricochet_authorization.rs; src/swi.rs CLI abbreviation/configuration/desktop tests; tests/mos_calls.rs"
+    command_script_subset: "BASIC64 *OBEY uses the active @COMMAND registry and same caller Task. Rust supplies bounded checked guest reads/source frames; BASIC64 classifies, substitutes parameters once, and dispatches lines. Supports LF/CRLF/CR, blank lines, leading-space | comments, EOF without final newline, stop-on-first-error with guest path/line provenance, prior-effect retention, and QUIT unwinding. Limits: 65,536 bytes across active scripts, 255 command bytes per line, 4,096 physical lines per session, eight nested sources. %0-%9, %*n and %% use space-separated arguments outside quotes; quotes are retained, missing args are empty, malformed quote/%* forms and expanded overlength lines reject before that line dispatches. Task-local read-only Obey$Dir exposes the resolved guest parent via OS_ReadVarVal/type-0 expansion and restores by frame pop; it intentionally differs from PRM's invocation-text parent fragment. PRM -v/-c, Exec, aliases, general command expansion, automatic !Boot/filetype execution, and arbitrary RISC OS script compatibility are not claimed."
     configuration_contract: "Current v3 schema has six keys: Language (PRM decimal/&hex/base_num spelling, hosted values 0/3), WimpMode (Mode alias; Auto or canonical X<width> Y<height> C/G<depth>; zero-padded 3/4 digit dimensions canonicalize), BASICMode, BASICProfile, BASICTarget, and BASICEngine. WimpMode alone chooses both resolution and palette: fixed selectors support six logical sizes and C2/C16/C256/C32K/C16M/G4/G16/G256; Auto is host-sized and full-colour C16M/Rgb888. Physical mode IDs, EX/EY scaling and frame rate are unsupported. Defaults: Language=0, BASICMode=AUTO, BASICProfile=AUTO, BASICTarget=AUTO, BASICEngine=INTERPRETER, WimpMode=AUTO. Old DisplayResolution/DisplayColour pairs migrate to WimpMode (Window becomes Auto/full-colour); explicit WimpMode in v2 wins over retired RicochetOutputProfile. WindowFurniture and RicochetOutputProfile rows are discarded on file load; legacy keys are file-load migration only and rejected by command/reset APIs. Renderer appearance is flat-only. Stored reads are bounded to 64 KiB."
-    compatibility: "The interim `*RICOCHET` family is not recognized or advertised. `*INSPECT` is read-only: MODULES [filter], MODULE title, SWI name|number, DEFINITION module/definition [strict decimal byte offset], with SOURCE as a read-only alias. Classic supported routes are *Modules, *RMLoad, *RMRun, *RMKill, and conditional *RMEnsure. Final-dot prefixes use a fixed BASIC64 table and exact routes win; ambiguous prefixes error. The current table includes `*I.`, `*M.`, `*Mod.`, and `*INSPE.`; it does not reproduce PRM's dynamic alias/module-order resolution. Repeated leading `*` and command whitespace are stripped. RMLoad/RMRun accept one guest path to BASIC64 filetype &064; init strings are rejected. RMRun equals RMLoad because hosted modules have no app-entry address. RMKill does not model `%instance`. RMEnsure compares numeric major.minor[.patch] components, no-ops when installed version is sufficient, and executes its bounded tail only when missing/older; an unsatisfied check without tail raises CliError. `*Modules` lists logical hosted title/version/state without invented RMA/workspace addresses or instance rows. RMReInit/RMInsert/RMTidy/RMClear/RMFaster/ROMModules/Unplug are explicit unsupported errors without state change because hosted ROM/RMA/unplug support does not exist. CONFIGURE/CONF. and STATUS policy is BASIC64-owned. OS_CLI accepts NUL/LF/CR terminators, preserves R0, and uses checked task-local dynamic scratch released on normal or exceptional exit. Configuration writes require separate caller Task ConfigurationWrite authority deliberately granted to interactive MOS, not inherited by spawned tasks; source reading and module management remain separate rights. Malformed, unsupported, unreadable, invalid-UTF-8, and oversized stored configuration now boots with safe defaults and a path-redacted warning/status; the file remains unchanged until an authorized successful repair preserves recoverable bytes in a `.recovery-*` sibling and atomically writes canonical v3. Oversized input is copied by streaming. This post-foundation route is separate from native capsule recovery. Remaining MOS command semantics are transitional Rust; full OS_CLI migration is open."
+    compatibility: "The interim `*RICOCHET` family is not recognized or advertised. `*INSPECT` is read-only: MODULES [filter], MODULE title, SWI name|number, DEFINITION module/definition [strict decimal byte offset], with SOURCE as a read-only alias. Classic supported routes are *Modules, *RMLoad, *RMRun, *RMKill, and conditional *RMEnsure. Final-dot prefixes use a fixed BASIC64 table and exact routes win; ambiguous prefixes error. The current table includes `*I.`, `*M.`, `*Mod.`, and `*INSPE.`; it does not reproduce PRM's dynamic alias/module-order resolution. Repeated leading `*` and command whitespace are stripped. RMLoad/RMRun accept one guest path to BASIC64 filetype &064; init strings are rejected. RMRun equals RMLoad because hosted modules have no app-entry address. RMKill does not model `%instance`. RMEnsure compares numeric major.minor[.patch] components, no-ops when installed version is sufficient, and executes its bounded tail only when missing/older; an unsatisfied check without tail raises CliError. `*Modules` lists logical hosted title/version/state without invented RMA/workspace addresses or instance rows. RMReInit/RMInsert/RMTidy/RMClear/RMFaster/ROMModules/Unplug are explicit unsupported errors without state change because hosted ROM/RMA/unplug support does not exist. CONFIGURE/CONF., STATUS, INSPECT, classic module commands, and HELP policy are BASIC64-owned and use the active @COMMAND registry. Rust-backed transitional command behavior is exposed only through explicit closed-allowlist BRIDGE descriptors; unknown commands return BASIC64 Bad command and never fall through to a generic host parser or execute arbitrary files. OS_CLI accepts NUL/LF/CR terminators, preserves R0, and uses checked task-local dynamic scratch released on normal or exceptional exit. Configuration writes require separate caller Task ConfigurationWrite authority deliberately granted to interactive MOS, not inherited by spawned tasks; source reading and module management remain separate rights. Malformed, unsupported, unreadable, invalid-UTF-8, and oversized stored configuration now boots with safe defaults and a path-redacted warning/status; the file remains unchanged until an authorized successful repair preserves recoverable bytes in a `.recovery-*` sibling and atomically writes canonical v3. Oversized input is copied by streaming. This post-foundation route is separate from native capsule recovery. Rust remains behind the documented command bridges; OS_CLI recognition has no catch-all Rust fallback."
 
   - number: "0x06"
     name: OS_Byte
-    current_handler: SwiDispatcher::os_byte via MosState
+    current_handler: "Mos.ByteService BASIC64 definition; Host.MosInput.* mechanisms"
     contract: "R0 low byte reason; R1/R2 inputs and reason-specific return registers/carry"
     logical_memory: none
-    blocking: false
-    owner: MOS
-    final_form: "BASIC64 MOS policy over typed input, configuration, and clock primitives"
-    current_tests: "tests/mos_calls.rs: osbyte_keyboard_queue_and_cli_use_existing_services; input/register preservation tests"
+    blocking: true
+    owner: Mos
+    final_form: "Mos.ByteService owns reasons 21 (x=0), 129 (y<128), and 138 (x=0); checked typed input/timing primitives. No Rust numeric fallback."
+    current_tests: "tests/ricochet_mos_swi_ownership.rs; tests/mos_calls.rs; tests/ricochet_exec.rs"
 
   - number: "0x07"
     name: OS_Word
-    current_handler: SwiDispatcher::os_word and MosState
+    current_handler: "Mos.WordService BASIC64 definition; Host.Clock.* and checked five-byte memory mechanisms"
     contract: "R0 reason; R1 caller logical pointer to reason-specific control block"
     logical_memory: "checked caller memory; reason-specific size (clock reasons 1-4 are tested)"
     blocking: false
-    owner: MOS
-    final_form: "BASIC64 reason dispatch over typed caller-memory and clock primitives"
-    current_tests: "tests/mos_calls.rs: call_osword_uses_checked_full_and_split_pointers"
+    owner: Mos
+    final_form: "Mos.WordService owns reasons 1-4 with checked five-byte little-endian clock blocks; no Rust numeric fallback."
+    current_tests: "tests/ricochet_mos_swi_ownership.rs; tests/mos_calls.rs"
 
   - number: "0x08"
     name: OS_File
-    current_handler: SwiDispatcher::os_file
+    current_handler: FileSwitch.FileService
     contract: "R0 action; R1 filename pointer; R2-R5 action-specific input/output registers"
     logical_memory: "checked caller strings and action-specific control data"
     blocking: false
     owner: FileSwitch
     final_form: "BASIC64 FileSwitch semantics over filesystem and caller-memory primitives"
-    current_tests: "src/swi.rs FileSwitch/guest catalogue tests; compatibility gaps are listed in the matrix"
+    current_tests: "tests/ricochet_os_file_ownership.rs; tests/ricochet_os_file_paths.rs; bounded File$Path/R4 paths, limits, and remaining deviations are listed in the matrix"
 
   - number: "0x09"
     name: OS_Args
-    current_handler: SwiDispatcher::os_args
-    contract: "R0 reason; R1 open-file handle; R2/R3 reason-specific position/value"
-    logical_memory: "no block pointer in the currently hosted reasons"
+    current_handler: FileSwitch.ArgsService
+    contract: "R0 reason; R1 handle; reasons 0-5 use R2 for position/extent/EOF; reason 7 uses R2 guest name buffer and R5 capacity/spare-byte result; reasons 0-5 and 7 supported"
+    logical_memory: "reason 7 conditionally writes canonical guest name plus NUL through a full-span checked caller buffer; no unconditional R2 pointer contract"
     blocking: false
     owner: FileSwitch
     final_form: "BASIC64 FileSwitch operation over task-owned file-channel primitives"
-    current_tests: "FileSwitch unit coverage is partial; see ricochet-compatibility-matrix.md"
+    current_tests: "tests/ricochet_fileswitch_channel_ownership.rs; PRM Args 4 reports extent because HostFS has no allocation-size model"
 
   - number: "0x0A"
     name: OS_BGet
-    current_handler: SwiDispatcher::os_bget
-    contract: "R0 file handle input; R0 byte result; carry reports EOF"
+    current_handler: FileSwitch.ByteGetService
+    contract: "R1 file handle input and preserved; R0 byte when carry clear; first EOF sets carry, subsequent read errors"
     logical_memory: none
     blocking: false
     owner: FileSwitch
     final_form: "BASIC64 byte-read service over a checked task file-channel primitive"
-    current_tests: "src/swi.rs guest catalogue/type tests; focused EOF/handle matrix remains incomplete"
+    current_tests: "tests/ricochet_fileswitch_channel_ownership.rs; includes EOF, handle, caller isolation and CALL bridge cases"
 
   - number: "0x0B"
     name: OS_BPut
-    current_handler: SwiDispatcher::os_bput
-    contract: "R0 file handle; R1 byte input"
+    current_handler: FileSwitch.BytePutService
+    contract: "R0 byte and R1 file handle input; supported register values preserved"
     logical_memory: none
     blocking: false
     owner: FileSwitch
     final_form: "BASIC64 byte-write service over a checked task file-channel primitive"
-    current_tests: "FileSwitch unit coverage is partial; see ricochet-compatibility-matrix.md"
+    current_tests: "tests/ricochet_fileswitch_channel_ownership.rs; includes checked host channel and CALL bridge cases"
 
   - number: "0x0C"
     name: OS_GBPB
-    current_handler: SwiDispatcher::os_gbpb / os_gbpb_file / os_gbpb_names
-    contract: "R0 reason; R1 handle; R2 caller buffer; R3 count; R4/R5 operation-specific state"
-    logical_memory: "checked caller buffer for byte and catalogue operations"
+    current_handler: FileSwitch.BulkTransferService
+    contract: "BASIC64-owned reasons 1-4 file transfer, 5-7 fixed names, 8-10 bounded directory output; R0 reason, operation-specific R1-R6, public register/carry results follow PRM subset"
+    logical_memory: "transfer buffer preflighted as a complete caller-data span (max 1 MiB); fixed-name and directory output preflighted before bytes are written; excludes reserved X-error block"
     blocking: false
     owner: FileSwitch
-    final_form: "BASIC64 reason handling over checked memory and file-channel primitives"
-    current_tests: "src/swi.rs catalogue and guest-buffer tests; full reason set not implemented"
+    final_form: "BASIC64 reason/register/record policy over task-owned transfer and bounded catalogue snapshot primitives; no numeric Rust fallback"
+    current_tests: "tests/ricochet_gbpb_ownership.rs; reasons 1-10, caller span/cursor atomicity, continuation and record alignment; reasons 11-12 remain unsupported"
 
   - number: "0x0D"
     name: OS_Find
-    current_handler: SwiDispatcher::os_find
-    contract: "R0 open/close action; R1 filename pointer or handle; R0 returns allocated handle"
-    logical_memory: "checked caller NUL-terminated filename"
+    current_handler: FileSwitch.FindService
+    contract: "R0 action; R1 direct guest pathname on supported open reasons or handle/0 for close; R0 returns channel handle, or 0 for missing file without missing-is-error bit"
+    logical_memory: "conditional checked caller NUL string on open; R1 is otherwise scalar to preserve the reason-dependent handle/path register shape"
     blocking: false
     owner: FileSwitch
     final_form: "BASIC64 channel lifecycle over filesystem primitives"
-    current_tests: "src/swi.rs guest catalogue tests; exact historical flag combinations remain incomplete"
+    current_tests: "tests/ricochet_fileswitch_channel_ownership.rs; direct path/modes, missing file, close-all, task isolation and CALL bridge"
 
   - number: "0x0E"
     name: OS_ReadLine
@@ -214,25 +227,48 @@ numeric_services:
     current_tests: "swi::tests::module_manager_loads_inspects_and_unloads_guest_source_modules; swi::tests::module_manager_replaces_guest_exports_as_one_generation_and_preserves_workspace; wp51_os_module_replacement_is_atomic_compatible_and_preserves_active_calls; swi::tests::module_manager_rolls_back_failed_guest_start_and_protects_foundation; swi::tests::module_manager_enforces_guest_capability_and_dependency_boundaries; swi::tests::swi_errors_and_x_form_errors_use_the_documented_task_scoped_block"
     compatibility: "Deliberate hosted adaptation: &064 visible BASIC64 source replaces historical &FFA relocatable ARM image. The requestor Task must carry ModuleManagement; ModuleManager's provider capability does not confer it. Titles are ASCII alphanumeric and matched case-insensitively; case-only replacement preserves the installed spelling. A same-title Load atomically replaces all exports only when module identity/version/dependencies/capabilities/lifecycle, SWI names/numbers/definition names/register contracts, exported PROC/FN signatures, and full persistent/type schema are unchanged. It preserves ModuleId, entry-cell IDs and workspace; active leases keep old code. Candidate Start and old Quiesce/Finalise are not rerun. Incompatible candidates are rejected without disturbing the installed module. This is intentionally safer than PRM reason 1, which kills the old module and all instantiations before initialization. No init parameters or %instantiations. Only reasons 1 and 4 are supported. Reasons 0, 2-3, 5-17, and 19-20 return UnsupportedServiceReason. Reasons 12 and 18 are specifically rejected because their outputs include raw module/private-word/postfix pointers; safe inventory and name lookup are provided by Ricochet_ModuleInfo and Ricochet_ModuleLookup."
 
+  - number: "0x23"
+    name: OS_ReadVarVal
+    current_handler: "System.ReadVarVal BASIC64 definition; Host.SystemVariables.Read protected primitive"
+    contract: "R0 selector C-string pointer; R1 output-buffer pointer; R2 capacity or high-bit length probe; R3=0 begins a wildcard read and nonzero is an opaque caller-task name/context pointer; R4=3 requests conversion, other values request raw string bytes. R0/R1 are preserved; R2 returns byte length/probe result, R3 returns the next matching name pointer for wildcard enumeration, R4 returns actual stored type. Probe on a missing exact name returns R2=0; for R4 other than 3, an existing value of length N returns bitwise-NOT N. Wildcard exhaustion is code 2, including X-form V/error-block reporting."
+    logical_memory: "Checked caller logical memory: NUL-terminated selector up to 33 bytes (hosted subset; PRM permits any ASCII <=32 terminator), plus the requested output capacity up to 256 bytes. Values are length-delimited and not NUL-terminated. Wildcard names are returned through task-owned, task-local dynamic areas; context identity is not a host pointer and cannot be reused by another task."
+    blocking: false
+    owner: System
+    final_form: "BASIC64 `OS_ReadVarVal` policy over one runtime-scoped bounded guest-variable store"
+    current_tests: "tests/ricochet_command_variables.rs; tests/ricochet_variable_expansion.rs; system_variables unit tests"
+    compatibility: "Only string type 0 and literal string type 4 are stored. Type-0 writes immediately expand exact <name> references, outer/doubled quotes, and printable |<, |>, ||, |\" escapes with no rescanning; type-4 and reads preserve raw stored bytes. Numeric, control, wildcard-reference and other GSTrans syntax is rejected. Names use visible ASCII, case-insensitive lookup, preserved creation spelling, and bounded `*`/`#` wildcards. At most 128 entries and 32 KiB aggregate name/value bytes are retained. The store is runtime-session local, not persisted and never sourced from the host environment."
+
+  - number: "0x24"
+    name: OS_SetVarVal
+    current_handler: "System.SetVarVal BASIC64 definition; Host.SystemVariables.Write protected primitive"
+    contract: "R0 selector/name C-string pointer; R1 value pointer; R2 signed byte length (negative means delete); R3 context must be zero; R4 type 0 or 4. Successful calls preserve R0-R2, set R3=0, and return the stored type in R4. Type 0 requires an LF, CR, or NUL at R1+R2; type 4 is exactly R2 bytes."
+    logical_memory: "Checked caller logical memory: NUL-terminated selector up to 33 bytes (hosted subset; PRM permits any ASCII <=32 terminator); values up to 256 UTF-8 bytes; type-0 terminator checked at R1+R2. Type-4 payload has no terminator requirement."
+    blocking: false
+    owner: System
+    final_form: "BASIC64 type/register policy over a protected shared-store mechanism"
+    current_tests: "tests/ricochet_command_variables.rs; tests/ricochet_variable_expansion.rs; system_variables unit tests"
+    compatibility: "Mutation checks the original caller Task for separate SystemVariableWrite authority before reading caller buffers; the trusted MOS session is explicitly granted that right, ordinary tasks and tasks with only source/module/configuration rights are not. Exact names create/update; wildcard updates require exactly one existing match, while negative-length deletion removes every match. Only STRING and LiteralString are accepted; type 0 uses a bounded immediate string-expansion subset, with no public OS_GSTrans ABI. Macro, numeric, code, evaluation and general GSTrans forms are unsupported."
+
   - number: "0x29"
     name: OS_FSControl
-    current_handler: SwiDispatcher::os_fscontrol
+    current_handler: FileSwitch.FileSystemControl
     contract: "R0 reason; R1 filesystem number or string pointer; R2-R5 reason-specific data"
     logical_memory: "checked caller strings and reason-specific control data"
     blocking: false
     owner: FileSwitch
     final_form: "BASIC64 filing-system policy over host volume and checked memory primitives"
-    current_tests: "src/swi.rs guest catalogue/type tests; filing-system reason coverage is partial"
+    current_tests: "tests/ricochet_fscontrol_ownership.rs; bounded hosted reason coverage"
 
   - number: "0x32"
     name: OS_ReadPoint
-    current_handler: SwiDispatcher::dispatch
+    current_handler: Graphics.ReadPointService
     contract: "R0/R1 input coordinates; R2/R3 result colour/tint; R4 indicates outside-surface result"
     logical_memory: none
     blocking: false
     owner: Graphics
-    final_form: "BASIC64 graphics service over caller-owned surface query primitive"
-    current_tests: "src/swi.rs os_read_point_reads_immediate_pixels_and_preserves_coordinates"
+    final_form: "BASIC64 profile/result policy over a caller-task/window CPU-raster query primitive"
+    current_tests: "tests/ricochet_graphics_swi_ownership.rs; swi::tests::os_read_point_reads_immediate_pixels_and_preserves_coordinates"
+    compatibility: "R0/R1 are preserved. Classic queries return R2 colour, R3 tint and R4=0; an outside-surface query returns R2=R4=&FFFFFFFF and R3=0. Modern text mode returns the existing profile-specific error because its overlay is not in the guest raster. Indexed colours remain estimates from the RGBA raster."
 
   - number: "0x38"
     name: OS_SWINumberToString
@@ -269,23 +305,25 @@ numeric_services:
 
   - number: "0x45"
     name: OS_Plot
-    current_handler: SwiDispatcher::dispatch
+    current_handler: Graphics.PlotService
     contract: "R0 plot code; R1/R2 signed logical coordinates"
     logical_memory: none
     blocking: false
     owner: Graphics
-    final_form: "BASIC64 plot policy over protected graphics submission primitive"
-    current_tests: "src/swi.rs Wimp redraw/graphics routing tests; no complete plot-code conformance suite"
+    final_form: "BASIC64 plot-code policy over a caller-task/window CPU-raster submission primitive"
+    current_tests: "tests/ricochet_graphics_swi_ownership.rs; Wimp redraw/graphics routing tests"
+    compatibility: "The hosted service masks R0 to the low plot-code byte, interprets R1/R2 as signed 32-bit coordinate bit patterns, and preserves R0-R2 deterministically (the PRM marks them corrupted/unspecified). The existing GraphicsState plot subset is unchanged; complete VDU/plot-code conformance is not claimed."
 
   - number: "0x400C0"
     name: Wimp_Initialise
-    current_handler: SwiDispatcher::dispatch_wimp -> WimpServer::initialise
-    contract: "R0 requested version in/result version; R1 'TASK' magic in/task handle out; R2 description pointer; R3 optional terminated message-list pointer"
-    logical_memory: "checked caller strings and optional word list"
+    current_handler: BASIC64 Wimp::InitialiseService -> WimpServer task-registration primitives
+    contract: "R0 requested version in/result version; R1 'TASK' magic; R2 description pointer; R3 optional word-list pointer; R1 returns task handle"
+    logical_memory: "caller-scoped control-terminated description and optional bounded word list"
     blocking: false
     owner: Wimp
-    final_form: "BASIC64 Wimp validation and task registration over task/window primitives"
-    current_tests: "src/wimp.rs initialization tests; tests/wimp_desktop.rs multi-task tests"
+    final_form: "BASIC64 version/magic policy over checked description/list validation and caller task registration; no Rust numeric fallback"
+    current_tests: "tests/ricochet_wimp_lifecycle_ownership.rs; src/wimp.rs initialization tests; tests/wimp_desktop.rs multi-task tests"
+    compatibility: "Hosted R3=0 is accepted for versions 300 and 310; non-null lists are bounded/preflighted but currently do not filter poll messages. PRM v300 normally requires a list and v310 gives NULL the no-important-messages meaning."
 
   - number: "0x400C1"
     name: Wimp_CreateWindow
@@ -319,22 +357,22 @@ numeric_services:
 
   - number: "0x400C5"
     name: Wimp_OpenWindow
-    current_handler: WimpServer::open_window
+    current_handler: Wimp.bas64::OpenWindowService -> WimpServer::open_window_values
     contract: "R1 caller pointer to 32-byte open block; block contains window handle, scroll position, and visible rectangle"
     logical_memory: "checked caller open block"
     blocking: false
     owner: Wimp
-    final_form: "BASIC64 open/stack policy over protected window operation primitive"
+    final_form: "BASIC64 block/stack policy over caller-owned atomic window commit; no numeric fallback"
     current_tests: "tests/wimp_desktop.rs stacking, scroll, resize, and open-request tests"
 
   - number: "0x400C6"
     name: Wimp_CloseWindow
-    current_handler: WimpServer::close_window
-    contract: "R1 window handle"
-    logical_memory: none
+    current_handler: Wimp.bas64::CloseWindowService -> WimpServer::close_window_handle
+    contract: "R1 caller pointer to 4-byte block containing window handle; hosted R0 preserved"
+    logical_memory: "checked caller 4-byte handle block"
     blocking: false
     owner: Wimp
-    final_form: "BASIC64 lifecycle policy over protected window operation primitive"
+    final_form: "BASIC64 block decode over caller-owned close mechanism; no numeric fallback"
     current_tests: "src/wimp.rs and tests/wimp_desktop.rs close/focus tests"
 
   - number: "0x400C7"
@@ -379,12 +417,12 @@ numeric_services:
 
   - number: "0x400CB"
     name: Wimp_GetWindowState
-    current_handler: WimpServer::get_window_state
-    contract: "R1 caller window-state block containing handle and returned state/bounds"
-    logical_memory: "checked caller window-state block"
+    current_handler: Wimp.bas64::GetWindowStateService -> WimpServer::window_state_values
+    contract: "R1 caller 36-byte in/out block; handle in word 0, state/bounds returned in words 0..8; hosted R0 preserved"
+    logical_memory: "checked caller 36-byte read/write state block"
     blocking: false
     owner: Wimp
-    final_form: "BASIC64 state view over protected window query primitive"
+    final_form: "BASIC64 complete state-block encoding over caller-owned query; no numeric fallback"
     current_tests: "src/wimp.rs window state tests"
 
   - number: "0x400CD"
@@ -429,33 +467,35 @@ numeric_services:
 
   - number: "0x400D7"
     name: Wimp_SetExtent
-    current_handler: WimpServer::set_extent
+    current_handler: Wimp.bas64::SetExtentService -> WimpServer::set_extent_values
     contract: "R0 window handle; R1 caller extent block with four signed coordinates"
     logical_memory: "checked caller extent block"
     blocking: false
     owner: Wimp
-    final_form: "BASIC64 scroll/extent policy over protected window primitive"
+    final_form: "BASIC64 signed extent decode over caller-owned atomic geometry update; hosted R0=0; no numeric fallback"
     current_tests: "tests/wimp_desktop.rs extent/scrollbar range tests"
 
   - number: "0x400DD"
     name: Wimp_CloseDown
-    current_handler: WimpServer::close_down
-    contract: "R0 task handle; R1 'TASK' magic"
+    current_handler: BASIC64 Wimp::CloseDownService -> WimpServer caller-owned close primitive
+    contract: "R0 caller task handle in; R1 'TASK' magic; hosted R0 returns 0"
     logical_memory: none
     blocking: false
     owner: Wimp
-    final_form: "BASIC64 shutdown policy over task/window lifecycle primitives"
-    current_tests: "src/wimp.rs task cleanup tests"
+    final_form: "BASIC64 magic/result policy over caller-identity-checked Wimp cleanup; no Rust numeric fallback"
+    current_tests: "tests/ricochet_wimp_lifecycle_ownership.rs; src/wimp.rs task cleanup tests"
+    compatibility: "Hosted CloseDown always requires the caller's exact live handle and preserves the existing Wimp-launched console window; it does not infer the caller when R0=0."
 
   - number: "0x400DE"
     name: Wimp_StartTask
-    current_handler: WimpServer::start_task
-    contract: "R0 task launch flags; R1 caller command-line pointer; R2 output task handle"
-    logical_memory: "checked caller command line"
+    current_handler: BASIC64 Wimp::StartTaskService -> bounded task launch queue primitives
+    contract: "R0 caller command-string pointer in; R0 returns child task handle"
+    logical_memory: "caller-scoped control-terminated command, maximum 256 bytes; guest path span checked"
     blocking: false
     owner: Wimp
-    final_form: "BASIC64 launch policy over protected task creation primitive"
-    current_tests: "src/wimp.rs task launch/input/cleanup tests"
+    final_form: "BASIC64 command allowlist and parsing over checked caller task registration/launch queue; no Rust numeric fallback"
+    current_tests: "tests/ricochet_wimp_lifecycle_ownership.rs; src/wimp.rs task launch/input/cleanup tests"
+    compatibility: "PRM takes R0=*Command and returns the live child handle. Hosted commands are limited to *Commands, *BASIC, and *BASIC <guest-path>; arbitrary Wimp commands are rejected."
 
   - number: "0x4FF02"
     name: Wimp_CreateIconEx
@@ -627,44 +667,44 @@ named_aliases:
 
 named_only_services:
   - name: COLOURTRANS_CONVERTHSVTORGB
-    current_handler: SwiDispatcher::dispatch_named_swi (inline conversion)
+    current_handler: ColourTrans.bas64::COLOURTRANS_CONVERTHSVTORGB (name-only module-owned SYS)
     contract: "R0 16.16 hue; R1/R2 scaled saturation/value; R0-R2 return 8-bit RGB"
     logical_memory: none
     blocking: false
     owner: ColourTrans
     final_form: "BASIC64 colour conversion definition"
-    current_tests: "named-only service currently lacks focused direct tests"
+    current_tests: "tests/ricochet_colourtrans_ownership.rs; module-owned name-only dispatch"
   - name: COLOURTRANS_SETGCOL
-    current_handler: SwiDispatcher::dispatch_named_swi (GraphicsService mutation)
+    current_handler: ColourTrans.bas64::COLOURTRANS_SETGCOL via Host.Graphics.SetPackedRgb
     contract: "R0 packed RGB colour selects current graphics context colour"
     logical_memory: none
     blocking: false
     owner: ColourTrans
     final_form: "BASIC64 colour state policy over graphics-state primitive"
-    current_tests: "graphics snapshots exercise colour use; direct contract test missing"
+    current_tests: "tests/ricochet_colourtrans_ownership.rs; immediate snapshot and Plot/ReadPoint integration"
   - name: COLOURTRANS_WRITEPALETTE
-    current_handler: SwiDispatcher::dispatch_named_swi (hosted no-op)
+    current_handler: ColourTrans.bas64::COLOURTRANS_WRITEPALETTE (name-only module-owned SYS)
     contract: "currently accepts registers and performs no operation"
     logical_memory: none
     blocking: false
     owner: ColourTrans
     final_form: "BASIC64 service with explicitly documented hosted compatibility behavior"
-    current_tests: "no focused test; incomplete hosted implementation"
+    current_tests: "tests/ricochet_colourtrans_ownership.rs; verifies accepted register-preserving hosted no-op"
   - name: RICOCHET_DESKTOP
-    current_handler: SwiDispatcher::ricochet_desktop
+    current_handler: DesktopServices.bas64::DESKTOPSERVICE (name-only module-owned SYS)
     contract: "R0 operation selector; R1-R7 operation-specific settings and results"
-    logical_memory: "selected operations use checked caller logical pointers"
+    logical_memory: "catalogue, volume-name, and timestamp actions use checked caller logical pointers"
     blocking: false
-    owner: Desktop
-    final_form: "BASIC64 desktop configuration/service definition over protected host display operations"
-    current_tests: "src/swi.rs desktop API query/update/error tests"
+    owner: DesktopServices
+    final_form: "BASIC64 action/register policy over bounded caller-scoped catalogue and Wimp menu mechanisms"
+    current_tests: "tests/ricochet_desktop_services_ownership.rs"
   - name: RICOCHET_DISPLAY
-    current_handler: SwiDispatcher::ricochet_display
+    current_handler: DisplayManager.bas64::DISPLAYSERVICE (name-only module-owned SYS)
     contract: "R0 ABI version and query/apply command; R1-R7 return or supply display settings"
     logical_memory: none
     blocking: false
     owner: DisplayManager
-    final_form: "BASIC64 display policy over protected host display adapter"
-    current_tests: "src/swi.rs ricochet_display_swi_queries_applies_and_reports_save_failure_in_registers"
+    final_form: "BASIC64 version/action/enum policy over protected caller-authorized display query/apply mechanisms"
+    current_tests: "tests/ricochet_desktop_services_ownership.rs"
 
 compatibility_matrix: docs/ricochet-compatibility-matrix.md

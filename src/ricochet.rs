@@ -240,6 +240,33 @@ pub struct SwiExport {
     pub contract: SwiContract,
 }
 
+/// A command published atomically with its owning module. Display metadata is
+/// intentionally part of the manifest so Help and command selection cannot
+/// drift into independent hard-coded tables.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandCategory {
+    Commands,
+    FileCommands,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommandHandler {
+    Basic64Proc(String),
+    /// A closed, name-bound bridge into one existing Rust CLI implementation.
+    /// The bridge name is the command's own canonical name, never an arbitrary
+    /// host function selector.
+    RustBridge,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModuleCommand {
+    pub name: String,
+    pub category: CommandCategory,
+    pub handler: CommandHandler,
+    pub syntax: String,
+    pub description: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModuleManifest {
     pub schema_version: u16,
@@ -255,6 +282,8 @@ pub struct ModuleManifest {
     pub replacement_policy: ReplacementPolicy,
     /// Public BASIC64 symbols. SWI definitions are included automatically.
     pub symbol_exports: Vec<String>,
+    /// Commands are published and retired with this module's other exports.
+    pub commands: Vec<ModuleCommand>,
     pub exports: Vec<SwiExport>,
     pub source_path: String,
     pub source_hash: String,
@@ -333,6 +362,12 @@ impl ModuleManifest {
                 self.symbol_exports.len().to_string(),
             ),
         ];
+        // Preserve byte-for-byte canonical compatibility with old v1
+        // manifests: command metadata is present only for modules that declare
+        // commands, and the decoder treats an absent count as an empty table.
+        if !self.commands.is_empty() {
+            fields.push(("command.count".to_owned(), self.commands.len().to_string()));
+        }
         for (index, (name, version)) in self.dependencies.iter().enumerate() {
             fields.push((
                 format!("dependency.{index}"),
@@ -367,6 +402,28 @@ impl ModuleManifest {
         }
         for (index, symbol) in self.symbol_exports.iter().enumerate() {
             fields.push((format!("symbol_export.{index}"), encode_text(symbol)));
+        }
+        for (index, command) in self.commands.iter().enumerate() {
+            let (handler_kind, handler_name) = match &command.handler {
+                CommandHandler::Basic64Proc(name) => ("PROC", name.as_str()),
+                CommandHandler::RustBridge => ("BRIDGE", "-"),
+            };
+            let category = match command.category {
+                CommandCategory::Commands => "COMMANDS",
+                CommandCategory::FileCommands => "FILECOMMANDS",
+            };
+            fields.push((
+                format!("command.{index}"),
+                [
+                    encode_text(&command.name),
+                    category.to_owned(),
+                    handler_kind.to_owned(),
+                    encode_text(handler_name),
+                    encode_text(&command.syntax),
+                    encode_text(&command.description),
+                ]
+                .join("|"),
+            ));
         }
         for (index, export) in self.exports.iter().enumerate() {
             let prefix = format!("export.{index}.");
@@ -510,6 +567,22 @@ impl ModuleManifest {
         let capability_count = parse_count(&mut fields, "capability.count")?;
         let symbol_export_count = parse_count(&mut fields, "symbol_export.count")?;
         let export_count = parse_count(&mut fields, "export.count")?;
+        // Added compatibly to the v1 wire format: old manifests have no
+        // command table and therefore decode as publishing no commands.
+        let command_count = match fields.remove("command.count") {
+            Some(count) => {
+                let count = count.parse::<usize>().map_err(|_| {
+                    RegistryError::InvalidManifest("invalid count in command.count".into())
+                })?;
+                if count > 4096 {
+                    return Err(RegistryError::InvalidManifest(
+                        "count in command.count exceeds 4096".into(),
+                    ));
+                }
+                count
+            }
+            None => 0,
+        };
         let mut dependencies = Vec::with_capacity(dependency_count);
         for index in 0..dependency_count {
             let value = take_field(&mut fields, &format!("dependency.{index}"))?;
@@ -660,6 +733,43 @@ impl ModuleManifest {
                 },
             });
         }
+        let mut commands = Vec::with_capacity(command_count);
+        for index in 0..command_count {
+            let value = take_field(&mut fields, &format!("command.{index}"))?;
+            let parts = value.split('|').collect::<Vec<_>>();
+            if parts.len() != 6 {
+                return Err(RegistryError::InvalidManifest(
+                    "command row must contain six fields".into(),
+                ));
+            }
+            let name = decode_text(parts[0])?;
+            let category = match parts[1] {
+                "COMMANDS" => CommandCategory::Commands,
+                "FILECOMMANDS" => CommandCategory::FileCommands,
+                _ => {
+                    return Err(RegistryError::InvalidManifest(
+                        "unknown command category".into(),
+                    ));
+                }
+            };
+            let handler_name = decode_text(parts[3])?;
+            let handler = match parts[2] {
+                "PROC" => CommandHandler::Basic64Proc(handler_name),
+                "BRIDGE" if handler_name == "-" => CommandHandler::RustBridge,
+                _ => {
+                    return Err(RegistryError::InvalidManifest(
+                        "unknown command handler kind".into(),
+                    ));
+                }
+            };
+            commands.push(ModuleCommand {
+                name,
+                category,
+                handler,
+                syntax: decode_text(parts[4])?,
+                description: decode_text(parts[5])?,
+            });
+        }
         if let Some(key) = fields.keys().next() {
             return Err(RegistryError::InvalidManifest(format!(
                 "unknown manifest field {key}"
@@ -678,6 +788,7 @@ impl ModuleManifest {
             lifecycle,
             replacement_policy,
             symbol_exports,
+            commands,
             exports,
             source_path,
             source_hash,
@@ -1080,6 +1191,51 @@ fn validate_manifest_shape(manifest: &ModuleManifest) -> Result<(), RegistryErro
             return Err(RegistryError::InvalidManifest(format!(
                 "duplicate exported symbol {symbol:?}"
             )));
+        }
+    }
+    let mut command_names = BTreeSet::new();
+    for command in &manifest.commands {
+        let canonical = command.name.to_ascii_uppercase();
+        if command.name.is_empty()
+            || command.name.len() > 32
+            || !command
+                .name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            || !command_names.insert(canonical)
+        {
+            return Err(RegistryError::InvalidManifest(format!(
+                "invalid or duplicate command name {:?}",
+                command.name
+            )));
+        }
+        if command.syntax.is_empty()
+            || command.syntax.len() > 160
+            || command.description.is_empty()
+            || command.description.len() > 256
+            || [&command.name, &command.syntax, &command.description]
+                .iter()
+                .any(|text| text.contains('|') || text.bytes().any(|byte| byte.is_ascii_control()))
+        {
+            return Err(RegistryError::InvalidManifest(format!(
+                "command {} has invalid or overlong display metadata",
+                command.name
+            )));
+        }
+        match &command.handler {
+            CommandHandler::Basic64Proc(name) => {
+                validate_symbol_name(name)?;
+            }
+            CommandHandler::RustBridge => {
+                if !manifest.name.eq_ignore_ascii_case("RicochetCommands")
+                    || !is_registered_rust_command(&command.name)
+                {
+                    return Err(RegistryError::InvalidManifest(format!(
+                        "Rust bridge command {} is not permitted in module {}",
+                        command.name, manifest.name
+                    )));
+                }
+            }
         }
     }
     let mut primitive_imports = BTreeSet::new();
@@ -1715,6 +1871,16 @@ pub struct ModuleRecord {
     pub definitions: BTreeMap<String, DefinitionDescriptor>,
     pub resolved_primitives: BTreeMap<String, PrimitiveId>,
     pub granted_capabilities: BTreeSet<CapabilityName>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveCommand {
+    pub module: ModuleId,
+    pub module_name: String,
+    pub module_version: SemanticVersion,
+    pub source_hash: String,
+    pub command: ModuleCommand,
+    pub definition: Option<DefinitionDescriptor>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2400,6 +2566,54 @@ impl ModuleRegistry {
         records
     }
 
+    /// Active command order follows `active_modules_sorted()` and then each
+    /// manifest's declaration order. Help and BASIC64 execution both consume
+    /// this same sequence.
+    pub fn active_commands(&self) -> Vec<ActiveCommand> {
+        self.active_modules_sorted()
+            .into_iter()
+            .flat_map(|module| {
+                module.manifest.commands.iter().map(move |command| {
+                    let definition = match &command.handler {
+                        CommandHandler::Basic64Proc(name) => module.definitions.get(name).cloned(),
+                        CommandHandler::RustBridge => None,
+                    };
+                    ActiveCommand {
+                        module: module.id,
+                        module_name: module.manifest.name.clone(),
+                        module_version: module.manifest.version,
+                        source_hash: module.manifest.source_hash.clone(),
+                        command: command.clone(),
+                        definition,
+                    }
+                })
+            })
+            .collect()
+    }
+
+    pub fn active_command(
+        &self,
+        module_name: &str,
+        command_name: &str,
+        handler_kind: &str,
+        handler_name: &str,
+    ) -> Option<ActiveCommand> {
+        self.active_commands().into_iter().find(|entry| {
+            entry.module_name.eq_ignore_ascii_case(module_name)
+                && entry.command.name.eq_ignore_ascii_case(command_name)
+                && match &entry.command.handler {
+                    CommandHandler::Basic64Proc(name) => {
+                        handler_kind.eq_ignore_ascii_case("PROC")
+                            && name.eq_ignore_ascii_case(handler_name)
+                    }
+                    CommandHandler::RustBridge => {
+                        handler_kind.eq_ignore_ascii_case("BRIDGE")
+                            && entry.command.name.eq_ignore_ascii_case(handler_name)
+                    }
+                }
+        })
+    }
+
     pub fn module_state(&self, id: ModuleId) -> Option<ModuleState> {
         self.module(id).map(|module| module.state)
     }
@@ -2799,15 +3013,51 @@ fn canonical_module_name(name: &str) -> String {
     name.to_ascii_uppercase()
 }
 
-fn same_replacement_manifest(current: &ModuleManifest, candidate: &ModuleManifest) -> bool {
+pub(crate) fn same_replacement_manifest(
+    current: &ModuleManifest,
+    candidate: &ModuleManifest,
+) -> bool {
     let mut current_without_source = current.clone();
     current_without_source.source_path = candidate.source_path.clone();
     current_without_source.source_hash = candidate.source_hash.clone();
+    if current_without_source.commands.len() != candidate.commands.len() {
+        return false;
+    }
+    // Descriptions are presentation metadata and can improve on reload;
+    // names, categories, syntax, and handler identities remain contracts.
+    for (old, new) in current_without_source
+        .commands
+        .iter_mut()
+        .zip(&candidate.commands)
+    {
+        old.description = new.description.clone();
+    }
     current_without_source == *candidate
 }
 
 fn canonical_primitive_name(name: &str) -> String {
     name.to_ascii_uppercase()
+}
+
+fn is_registered_rust_command(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "BASIC64"
+            | "BASIC"
+            | "RUN"
+            | "CAT"
+            | "DIR"
+            | "CDIR"
+            | "DELETE"
+            | "RENAME"
+            | "FILETYPE"
+            | "TYPE"
+            | "DISC"
+            | "HOSTFS"
+            | "DESKTOP"
+            | "FX"
+            | "QUIT"
+    )
 }
 
 fn validate_module_name(name: &str) -> Result<(), RegistryError> {
@@ -2865,6 +3115,7 @@ mod tests {
             lifecycle: ModuleLifecycle::default(),
             replacement_policy: ReplacementPolicy::CompatibleImmediate,
             symbol_exports: Vec::new(),
+            commands: Vec::new(),
             exports,
             source_path: "modules/test.bas64".into(),
             source_hash: "sha256:test".into(),
@@ -2878,6 +3129,29 @@ mod tests {
             definition_name: definition.into(),
             contract: SwiContract::default(),
         }
+    }
+
+    #[test]
+    fn command_manifest_extension_keeps_old_empty_tables_canonical_and_bounded() {
+        let value = manifest(
+            "Console",
+            vec![export(0x10, "OS_WriteC", "WriteC")],
+            Vec::new(),
+            &[],
+        );
+        let old_canonical_wire = value.encode_v1().unwrap();
+        assert!(!old_canonical_wire.contains("command.count\t"));
+        assert_eq!(
+            ModuleManifest::decode_v1(&old_canonical_wire).unwrap(),
+            value
+        );
+
+        let hostile_count = format!("{old_canonical_wire}command.count\t18446744073709551615\n");
+        assert!(matches!(
+            ModuleManifest::decode_v1(&hostile_count),
+            Err(RegistryError::InvalidManifest(message))
+                if message.contains("command.count exceeds 4096")
+        ));
     }
 
     #[test]

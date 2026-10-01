@@ -1751,20 +1751,40 @@ impl WimpServer {
     }
 
     fn initialise(&self, task: &mut Task, context: &mut SwiContext) -> Result<(), RuntimeError> {
-        if !matches!(context.registers[0], 200 | 300 | 310) {
+        self.validate_initialise_inputs(
+            task,
+            context.registers[0],
+            context.registers[2],
+            context.registers[3],
+        )?;
+        let (version, handle) = self.register_task(task)?;
+        context.registers[0] = version;
+        context.registers[1] = handle;
+        Ok(())
+    }
+
+    pub(crate) fn validate_initialise_inputs(
+        &self,
+        task: &Task,
+        version: u32,
+        description_address: u32,
+        message_list_address: u32,
+    ) -> Result<(), RuntimeError> {
+        if !matches!(version, 200 | 300 | 310) {
             return Err(program_error(
                 "Wimp_Initialise version must be 200, 300 or 310",
             ));
         }
-        if context.registers[1] != TASK_MAGIC {
-            return Err(program_error("Wimp_Initialise R1 must contain 'TASK'"));
+        let description = read_lifecycle_string(task, description_address, 128)?;
+        if description.len() > 127 {
+            return Err(program_error("Wimp task description exceeds 127 bytes"));
         }
-        let _description = read_control_string(task, context.registers[2], 128)?;
-        if context.registers[0] >= 300 && context.registers[3] != 0 {
-            let mut address = context.registers[3];
+        if version >= 300 && message_list_address != 0 {
+            let mut address = message_list_address;
             let mut terminated = false;
             for _ in 0..128 {
-                if read_word(&task.memory.read_bytes(address, 4)?, 0) == 0 {
+                let bytes = task.memory.read_caller_data_bytes(address, 4)?;
+                if read_word(&bytes, 0) == 0 {
                     terminated = true;
                     break;
                 }
@@ -1778,7 +1798,10 @@ impl WimpServer {
                 ));
             }
         }
+        Ok(())
+    }
 
+    pub(crate) fn register_task(&self, task: &mut Task) -> Result<(u32, u32), RuntimeError> {
         let mut state = self.lock_state()?;
         let handle = if let Some(handle) = state.guest_to_task.get(&task.id).copied() {
             let registered = state
@@ -1818,9 +1841,7 @@ impl WimpServer {
             );
             handle
         };
-        context.registers[0] = WIMP_VERSION;
-        context.registers[1] = handle;
-        Ok(())
+        Ok((WIMP_VERSION, handle))
     }
 
     fn create_window(&self, task: &mut Task, context: &mut SwiContext) -> Result<(), RuntimeError> {
@@ -2029,16 +2050,28 @@ impl WimpServer {
         let address = context.registers[1];
         let block = task.memory.read_bytes(address, OPEN_BLOCK_SIZE)?;
         let handle = read_word(&block, 0);
-        let mut area = WorkArea {
+        let area = WorkArea {
             min_x: read_word(&block, 4) as i32,
             min_y: read_word(&block, 8) as i32,
             max_x: read_word(&block, 12) as i32,
             max_y: read_word(&block, 16) as i32,
         };
-        validate_geometry(area)?;
-        let mut scroll_x = read_word(&block, 20) as i32;
-        let mut scroll_y = read_word(&block, 24) as i32;
+        let scroll_x = read_word(&block, 20) as i32;
+        let scroll_y = read_word(&block, 24) as i32;
         let behind = read_word(&block, 28) as i32;
+        self.open_window_values(task, handle, area, scroll_x, scroll_y, behind)
+    }
+
+    pub(crate) fn open_window_values(
+        &self,
+        task: &mut Task,
+        handle: u32,
+        mut area: WorkArea,
+        mut scroll_x: i32,
+        mut scroll_y: i32,
+        behind: i32,
+    ) -> Result<(), RuntimeError> {
+        validate_geometry(area)?;
         let mut state = self.lock_state()?;
         let metrics = state.desktop_metrics;
         let caller = *state
@@ -2116,6 +2149,10 @@ impl WimpServer {
         let address = context.registers[1];
         let block = task.memory.read_bytes(address, 4)?;
         let handle = read_word(&block, 0);
+        self.close_window_handle(task, handle)
+    }
+
+    pub(crate) fn close_window_handle(&self, task: &Task, handle: u32) -> Result<(), RuntimeError> {
         let mut state = self.lock_state()?;
         let caller = *state
             .guest_to_task
@@ -2668,6 +2705,21 @@ impl WimpServer {
         let address = context.registers[1];
         let block = task.memory.read_bytes(address, WINDOW_STATE_BLOCK_SIZE)?;
         let handle = read_word(&block, 0);
+        let result = self.window_state_values(task, handle)?;
+        let mut bytes = [0u8; WINDOW_STATE_BLOCK_SIZE];
+        for (index, value) in result.iter().enumerate() {
+            put_word(&mut bytes, index * 4, *value);
+        }
+        task.memory.write_bytes(address, &bytes)?;
+        context.registers[1] = address;
+        Ok(())
+    }
+
+    pub(crate) fn window_state_values(
+        &self,
+        task: &Task,
+        handle: u32,
+    ) -> Result<[u32; 9], RuntimeError> {
         let state = self.lock_state()?;
         let caller = *state
             .guest_to_task
@@ -2739,35 +2791,42 @@ impl WimpServer {
         if window.toggle_request_pending {
             flags |= 1 << 19;
         }
-        let mut result = [0; WINDOW_STATE_BLOCK_SIZE];
-        put_word(&mut result, 0, handle);
-        put_word(&mut result, 4, window.work_area.min_x as u32);
-        put_word(&mut result, 8, window.work_area.min_y as u32);
-        put_word(&mut result, 12, window.work_area.max_x as u32);
-        put_word(&mut result, 16, window.work_area.max_y as u32);
-        put_word(&mut result, 20, window.scroll_x as u32);
-        put_word(&mut result, 24, window.scroll_y as u32);
-        put_word(&mut result, 28, front as u32);
-        put_word(&mut result, 32, flags);
-        drop(state);
-        task.memory.write_bytes(address, &result)?;
-        context.registers[1] = address;
-        Ok(())
+        Ok([
+            handle,
+            window.work_area.min_x as u32,
+            window.work_area.min_y as u32,
+            window.work_area.max_x as u32,
+            window.work_area.max_y as u32,
+            window.scroll_x as u32,
+            window.scroll_y as u32,
+            front as u32,
+            flags,
+        ])
     }
 
     fn close_down(&self, task: &mut Task, context: &mut SwiContext) -> Result<(), RuntimeError> {
         if context.registers[1] != TASK_MAGIC {
             return Err(program_error("Wimp_CloseDown R1 must contain 'TASK'"));
         }
+        self.close_task_for_caller(task, context.registers[0])?;
+        context.registers[0] = 0;
+        Ok(())
+    }
+
+    pub(crate) fn close_task_for_caller(
+        &self,
+        task: &mut Task,
+        requested_handle: u32,
+    ) -> Result<(), RuntimeError> {
         let mut state = self.lock_state()?;
         let handle = *state
             .guest_to_task
             .get(&task.id)
             .ok_or_else(|| program_error("Wimp_CloseDown called before Wimp_Initialise"))?;
-        if context.registers[0] != handle {
-            return Err(program_error(
-                "Wimp_CloseDown task handle does not belong to caller",
-            ));
+        if requested_handle != handle {
+            return Err(program_error(format!(
+                "Wimp_CloseDown handle {requested_handle} does not match caller handle {handle}"
+            )));
         }
         if state
             .active_menu
@@ -2776,14 +2835,33 @@ impl WimpServer {
         {
             state.active_menu = None;
         }
+        if state.system_menu_owner == Some(handle) {
+            state.system_menu_owner = None;
+        }
+        if state.last_click.is_some_and(|click| click.owner == handle) {
+            state.last_click = None;
+        }
         let started_by_wimp = state
             .tasks
             .get(&handle)
             .is_some_and(|registered| registered.started_by_wimp);
+        let console_exists = state
+            .windows
+            .values()
+            .any(|window| window.owner_task_handle == handle && window.console_window);
+        if started_by_wimp && !console_exists {
+            let next = state.next_window_handle;
+            if next == 0 || next > i32::MAX as u32 || next.checked_add(1).is_none() {
+                return Err(program_error("Wimp window handle space exhausted"));
+            }
+        }
         if started_by_wimp {
             if let Some(registered) = state.tasks.get_mut(&handle) {
                 registered.initialised = false;
                 registered.events.clear();
+                registered.last_event_button_state = None;
+                registered.redraw_event_pending = None;
+                registered.redraw_loop = None;
             }
             state.icons.retain(|icon| icon.owner_task_id != task.id);
             state
@@ -2796,10 +2874,6 @@ impl WimpServer {
             state
                 .stacking
                 .retain(|window| existing_windows.contains(window));
-            let console_exists = state
-                .windows
-                .values()
-                .any(|window| window.owner_task_handle == handle && window.console_window);
             if !console_exists {
                 let metrics = state.desktop_metrics;
                 insert_console_window(&mut state, handle, task.id, "BASIC", metrics)?;
@@ -3048,6 +3122,17 @@ impl WimpServer {
             max_x: read_word(&block, 8) as i32,
             max_y: read_word(&block, 12) as i32,
         };
+        self.set_extent_values(task, handle, extent)?;
+        context.registers[0] = 0;
+        Ok(())
+    }
+
+    pub(crate) fn set_extent_values(
+        &self,
+        task: &Task,
+        handle: u32,
+        extent: WorkArea,
+    ) -> Result<(), RuntimeError> {
         validate_geometry(extent)?;
         let mut state = self.lock_state()?;
         let owner = *state
@@ -3075,7 +3160,6 @@ impl WimpServer {
             }
         }
         queue_visible_invalid_redraws(&mut state);
-        context.registers[0] = 0;
         drop(state);
         self.changed.notify_all();
         let _ = self.desktop_updates.send(());
@@ -3105,22 +3189,84 @@ impl WimpServer {
         if guest_path.contains('\n') || guest_path.contains('\r') {
             return Err(program_error("Wimp_StartTask path is invalid"));
         }
+        let kind = match kind {
+            DesktopTaskKind::Commands => DesktopTaskKind::Commands,
+            DesktopTaskKind::BasicWindow => DesktopTaskKind::BasicWindow,
+            DesktopTaskKind::File => DesktopTaskKind::File,
+        };
+        context.registers[0] = self.queue_launch_for_caller(task, kind, guest_path)?;
+        Ok(())
+    }
+
+    pub(crate) fn read_start_task_byte(
+        &self,
+        task: &Task,
+        address: u32,
+        offset: u32,
+    ) -> Result<u8, RuntimeError> {
+        if offset >= 256 {
+            return Err(program_error("Wimp_StartTask command exceeds 255 bytes"));
+        }
+        let current = address
+            .checked_add(offset)
+            .ok_or(crate::memory::MemoryError::AddressOverflow)?;
+        let byte = task.memory.read_caller_data_bytes(current, 1)?[0];
+        // RISC OS control strings end at NUL/CR here. Preserve other bytes so
+        // the BASIC64 command policy can recognize TAB separators and reject
+        // embedded controls rather than silently truncating at them.
+        Ok(if byte == b'\r' { 0 } else { byte })
+    }
+
+    pub(crate) fn queue_launch_for_caller(
+        &self,
+        task: &Task,
+        kind: DesktopTaskKind,
+        guest_path: &str,
+    ) -> Result<u32, RuntimeError> {
+        match kind {
+            DesktopTaskKind::Commands | DesktopTaskKind::BasicWindow if guest_path.is_empty() => {}
+            DesktopTaskKind::File
+                if !guest_path.is_empty()
+                    && guest_path.len() <= 255
+                    && !guest_path.chars().any(char::is_control) => {}
+            _ => return Err(program_error("Wimp task launch arguments are invalid")),
+        }
+        if !std::str::from_utf8(guest_path.as_bytes()).is_ok() {
+            return Err(program_error("Wimp_StartTask path is not valid UTF-8"));
+        }
         let mut state = self.lock_state()?;
-        let _owner = *state
+        let owner = *state
             .guest_to_task
             .get(&task.id)
             .ok_or_else(|| program_error("Wimp_StartTask called by a non-Wimp task"))?;
+        if !state
+            .tasks
+            .get(&owner)
+            .is_some_and(|registered| registered.initialised)
+        {
+            return Err(program_error(
+                "Wimp_StartTask requires an initialised Wimp task",
+            ));
+        }
         let task_id = state.next_guest_task_id;
-        state.next_guest_task_id = state
+        let next_task_id = state
             .next_guest_task_id
             .checked_add(1)
             .ok_or_else(|| program_error("hosted task id space is exhausted"))?;
+        let next_handle = state.next_task_handle;
+        if next_handle == 0 || next_handle > i32::MAX as u32 || next_handle.checked_add(1).is_none()
+        {
+            return Err(program_error("Wimp handle space exhausted"));
+        }
         let task_handle = allocate_handle(&mut state.next_task_handle)?;
         let label = match kind {
             DesktopTaskKind::Commands => "*Commands",
             DesktopTaskKind::BasicWindow => "BASIC window",
             DesktopTaskKind::File => guest_path.rsplit('.').next().unwrap_or(guest_path),
         };
+        let metrics = state.desktop_metrics;
+        insert_console_window(&mut state, task_handle, task_id, label, metrics)?;
+        state.next_guest_task_id = next_task_id;
         state.guest_to_task.insert(task_id, task_handle);
         state.tasks.insert(
             task_handle,
@@ -3133,19 +3279,16 @@ impl WimpServer {
                 ..WimpTask::default()
             },
         );
-        let metrics = state.desktop_metrics;
-        insert_console_window(&mut state, task_handle, task_id, label, metrics)?;
         state.pending_launches.push_back(DesktopTaskRequest {
             kind,
             task_id,
             guest_path: guest_path.to_string(),
             title: label.to_string(),
         });
-        context.registers[0] = task_handle;
         drop(state);
         self.changed.notify_all();
         let _ = self.desktop_updates.send(());
-        Ok(())
+        Ok(task_handle)
     }
 
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, WimpState>, RuntimeError> {
@@ -5163,6 +5306,31 @@ fn read_control_string(task: &Task, address: u32, limit: usize) -> Result<String
         let byte = task.memory.read_byte(current)?;
         if byte <= 31 {
             return Ok(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        bytes.push(byte);
+    }
+    Err(program_error(
+        "Wimp task description is not control-terminated",
+    ))
+}
+
+fn read_lifecycle_string(task: &Task, address: u32, limit: usize) -> Result<String, RuntimeError> {
+    let mut bytes = Vec::new();
+    for offset in 0..limit {
+        let current = address
+            .checked_add(
+                u32::try_from(offset).map_err(|_| crate::memory::MemoryError::AddressOverflow)?,
+            )
+            .ok_or(crate::memory::MemoryError::AddressOverflow)?;
+        let byte = task.memory.read_caller_data_bytes(current, 1)?[0];
+        if byte == 0 || byte == b'\r' {
+            return String::from_utf8(bytes)
+                .map_err(|_| program_error("Wimp task description is not valid UTF-8"));
+        }
+        if byte < 32 || byte == 127 {
+            return Err(program_error(
+                "Wimp task description contains an unsupported control byte",
+            ));
         }
         bytes.push(byte);
     }

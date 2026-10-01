@@ -45,8 +45,47 @@ impl MosClock {
 pub(super) struct MosState {
     pub(super) system_clock: MosClock,
     pub(super) monotonic_timer: MosClock,
-    interval_timer: MosClock,
+    pub(super) interval_timer: MosClock,
     pub(super) input: VecDeque<u8>,
+}
+
+impl MosState {
+    pub(super) fn insert_key(&mut self, byte: u8) -> bool {
+        if self.input.len() >= 256 {
+            true
+        } else {
+            self.input.push_back(byte);
+            false
+        }
+    }
+
+    pub(super) fn flush_keyboard(&mut self, console: &HostConsole) {
+        self.input.clear();
+        while console.try_read_byte().is_some() {}
+    }
+
+    /// Poll the MOS keyboard queue for the requested centisecond interval.
+    /// An active Exec source owns this task's input stream, so timed key
+    /// polling must neither advance it nor consume queued host input.
+    pub(super) fn read_timed_key(
+        &mut self,
+        task: &Task,
+        console: &HostConsole,
+        timeout_centiseconds: u16,
+    ) -> (u8, u8) {
+        let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_centiseconds) * 10);
+        loop {
+            if !task.has_exec_input()
+                && let Some(key) = self.input.pop_front().or_else(|| console.try_read_byte())
+            {
+                return (key, if key == 27 { 1 } else { 0 });
+            }
+            if Instant::now() >= deadline {
+                return (255, 2);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 }
 
 // ARM BASIC accepts a complete address in X%, or a low byte in X% and
@@ -143,88 +182,6 @@ impl SwiDispatcher {
             }
         };
         self.dispatch(swi, task, context)
-    }
-
-    pub(super) fn os_word(
-        &mut self,
-        task: &mut Task,
-        context: &mut SwiContext,
-    ) -> Result<(), RuntimeError> {
-        let reason = context.registers[R0];
-        let address = context.registers[R1];
-        let clock = match reason {
-            1 | 2 => &self.mos.system_clock,
-            3 | 4 => &self.mos.interval_timer,
-            _ => {
-                return Err(RuntimeError::Program(format!(
-                    "OS_Word reason {reason} is not implemented by the hosted MOS"
-                )));
-            }
-        };
-        if reason == 1 || reason == 3 {
-            task.memory
-                .write_bytes(address, &clock.read().to_le_bytes()[..5])?;
-        } else {
-            // Validate the complete block before changing clock state.
-            let bytes = task.memory.read_bytes(address, 5)?;
-            let value = bytes.iter().enumerate().fold(0, |value, (index, byte)| {
-                value | (u64::from(*byte) << (8 * index))
-            });
-            clock.set(value);
-        }
-        Ok(())
-    }
-
-    pub(super) fn os_byte(&mut self, context: &mut SwiContext) -> Result<(), RuntimeError> {
-        // Decode byte parameters without destroying preserved register bits.
-        let reason = context.registers[R0] & 255;
-        let x = context.registers[R1] & 255;
-        let y = context.registers[R2] & 255;
-        match reason {
-            // The hosted input queue models keyboard buffer zero only.
-            138 if x == 0 => {
-                if self.mos.input.len() >= 256 {
-                    context.carry = true;
-                } else {
-                    self.mos.input.push_back(y as u8);
-                    context.carry = false;
-                }
-                Ok(())
-            }
-            21 if x == 0 => {
-                self.mos.input.clear();
-                while self.console.try_read_byte().is_some() {}
-                Ok(())
-            }
-            // INKEY with a nonnegative 16-bit centisecond timeout. Negative
-            // keyboard-matrix queries need a separate physical-key model.
-            129 if y < 128 => {
-                let deadline = Instant::now() + Duration::from_millis(u64::from(x + (y << 8)) * 10);
-                loop {
-                    if let Some(key) = self
-                        .mos
-                        .input
-                        .pop_front()
-                        .or_else(|| self.console.try_read_byte())
-                    {
-                        context.registers[R1] = u32::from(key);
-                        context.registers[R2] = if key == 27 { 27 } else { 0 };
-                        context.carry = key == 27;
-                        return Ok(());
-                    }
-                    if Instant::now() >= deadline {
-                        context.registers[R1] = 255;
-                        context.registers[R2] = 255;
-                        context.carry = true;
-                        return Ok(());
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-            }
-            _ => Err(RuntimeError::Program(format!(
-                "OS_Byte reason {reason} with X={x}, Y={y} is not implemented by the hosted MOS"
-            ))),
-        }
     }
 }
 

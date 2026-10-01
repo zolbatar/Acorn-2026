@@ -6,24 +6,78 @@ REM @IMPORT_MODULE ModuleManager 1.0.0
 REM @CAPABILITY TaskMemory
 REM @CAPABILITY ConfigurationStoreRead
 REM @CAPABILITY ConfigurationStoreWrite
-REM @CAPABILITY MosCommandBridge
+REM @CAPABILITY CommandRegistry
+REM @CAPABILITY CommandScripts
+REM @CAPABILITY ExecInput
 REM @CAPABILITY RuntimeErrors
 REM @IMPORT Host.Configuration.ReadValue ConfigurationStoreRead
 REM @IMPORT Host.Configuration.WriteValue ConfigurationStoreWrite
 REM @IMPORT Host.Configuration.ReplaceAll ConfigurationStoreWrite
 REM @IMPORT Host.Memory.AcquireCommandScratch TaskMemory
 REM @IMPORT Host.Memory.ReleaseCommandScratch TaskMemory
-REM @IMPORT Host.MOS.ExecuteLegacy MosCommandBridge
+REM @IMPORT Host.CommandRegistry.ReadEntry CommandRegistry
+REM @IMPORT Host.CommandRegistry.Invoke CommandRegistry
+REM @IMPORT Host.CommandScripts.Open CommandScripts
+REM @IMPORT Host.CommandScripts.ReadLine CommandScripts
+REM @IMPORT Host.CommandScripts.Close CommandScripts
+REM @IMPORT Host.ExecInput.Replace ExecInput
 REM @IMPORT Host.Runtime.MissingTerminator RuntimeErrors
 REM @SWI OS_CLI &05 ExecuteCli REGISTERS=R0:ADDRESS32:IN;MEMORY=R0:READ:256;BLOCKING=TRUE;REENTRANT=FALSE;ERROR=CliError
+
+REM Registry order is module title order then declaration order. Execution uses
+REM the first matching command. Help uses the same live descriptors but lists
+REM every matching prefix. Rust-backed transitional commands are explicit
+REM BRIDGE rows; there is no catch-all legacy route.
+REM @COMMAND HELP Commands PROC CommandHelp "*Help [topic, command or module]" "Show commands, module versions, syntax, or matching command details"
+REM @COMMAND CONFIGURE Commands PROC ConfigureEntrypoint "*Configure <option> <value>" "Set supported Ricochet configuration"
+REM @COMMAND STATUS Commands PROC StatusEntrypoint "*Status [option]" "Show effective configuration values and recovery status"
+REM STATUS remains the first S-prefix match; exact *Set/*Show and *Se./*Sh. select variable commands.
+REM @COMMAND SET Commands PROC SetVariableEntrypoint "*Set <name> [value]" "Create or update a guest-owned string system variable"
+REM @COMMAND SHOW Commands PROC ShowVariablesEntrypoint "*Show [pattern]" "Read guest-owned string system variables"
+REM @COMMAND INSPECT Commands PROC InspectEntrypoint "*Inspect MODULES / MODULE / SWI / DEFINITION ..." "Read-only module, SWI, and retained-source inspection"
+REM @COMMAND MODULES Commands PROC ModulesEntrypoint "*Modules" "List active BASIC64 modules and versions"
+REM @COMMAND BASIC Commands BRIDGE BASIC "*BASIC <file>" "Run BASIC with saved compatibility preferences"
+REM @COMMAND BASIC64 Commands BRIDGE BASIC64 "*BASIC64 [options] <file>" "Run with native BASIC64 launch defaults"
+REM @COMMAND RUN Commands BRIDGE RUN "*RUN <file>" "Run BASIC source or tokenized BASIC"
+REM The classic RUN abbreviation predates the RM* commands and keeps priority.
+REM @COMMAND RMLOAD Commands PROC RMLoadEntrypoint "*RMLoad <path>" "Load a BASIC64 module from a guest path"
+REM @COMMAND RMRUN Commands PROC RMRunEntrypoint "*RMRun <path>" "Load a module; no separate application entry is hosted"
+REM @COMMAND RMKILL Commands PROC RMKillEntrypoint "*RMKill <title>" "Unload an active BASIC64 module"
+REM @COMMAND RMENSURE Commands PROC RMEnsureEntrypoint "*RMEnsure <title> <version> [command]" "Run a bounded command only when a module version is absent or too old"
+REM @COMMAND RMREINIT Commands PROC UnsupportedModuleEntrypoint "*RMReInit <title> [init-string]" "Requires native ROM and RMA module lifecycle support"
+REM @COMMAND RMINSERT Commands PROC UnsupportedModuleEntrypoint "*RMInsert <title> [ROM-section]" "Requires ROM module support"
+REM @COMMAND RMTIDY Commands PROC UnsupportedModuleEntrypoint "*RMTidy" "Requires native RMA compaction and module lifecycle support"
+REM @COMMAND RMCLEAR Commands PROC UnsupportedModuleEntrypoint "*RMClear <title>" "Requires native ROM module support"
+REM @COMMAND RMFASTER Commands PROC UnsupportedModuleEntrypoint "*RMFaster" "Requires native ROM module support"
+REM @COMMAND ROMMODULES Commands PROC UnsupportedModuleEntrypoint "*ROMModules" "Requires a ROM module inventory"
+REM @COMMAND UNPLUG Commands PROC UnsupportedModuleEntrypoint "*Unplug <module>" "Requires ROM unplug state"
+REM UNPLUG retains the existing UN-prefix priority over UNSET.
+REM @COMMAND UNSET Commands PROC UnsetVariableEntrypoint "*Unset <pattern>" "Delete matching guest-owned string system variables"
+REM @COMMAND QUIT Commands BRIDGE QUIT "*QUIT" "Exit Ricochet"
+REM @COMMAND OBEY Commands PROC ObeyEntrypoint "*Obey <guest-path>" "Execute bounded guest command text through OS_CLI"
+REM @COMMAND EXEC Commands PROC ExecEntrypoint "*Exec [guest-path]" "Select a bounded guest file as this task's input stream, or close it"
+REM D. historically selects DIR before DELETE, DISC, and DESKTOP.
+REM @COMMAND DIR FileCommands BRIDGE DIR "*DIR [directory]" "Select or report the current directory"
+REM @COMMAND DELETE FileCommands BRIDGE DELETE "*DELETE <file>" "Delete a file"
+REM @COMMAND DISC FileCommands BRIDGE DISC "*DISC [name]" "Read or set the volume name"
+REM @COMMAND DESKTOP Commands BRIDGE DESKTOP "*DESKTOP" "Start Ricochet Desktop"
+REM F. historically selects FILETYPE before the *FX command.
+REM @COMMAND FILETYPE FileCommands BRIDGE FILETYPE "*FILETYPE <file> <type>" "Set a RISC OS file type"
+REM @COMMAND FX Commands BRIDGE FX "*FX <parameters>" "Run a supported hosted OS_Byte command"
+REM @COMMAND CAT FileCommands BRIDGE CAT "*CAT [directory]" "Catalogue a directory; * is the CAT shortcut"
+REM @COMMAND CDIR FileCommands BRIDGE CDIR "*CDIR <directory>" "Create a directory"
+REM @COMMAND RENAME FileCommands BRIDGE RENAME "*RENAME <old> <new>" "Rename a file or directory"
+REM @COMMAND TYPE FileCommands BRIDGE TYPE "*TYPE <file>" "Display a text file"
+REM @COMMAND HOSTFS FileCommands BRIDGE HOSTFS "*HOSTFS" "Select the hosted filing system"
 
 ERROR CliError
     Code AS UINT32 READONLY
     Message AS STRING READONLY
 END ERROR
 
-REM BASIC64 owns the public *INSPECT and module-command policy. The Rust bridge
-REM is used only for unrelated legacy commands which have not moved yet.
+REM BASIC64 owns recognition, matching, help, option policy, and presentation.
+REM Rust bridge entries are explicit registry members and have no independent
+REM help or command-name table.
 
 DEF PROC ExecuteCli THROWS CliError
     SAVED_R0% = R0%
@@ -47,84 +101,219 @@ DEF PROC ExecuteCli THROWS CliError
     NESTED_DISPATCH% = 0
 ENDPROC
 
-REM This procedure is also used by RMEnsure's bounded in-module command route;
-REM it never re-enters the non-reentrant OS_CLI SWI.
 DEF PROC DispatchCliText THROWS CliError
-    PROC TrimCommandText
-    STRIP_PREFIX% = 1
+    ALIAS_DEPTH% = 0
+    ALIAS_TRACE$ = "|"
+    ALIAS_SKIP% = 0
+    ALIAS_FOUND% = 0
+    ALIAS_WORK% = 0
+    CLI_COMMENT% = 0
     REPEAT
-        STRIP_PREFIX% = 0
-        IF LEFT$(RAWCLI$, 1) = "*" THEN RAWCLI$ = MID$(RAWCLI$, 2): STRIP_PREFIX% = 1
-        IF LEFT$(RAWCLI$, 1) = " " OR LEFT$(RAWCLI$, 1) = CHR$(9) THEN RAWCLI$ = MID$(RAWCLI$, 2): STRIP_PREFIX% = 1
-    UNTIL STRIP_PREFIX% = 0
-    TEXTIN$ = RAWCLI$
-    PROC MakeUppercase
-    UPPERCLI$ = TEXTOUT$
-    SPACE% = INSTR(UPPERCLI$, " ")
-    VERB$ = UPPERCLI$
-    ARGS$ = ""
-    ARGS_UPPER$ = ""
-    IF SPACE% > 0 THEN
-        VERB$ = LEFT$(UPPERCLI$, SPACE% - 1)
-        ARGS$ = MID$(RAWCLI$, SPACE% + 1)
-        ARGS_UPPER$ = MID$(UPPERCLI$, SPACE% + 1)
+        RAWCLI_FULL$ = RAWCLI$
+        PROC TrimCommandText
+        STRIP_PREFIX% = 1
+        REPEAT
+            STRIP_PREFIX% = 0
+            IF LEFT$(RAWCLI$, 1) = "*" THEN RAWCLI$ = MID$(RAWCLI$, 2): STRIP_PREFIX% = 1
+            IF LEFT$(RAWCLI$, 1) = " " OR LEFT$(RAWCLI$, 1) = CHR$(9) THEN RAWCLI$ = MID$(RAWCLI$, 2): STRIP_PREFIX% = 1
+        UNTIL STRIP_PREFIX% = 0
+        IF LEFT$(RAWCLI$, 1) = "|" THEN CLI_COMMENT% = 1
+        IF CLI_COMMENT% = 0 THEN
+            IF LEFT$(RAWCLI$, 1) = "%" THEN RAWCLI$ = MID$(RAWCLI$, 2): ALIAS_SKIP% = 1
+            TEXTIN$ = RAWCLI$
+            PROC MakeUppercase
+            UPPERCLI$ = TEXTOUT$
+            IF LEFT$(UPPERCLI$, 2) = "FX" AND LEN(UPPERCLI$) > 2 AND MID$(UPPERCLI$, 3, 1) <> " " AND MID$(UPPERCLI$, 3, 1) <> CHR$(9) THEN
+                UPPERCLI$ = "FX " + MID$(UPPERCLI$, 3)
+                RAWCLI$ = "FX " + MID$(RAWCLI$, 3)
+            ENDIF
+            SPACE% = INSTR(UPPERCLI$, " ")
+            ARG_TAB_INDEX% = INSTR(UPPERCLI$, CHR$(9))
+            IF SPACE% = 0 OR (ARG_TAB_INDEX% > 0 AND ARG_TAB_INDEX% < SPACE%) THEN SPACE% = ARG_TAB_INDEX%
+            VERB$ = UPPERCLI$
+            ARGS$ = ""
+            IF SPACE% > 0 THEN
+                VERB$ = LEFT$(UPPERCLI$, SPACE% - 1)
+                ARGS$ = MID$(RAWCLI$, SPACE% + 1)
+            ENDIF
+            TEXTIN$ = ARGS$
+            PROC MakeUppercase
+            ARGS_UPPER$ = TEXTOUT$
+            ABBREVIATED% = 0
+            IF VERB$ = "." THEN VERB$ = "CAT"
+            IF RIGHT$(VERB$, 1) = "." THEN
+                VERB$ = LEFT$(VERB$, LEN(VERB$) - 1)
+                ABBREVIATED% = 1
+            ENDIF
+            ALIAS_FOUND% = 0
+            IF LEN(VERB$) > 0 AND ALIAS_SKIP% = 0 THEN PROC ResolveCommandAlias
+            IF ALIAS_FOUND% THEN
+                ALIAS_DEPTH% = ALIAS_DEPTH% + 1
+                IF ALIAS_DEPTH% > 8 THEN PROC RaiseCliError("Alias expansion exceeds the hosted depth limit of 8")
+                IF INSTR(ALIAS_TRACE$, "|" + ALIAS_KEY$ + "|") > 0 THEN PROC RaiseCliError("Alias expansion cycle at Alias$" + ALIAS_KEY$)
+                ALIAS_TRACE$ = ALIAS_TRACE$ + ALIAS_KEY$ + "|"
+                IF LEN(ALIAS_EXPANSION$) > 255 THEN PROC RaiseCliError("Expanded alias command exceeds the 255-byte CLI limit")
+                ALIAS_WORK% = ALIAS_WORK% + LEN(ALIAS_EXPANSION$)
+                IF ALIAS_WORK% > 2048 THEN PROC RaiseCliError("Alias expansion exceeds the 2048-byte work limit")
+                RAWCLI$ = ALIAS_EXPANSION$
+                ALIAS_SKIP% = 0
+            ENDIF
+        ENDIF
+    UNTIL CLI_COMMENT% <> 0 OR ALIAS_FOUND% = 0
+    IF CLI_COMMENT% THEN ENDPROC
+    IF LEN(VERB$) = 0 THEN ENDPROC
+    PROC FindCommandDescriptor
+    IF COMMAND_FOUND% = 0 THEN
+        PROC RaiseCliError("Bad command: " + VERB$)
     ENDIF
-    ABBREVIATED% = 0
-    IF RIGHT$(VERB$, 1) = "." THEN
-        VERB$ = LEFT$(VERB$, LEN(VERB$) - 1)
-        ABBREVIATED% = 1
-    ENDIF
+    PROC InvokeCommandDescriptor
+ENDPROC
 
-    PROC ResolveCliCommand
-    IF CLI_AMBIGUOUS% THEN
-        PRINT "Ambiguous command abbreviation: "; VERB$; "."
-        ENDPROC
-    ENDIF
-    REM Keep launch-policy parsing in the MOS execution bridge; this exact
-    REM BASIC64 command is additive and does not alter the established *BASIC route.
-    IF VERB$ = "BASIC64" THEN PRIMITIVE Host.MOS.ExecuteLegacy, SAVED_R0%: ENDPROC
-    IF CLI_COMMAND$ = "CONFIGURE" THEN PROC ConfigureCommand: ENDPROC
-    IF CLI_COMMAND$ = "STATUS" THEN PROC StatusCommand: ENDPROC
-    IF CLI_COMMAND$ = "INSPECT" THEN
-        PROC AcquireCommandScratch
-        PROC HandleInspect
-        PROC ReleaseCommandScratch
-        ENDPROC
-    ENDIF
-    IF CLI_COMMAND$ = "MODULES" THEN
-        IF ARGS$ <> "" THEN PRINT "Syntax: *Modules": ENDPROC
-        PROC AcquireCommandScratch
-        SUBARGS$ = ""
-        PROC ListModules
-        PROC ReleaseCommandScratch
-        ENDPROC
-    ENDIF
-    IF CLI_COMMAND$ = "RMLOAD" OR CLI_COMMAND$ = "RMRUN" THEN
-        PROC OperateRMLoad
-        ENDPROC
-    ENDIF
-    IF CLI_COMMAND$ = "RMKILL" THEN
-        PROC OperateRMKill
-        ENDPROC
-    ENDIF
-    IF CLI_COMMAND$ = "RMENSURE" THEN
-        PROC OperateRMEnsure
-        ENDPROC
-    ENDIF
-    IF CLI_COMMAND$ <> "" THEN
-        PROC ExplainUnsupportedModuleCommand
-        ENDPROC
-    ENDIF
+DEF PROC ResolveCommandAlias THROWS CliError
+    ALIAS_KEY$ = VERB$
+    ALIAS_CHECK_KEY$ = ALIAS_KEY$
+    PROC ValidateAliasKey
+    IF ALIAS_NAME_VALID% = 0 THEN ENDPROC
 
-    IF NESTED_DISPATCH% THEN
-        PROC AcquireCommandScratch
-        PROC WriteString(CONFIG_SCRATCH_BASE, RAWCLI$)
-        PRIMITIVE Host.MOS.ExecuteLegacy, CONFIG_SCRATCH_BASE
-        PROC ReleaseCommandScratch
+    PROC AcquireVariableCommandScratch
+    ALIAS_PREFIX$ = ALIAS_KEY$
+    ALIAS_SELECTOR$ = "Alias$" + ALIAS_PREFIX$
+    ALIAS_CONTEXT% = 0
+    ALIAS_MATCHES% = 0
+    ALIAS_EXACT% = 1 - ABBREVIATED%
+    REM Enumerate the bounded alias namespace for abbreviations. Appending a
+    REM wildcard to a full 32-byte Alias$<command> selector would exceed the
+    REM shared system-variable name limit by one byte.
+    IF ALIAS_EXACT% = 0 THEN ALIAS_SELECTOR$ = "Alias$*"
+    PROC WriteString(VARIABLE_SCRATCH_BASE, ALIAS_SELECTOR$)
+    REPEAT
+        ?(VARIABLE_SCRATCH_BASE + &140) = 0
+        SYS "XOS_ReadVarVal", VARIABLE_SCRATCH_BASE, VARIABLE_SCRATCH_BASE + &140, 256, ALIAS_CONTEXT%, 0 TO ALIAS_ERROR_ADDRESS%, ALIAS_VALUE_ADDRESS%, ALIAS_VALUE_LENGTH%, ALIAS_CONTEXT%, ALIAS_VALUE_TYPE% ; ALIAS_FLAGS%
+        IF (ALIAS_FLAGS% AND 1) <> 0 THEN
+            ALIAS_ERROR_CODE% = !ALIAS_ERROR_ADDRESS%
+            IF ALIAS_ERROR_CODE% = 2 THEN ALIAS_CONTEXT% = 0
+            IF ALIAS_ERROR_CODE% <> 2 THEN SYS "OS_GenerateError", ALIAS_ERROR_ADDRESS%
+        ENDIF
+        IF (ALIAS_FLAGS% AND 1) = 0 THEN
+            ?(ALIAS_VALUE_ADDRESS% + ALIAS_VALUE_LENGTH%) = 0
+            IF ALIAS_EXACT% = 0 THEN
+                PROC ReadVariableContextName(ALIAS_CONTEXT%)
+                ALIAS_CANDIDATE_NAME$ = TEXT$
+                TEXTIN$ = ALIAS_CANDIDATE_NAME$
+                PROC MakeUppercase
+                ALIAS_CANDIDATE_NAME$ = TEXTOUT$
+                ALIAS_CANDIDATE_KEY$ = MID$(ALIAS_CANDIDATE_NAME$, 7)
+                ALIAS_CHECK_KEY$ = ALIAS_CANDIDATE_KEY$
+                PROC ValidateAliasKey
+                IF LEFT$(ALIAS_CANDIDATE_NAME$, 6) = "ALIAS$" AND ALIAS_NAME_VALID% AND LEFT$(ALIAS_CANDIDATE_KEY$, LEN(ALIAS_PREFIX$)) = ALIAS_PREFIX$ THEN
+                    ALIAS_MATCHES% = ALIAS_MATCHES% + 1
+                    IF ALIAS_MATCHES% = 1 THEN
+                        ALIAS_KEY$ = ALIAS_CANDIDATE_KEY$
+                        PROC ReadString(VARIABLE_SCRATCH_BASE + &140)
+                        ALIAS_VALUE$ = TEXT$
+                    ENDIF
+                ENDIF
+            ENDIF
+            IF ALIAS_EXACT% <> 0 THEN
+                ALIAS_MATCHES% = 1
+                PROC ReadString(VARIABLE_SCRATCH_BASE + &140)
+                ALIAS_VALUE$ = TEXT$
+            ENDIF
+            IF ALIAS_EXACT% THEN ALIAS_CONTEXT% = 0
+        ENDIF
+    UNTIL ALIAS_CONTEXT% = 0
+    PROC ReleaseVariableCommandScratch
+    IF ALIAS_MATCHES% > 1 THEN PROC RaiseCliError("Ambiguous alias abbreviation: " + VERB$ + ".")
+    IF ALIAS_MATCHES% = 0 THEN ENDPROC
+    ALIAS_FOUND% = 1
+    IF ALIAS_VALUE$ = "" THEN PROC RaiseCliError("Alias$" + ALIAS_KEY$ + " has an empty command target")
+    PROC ExtractRawCommandArguments
+    ALIAS_ARGUMENTS$ = RAW_ARGUMENTS$
+    PROC ValidateAliasArguments(ALIAS_ARGUMENTS$)
+    PROC ExpandAliasTarget(ALIAS_VALUE$, ALIAS_ARGUMENTS$)
+    RAWCLI$ = ALIAS_EXPANSION$
+ENDPROC
+
+DEF PROC ValidateAliasKey
+    ALIAS_NAME_VALID% = 1
+    IF LEN(ALIAS_CHECK_KEY$) = 0 OR LEN(ALIAS_CHECK_KEY$) > 26 THEN ALIAS_NAME_VALID% = 0
+    FOR ALIAS_NAME_POS% = 1 TO LEN(ALIAS_CHECK_KEY$)
+        ALIAS_NAME_BYTE% = ASC(MID$(ALIAS_CHECK_KEY$, ALIAS_NAME_POS%, 1))
+        IF (ALIAS_NAME_BYTE% < 48 OR ALIAS_NAME_BYTE% > 57) AND (ALIAS_NAME_BYTE% < 65 OR ALIAS_NAME_BYTE% > 90) THEN
+            IF INSTR("!'()+-.;=?@[]_`{}~", MID$(ALIAS_CHECK_KEY$, ALIAS_NAME_POS%, 1)) = 0 THEN ALIAS_NAME_VALID% = 0
+        ENDIF
+    NEXT
+ENDPROC
+
+DEF PROC ValidateAliasArguments(arguments$ AS STRING) THROWS CliError
+    ALIAS_QUOTED% = 0
+    FOR ALIAS_ARG_POS% = 1 TO LEN(arguments$)
+        IF MID$(arguments$, ALIAS_ARG_POS%, 1) = """" THEN ALIAS_QUOTED% = 1 - ALIAS_QUOTED%
+    NEXT
+    IF ALIAS_QUOTED% THEN PROC RaiseCliError("Alias argument list has unmatched quotes")
+ENDPROC
+
+DEF PROC ExpandAliasTarget(template$ AS STRING, arguments$ AS STRING) THROWS CliError
+    ALIAS_EXPANSION$ = ""
+    ALIAS_SCAN% = 1
+    ALIAS_HIGHEST% = -1
+    ALIAS_TAIL_USED% = 0
+    REPEAT
+        ALIAS_CHAR$ = MID$(template$, ALIAS_SCAN%, 1)
+        IF ALIAS_CHAR$ = "%" THEN
+            IF ALIAS_SCAN% = LEN(template$) THEN
+                ALIAS_EXPANSION$ = ALIAS_EXPANSION$ + "%"
+                ALIAS_SCAN% = ALIAS_SCAN% + 1
+            ENDIF
+            IF ALIAS_SCAN% <= LEN(template$) THEN
+                ALIAS_NEXT_CHAR$ = MID$(template$, ALIAS_SCAN% + 1, 1)
+                ALIAS_NEXT_CODE% = ASC(ALIAS_NEXT_CHAR$)
+                IF ALIAS_NEXT_CODE% >= 48 AND ALIAS_NEXT_CODE% <= 57 THEN
+                    ALIAS_INDEX% = ALIAS_NEXT_CODE% - 48
+                    PROC FindObeyArgument(arguments$, ALIAS_INDEX%)
+                    ALIAS_EXPANSION$ = ALIAS_EXPANSION$ + OBEY_ARGUMENT$
+                    IF ALIAS_INDEX% > ALIAS_HIGHEST% THEN ALIAS_HIGHEST% = ALIAS_INDEX%
+                    ALIAS_SCAN% = ALIAS_SCAN% + 2
+                ENDIF
+                IF ALIAS_NEXT_CODE% < 48 OR ALIAS_NEXT_CODE% > 57 THEN
+                    IF ALIAS_NEXT_CHAR$ = "%" THEN
+                        ALIAS_EXPANSION$ = ALIAS_EXPANSION$ + "%"
+                        ALIAS_SCAN% = ALIAS_SCAN% + 2
+                    ENDIF
+                    IF ALIAS_NEXT_CHAR$ <> "%" THEN
+                        ALIAS_INDEX_CODE% = 0
+                        IF ALIAS_NEXT_CHAR$ = "*" AND ALIAS_SCAN% + 2 <= LEN(template$) THEN ALIAS_INDEX_CODE% = ASC(MID$(template$, ALIAS_SCAN% + 2, 1))
+                        IF ALIAS_NEXT_CHAR$ = "*" AND ALIAS_INDEX_CODE% >= 48 AND ALIAS_INDEX_CODE% <= 57 THEN
+                            ALIAS_INDEX% = ALIAS_INDEX_CODE% - 48
+                            PROC FindObeyArgumentTail(arguments$, ALIAS_INDEX%)
+                            ALIAS_EXPANSION$ = ALIAS_EXPANSION$ + OBEY_ARGUMENT$
+                            ALIAS_TAIL_USED% = 1
+                            ALIAS_SCAN% = ALIAS_SCAN% + 3
+                        ENDIF
+                        IF ALIAS_NEXT_CHAR$ = "*" AND (ALIAS_INDEX_CODE% < 48 OR ALIAS_INDEX_CODE% > 57) THEN PROC RaiseCliError("Alias parameter substitution %* requires a digit")
+                        IF ALIAS_NEXT_CHAR$ <> "*" OR ALIAS_INDEX_CODE% < 48 OR ALIAS_INDEX_CODE% > 57 THEN
+                            ALIAS_EXPANSION$ = ALIAS_EXPANSION$ + "%" + ALIAS_NEXT_CHAR$
+                            ALIAS_SCAN% = ALIAS_SCAN% + 2
+                        ENDIF
+                    ENDIF
+                ENDIF
+            ENDIF
+        ENDIF
+        IF ALIAS_CHAR$ <> "%" THEN
+            ALIAS_EXPANSION$ = ALIAS_EXPANSION$ + ALIAS_CHAR$
+            ALIAS_SCAN% = ALIAS_SCAN% + 1
+        ENDIF
+        IF LEN(ALIAS_EXPANSION$) > 255 THEN PROC RaiseCliError("Expanded alias command exceeds the 255-byte CLI limit")
+    UNTIL ALIAS_SCAN% > LEN(template$)
+    IF ALIAS_TAIL_USED% = 0 THEN
+        PROC FindObeyArgumentTail(arguments$, ALIAS_HIGHEST% + 1)
+        IF OBEY_ARGUMENT$ <> "" THEN
+            IF ALIAS_EXPANSION$ <> "" AND RIGHT$(ALIAS_EXPANSION$, 1) <> " " THEN ALIAS_EXPANSION$ = ALIAS_EXPANSION$ + " "
+            ALIAS_EXPANSION$ = ALIAS_EXPANSION$ + OBEY_ARGUMENT$
+        ENDIF
     ENDIF
-    IF NESTED_DISPATCH% = 0 THEN
-        PRIMITIVE Host.MOS.ExecuteLegacy, SAVED_R0%
-    ENDIF
+    IF LEN(ALIAS_EXPANSION$) > 255 THEN PROC RaiseCliError("Expanded alias command exceeds the 255-byte CLI limit")
+    PROC ValidateAliasArguments(ALIAS_EXPANSION$)
 ENDPROC
 
 DEF PROC TrimCommandText
@@ -144,55 +333,696 @@ DEF PROC TrimCommandText
     UNTIL TRIMSPACE% = 0 OR LEN(RAWCLI$) = 0
 ENDPROC
 
-DEF PROC ResolveCliCommand
-    CLI_COMMAND$ = ""
-    CLI_MATCH_COUNT% = 0
-    CLI_AMBIGUOUS% = 0
-    IF ABBREVIATED% = 0 THEN
-        IF VERB$ = "CONFIGURE" THEN CLI_COMMAND$ = "CONFIGURE"
-        IF VERB$ = "STATUS" THEN CLI_COMMAND$ = "STATUS"
-        IF VERB$ = "INSPECT" THEN CLI_COMMAND$ = "INSPECT"
-        IF VERB$ = "MODULES" THEN CLI_COMMAND$ = "MODULES"
-        IF VERB$ = "RMLOAD" THEN CLI_COMMAND$ = "RMLOAD"
-        IF VERB$ = "RMRUN" THEN CLI_COMMAND$ = "RMRUN"
-        IF VERB$ = "RMKILL" THEN CLI_COMMAND$ = "RMKILL"
-        IF VERB$ = "RMENSURE" THEN CLI_COMMAND$ = "RMENSURE"
-        IF VERB$ = "RMREINIT" THEN CLI_COMMAND$ = "RMREINIT"
-        IF VERB$ = "RMINSERT" THEN CLI_COMMAND$ = "RMINSERT"
-        IF VERB$ = "RMTIDY" THEN CLI_COMMAND$ = "RMTIDY"
-        IF VERB$ = "RMCLEAR" THEN CLI_COMMAND$ = "RMCLEAR"
-        IF VERB$ = "RMFASTER" THEN CLI_COMMAND$ = "RMFASTER"
-        IF VERB$ = "ROMMODULES" THEN CLI_COMMAND$ = "ROMMODULES"
-        IF VERB$ = "UNPLUG" THEN CLI_COMMAND$ = "UNPLUG"
-        ENDPROC
-    ENDIF
-    IF ABBREVIATED% = 0 OR LEN(VERB$) = 0 THEN ENDPROC
-    REM Hosted compatibility rule: the one-letter *C. abbreviation selects
-    REM CONFIGURE before the legacy *CAT command, matching the earlier CLI contract.
-    IF VERB$ = "C" OR VERB$ = "CON" OR VERB$ = "CONF" OR VERB$ = "CONFIGURE" THEN PROC AddTopMatch("CONFIGURE")
-    IF VERB$ = "S" OR LEFT$("STATUS", LEN(VERB$)) = VERB$ THEN PROC AddTopMatch("STATUS")
-    IF LEFT$("INSPECT", LEN(VERB$)) = VERB$ THEN PROC AddTopMatch("INSPECT")
-    IF LEFT$("MODULES", LEN(VERB$)) = VERB$ THEN PROC AddTopMatch("MODULES")
-    IF LEFT$("RMLOAD", LEN(VERB$)) = VERB$ THEN PROC AddTopMatch("RMLOAD")
-    IF LEFT$("RMRUN", LEN(VERB$)) = VERB$ THEN PROC AddTopMatch("RMRUN")
-    IF LEFT$("RMKILL", LEN(VERB$)) = VERB$ THEN PROC AddTopMatch("RMKILL")
-    IF LEFT$("RMENSURE", LEN(VERB$)) = VERB$ THEN PROC AddTopMatch("RMENSURE")
-    IF LEFT$("RMREINIT", LEN(VERB$)) = VERB$ THEN PROC AddTopMatch("RMREINIT")
-    IF LEFT$("RMINSERT", LEN(VERB$)) = VERB$ THEN PROC AddTopMatch("RMINSERT")
-    IF LEFT$("RMTIDY", LEN(VERB$)) = VERB$ THEN PROC AddTopMatch("RMTIDY")
-    IF LEFT$("RMCLEAR", LEN(VERB$)) = VERB$ THEN PROC AddTopMatch("RMCLEAR")
-    IF LEFT$("RMFASTER", LEN(VERB$)) = VERB$ THEN PROC AddTopMatch("RMFASTER")
-    IF LEFT$("ROMMODULES", LEN(VERB$)) = VERB$ THEN PROC AddTopMatch("ROMMODULES")
-    IF LEFT$("UNPLUG", LEN(VERB$)) = VERB$ THEN PROC AddTopMatch("UNPLUG")
-    IF CLI_MATCH_COUNT% = 1 THEN CLI_COMMAND$ = CLI_MATCHED_COMMAND$
-    IF CLI_MATCH_COUNT% > 1 THEN CLI_AMBIGUOUS% = 1
+DEF PROC FindCommandDescriptor THROWS CliError
+    COMMAND_FOUND% = 0
+    ROUTE_CURSOR% = 0
+    PROC AcquireRouteScratch
+    REPEAT
+        PRIMITIVE Host.CommandRegistry.ReadEntry, ROUTE_CURSOR%, ROUTE_SCRATCH_BASE + &800, 1024 TO ROUTE_NEXT%, ROUTE_FOUND%
+        IF ROUTE_FOUND% THEN
+            PROC ReadString(ROUTE_SCRATCH_BASE + &800)
+            REGISTRY_ROW$ = TEXT$
+            PROC ParseCommandDescriptorRow
+            TEXTIN$ = ENTRY_NAME$
+            PROC MakeUppercase
+            ENTRY_NAME_UPPER$ = TEXTOUT$
+            MATCH% = 0
+            IF ABBREVIATED% = 0 AND VERB$ = ENTRY_NAME_UPPER$ THEN MATCH% = 1
+            IF ABBREVIATED% <> 0 AND LEN(VERB$) <= LEN(ENTRY_NAME_UPPER$) THEN
+                IF LEFT$(ENTRY_NAME_UPPER$, LEN(VERB$)) = VERB$ THEN MATCH% = 1
+            ENDIF
+            IF MATCH% AND COMMAND_FOUND% = 0 THEN
+                COMMAND_NAME$ = ENTRY_NAME$
+                COMMAND_OWNER$ = ENTRY_OWNER$
+                COMMAND_VERSION$ = ENTRY_VERSION$
+                COMMAND_KIND$ = ENTRY_KIND$
+                COMMAND_HANDLER$ = ENTRY_HANDLER$
+                COMMAND_CATEGORY$ = ENTRY_CATEGORY$
+                COMMAND_SYNTAX$ = ENTRY_SYNTAX$
+                COMMAND_DESCRIPTION$ = ENTRY_DESCRIPTION$
+                COMMAND_FOUND% = 1
+            ENDIF
+            ROUTE_CURSOR% = ROUTE_NEXT%
+        ENDIF
+    UNTIL ROUTE_FOUND% = 0 OR COMMAND_FOUND% <> 0
+    PROC ReleaseRouteScratch
 ENDPROC
 
-DEF PROC AddTopMatch(full$ AS STRING)
-    IF LEN(VERB$) <= LEN(full$) AND LEFT$(full$, LEN(VERB$)) = VERB$ THEN
-        CLI_MATCH_COUNT% = CLI_MATCH_COUNT% + 1
-        CLI_MATCHED_COMMAND$ = full$
+DEF PROC ParseCommandDescriptorRow THROWS CliError
+    PROC PopRegistryField: ENTRY_NAME$ = REGISTRY_FIELD$
+    PROC PopRegistryField: ENTRY_OWNER$ = REGISTRY_FIELD$
+    PROC PopRegistryField: ENTRY_VERSION$ = REGISTRY_FIELD$
+    PROC PopRegistryField: ENTRY_KIND$ = REGISTRY_FIELD$
+    PROC PopRegistryField: ENTRY_HANDLER$ = REGISTRY_FIELD$
+    PROC PopRegistryField: ENTRY_CATEGORY$ = REGISTRY_FIELD$
+    PROC PopRegistryField: ENTRY_SYNTAX$ = REGISTRY_FIELD$
+    ENTRY_DESCRIPTION$ = REGISTRY_ROW$
+ENDPROC
+
+DEF PROC PopRegistryField THROWS CliError
+    PIPE% = INSTR(REGISTRY_ROW$, "|")
+    IF PIPE% = 0 THEN PROC RaiseCliError("malformed active command registry row")
+    REGISTRY_FIELD$ = LEFT$(REGISTRY_ROW$, PIPE% - 1)
+    REGISTRY_ROW$ = MID$(REGISTRY_ROW$, PIPE% + 1)
+ENDPROC
+
+DEF PROC AcquireRouteScratch
+    PRIMITIVE Host.Memory.AcquireCommandScratch TO ROUTE_SCRATCH_ID%, ROUTE_SCRATCH_BASE
+ENDPROC
+
+DEF PROC ReleaseRouteScratch
+    IF ROUTE_SCRATCH_ID% <> 0 THEN PRIMITIVE Host.Memory.ReleaseCommandScratch, ROUTE_SCRATCH_ID%
+    ROUTE_SCRATCH_ID% = 0
+ENDPROC
+
+DEF PROC InvokeCommandDescriptor THROWS CliError
+    INVOKE_ARGUMENTS$ = ARGS$
+    IF COMMAND_NAME$ = "SET" THEN
+        PROC ExtractRawCommandArguments
+        INVOKE_ARGUMENTS$ = RAW_ARGUMENTS$
     ENDIF
+    IF COMMAND_NAME$ = "OBEY" THEN
+        PROC ExtractRawCommandArguments
+        INVOKE_ARGUMENTS$ = RAW_ARGUMENTS$
+    ENDIF
+    IF COMMAND_NAME$ = "EXEC" THEN
+        PROC ExtractRawCommandArguments
+        INVOKE_ARGUMENTS$ = RAW_ARGUMENTS$
+    ENDIF
+    PRIMITIVE Host.Memory.AcquireCommandScratch TO INVOKE_SCRATCH_ID%, INVOKE_SCRATCH_BASE
+    PROC WriteString(INVOKE_SCRATCH_BASE, COMMAND_NAME$)
+    PROC WriteString(INVOKE_SCRATCH_BASE + &40, COMMAND_OWNER$)
+    PROC WriteString(INVOKE_SCRATCH_BASE + &80, COMMAND_KIND$)
+    PROC WriteString(INVOKE_SCRATCH_BASE + &A0, COMMAND_HANDLER$)
+    PROC WriteString(INVOKE_SCRATCH_BASE + &100, INVOKE_ARGUMENTS$)
+    PRIMITIVE Host.CommandRegistry.Invoke, INVOKE_SCRATCH_BASE, INVOKE_SCRATCH_BASE + &40, INVOKE_SCRATCH_BASE + &80, INVOKE_SCRATCH_BASE + &A0, INVOKE_SCRATCH_BASE + &100
+    PRIMITIVE Host.Memory.ReleaseCommandScratch, INVOKE_SCRATCH_ID%
+    INVOKE_SCRATCH_ID% = 0
+ENDPROC
+
+DEF PROC ExtractRawCommandArguments
+    RAW_ARGUMENTS$ = RAWCLI_FULL$
+    RAW_PREFIX_ACTIVE% = 1
+    REPEAT
+        RAW_PREFIX_ACTIVE% = 0
+        IF LEFT$(RAW_ARGUMENTS$, 1) = "*" THEN RAW_ARGUMENTS$ = MID$(RAW_ARGUMENTS$, 2): RAW_PREFIX_ACTIVE% = 1
+        IF LEFT$(RAW_ARGUMENTS$, 1) = " " OR LEFT$(RAW_ARGUMENTS$, 1) = CHR$(9) THEN RAW_ARGUMENTS$ = MID$(RAW_ARGUMENTS$, 2): RAW_PREFIX_ACTIVE% = 1
+    UNTIL RAW_PREFIX_ACTIVE% = 0
+    IF LEFT$(RAW_ARGUMENTS$, 1) = "%" THEN RAW_ARGUMENTS$ = MID$(RAW_ARGUMENTS$, 2)
+    RAW_ARGUMENT_SPACE% = INSTR(RAW_ARGUMENTS$, " ")
+    RAW_ARGUMENT_TAB% = INSTR(RAW_ARGUMENTS$, CHR$(9))
+    IF RAW_ARGUMENT_SPACE% = 0 OR (RAW_ARGUMENT_TAB% > 0 AND RAW_ARGUMENT_TAB% < RAW_ARGUMENT_SPACE%) THEN RAW_ARGUMENT_SPACE% = RAW_ARGUMENT_TAB%
+    IF RAW_ARGUMENT_SPACE% = 0 THEN RAW_ARGUMENTS$ = "": ENDPROC
+    RAW_ARGUMENTS$ = MID$(RAW_ARGUMENTS$, RAW_ARGUMENT_SPACE% + 1)
+ENDPROC
+
+DEF PROC ConfigureEntrypoint(arguments$ AS STRING) THROWS CliError
+    ARGS$ = arguments$
+    PROC ConfigureCommand
+ENDPROC
+
+DEF PROC StatusEntrypoint(arguments$ AS STRING) THROWS CliError
+    ARGS$ = arguments$
+    PROC StatusCommand
+ENDPROC
+
+DEF PROC InspectEntrypoint(arguments$ AS STRING) THROWS CliError
+    ARGS$ = arguments$
+    TEXTIN$ = ARGS$
+    PROC MakeUppercase
+    ARGS_UPPER$ = TEXTOUT$
+    PROC AcquireCommandScratch
+    PROC HandleInspect
+    PROC ReleaseCommandScratch
+ENDPROC
+
+DEF PROC ModulesEntrypoint(arguments$ AS STRING) THROWS CliError
+    IF arguments$ <> "" THEN PRINT "Syntax: *Modules": ENDPROC
+    SUBARGS$ = ""
+    PROC AcquireCommandScratch
+    PROC ListModules
+    PROC ReleaseCommandScratch
+ENDPROC
+
+DEF PROC ObeyEntrypoint(arguments$ AS STRING) THROWS CliError
+    OBEY_PATH$ = arguments$
+    PROC ParseObeyPath
+    PRIMITIVE Host.Memory.AcquireCommandScratch TO OBEY_SCRATCH_ID%, OBEY_SCRATCH_BASE
+    PROC WriteString(OBEY_SCRATCH_BASE, OBEY_PATH$)
+    PROC WriteString(OBEY_SCRATCH_BASE + 256, OBEY_ARGS$)
+    PRIMITIVE Host.CommandScripts.Open, OBEY_SCRATCH_BASE, OBEY_SCRATCH_BASE + 256 TO OBEY_HANDLE%
+    PRIMITIVE Host.Memory.ReleaseCommandScratch, OBEY_SCRATCH_ID%
+    OBEY_HANDLE% = 0
+    REPEAT
+        PRIMITIVE Host.CommandScripts.ReadLine, OBEY_HANDLE% TO OBEY_LINE_LENGTH%, OBEY_LINE_NUMBER%, OBEY_STATE%, OBEY_LINE_BUFFER%, OBEY_ARGUMENT_BUFFER%
+        IF OBEY_STATE% = 0 OR OBEY_STATE% = 2 THEN
+            PRIMITIVE Host.CommandScripts.Close, OBEY_HANDLE%
+            ENDPROC
+        ENDIF
+        IF OBEY_STATE% = 1 THEN
+            PROC ReadString(OBEY_LINE_BUFFER%)
+            OBEY_LINE$ = TEXT$
+            PROC ReadString(OBEY_ARGUMENT_BUFFER%)
+            OBEY_ARGS$ = TEXT$
+            PROC ExpandObeyLine(OBEY_LINE$, OBEY_ARGS$)
+            OBEY_EXPANDED$ = OBEY_RESULT$
+            RAWCLI$ = OBEY_EXPANDED$
+            PROC DispatchCliText
+            OBEY_STATE% = 1
+        ENDIF
+    UNTIL 0
+ENDPROC
+
+DEF PROC ExecEntrypoint(arguments$ AS STRING) THROWS CliError
+    EXEC_TAIL$ = arguments$
+    PROC ParseExecPath
+    PRIMITIVE Host.Memory.AcquireCommandScratch TO EXEC_SCRATCH_ID%, EXEC_SCRATCH_BASE
+    PROC WriteString(EXEC_SCRATCH_BASE, EXEC_PATH$)
+    PRIMITIVE Host.ExecInput.Replace, EXEC_SCRATCH_BASE
+    PRIMITIVE Host.Memory.ReleaseCommandScratch, EXEC_SCRATCH_ID%
+    EXEC_SCRATCH_ID% = 0
+ENDPROC
+
+DEF PROC ParseExecPath THROWS CliError
+    EXEC_PATH$ = ""
+    EXEC_START% = 1
+    REPEAT
+        EXEC_SPACE% = ASC(MID$(EXEC_TAIL$, EXEC_START%, 1))
+        IF EXEC_SPACE% = 32 OR EXEC_SPACE% = 9 THEN EXEC_START% = EXEC_START% + 1
+    UNTIL (EXEC_SPACE% <> 32 AND EXEC_SPACE% <> 9) OR EXEC_START% > LEN(EXEC_TAIL$)
+    EXEC_TAIL$ = MID$(EXEC_TAIL$, EXEC_START%)
+    IF EXEC_TAIL$ = "" THEN ENDPROC
+    EXEC_QUOTED% = 0
+    IF LEFT$(EXEC_TAIL$, 1) = """" THEN EXEC_QUOTED% = 1
+    IF EXEC_QUOTED% THEN
+        EXEC_END% = INSTR(MID$(EXEC_TAIL$, 2), """")
+        IF EXEC_END% = 0 THEN PROC RaiseCliError("Exec pathname has unmatched quotes")
+        EXEC_PATH$ = MID$(EXEC_TAIL$, 2, EXEC_END% - 1)
+        EXEC_REMAINDER$ = MID$(EXEC_TAIL$, EXEC_END% + 2)
+        FOR EXEC_POS% = 1 TO LEN(EXEC_REMAINDER$)
+            EXEC_BYTE% = ASC(MID$(EXEC_REMAINDER$, EXEC_POS%, 1))
+            IF EXEC_BYTE% <> 32 AND EXEC_BYTE% <> 9 THEN PROC RaiseCliError("Exec accepts one guest pathname only")
+        NEXT
+    ENDIF
+    IF EXEC_QUOTED% = 0 THEN
+        EXEC_END% = INSTR(EXEC_TAIL$, " ")
+        EXEC_TAB% = INSTR(EXEC_TAIL$, CHR$(9))
+        IF EXEC_END% = 0 OR (EXEC_TAB% > 0 AND EXEC_TAB% < EXEC_END%) THEN EXEC_END% = EXEC_TAB%
+        IF EXEC_END% = 0 THEN EXEC_PATH$ = EXEC_TAIL$
+        IF EXEC_END% > 0 THEN PROC RaiseCliError("Exec accepts one guest pathname only")
+    ENDIF
+    IF EXEC_PATH$ = "" THEN PROC RaiseCliError("Exec pathname is empty")
+    IF INSTR(EXEC_PATH$, "<") > 0 OR INSTR(EXEC_PATH$, ">") > 0 OR INSTR(EXEC_PATH$, "%") > 0 THEN
+        PROC RaiseCliError("Exec pathname substitution is unsupported")
+    ENDIF
+ENDPROC
+
+DEF PROC ParseObeyPath THROWS CliError
+    OBEY_TAIL$ = OBEY_PATH$
+    OBEY_PATH$ = ""
+    OBEY_ARGS$ = ""
+    OBEY_SKIP% = 1
+    REPEAT
+        IF LEN(OBEY_TAIL$) = 0 THEN OBEY_SKIP% = 0
+        IF OBEY_SKIP% AND LEFT$(OBEY_TAIL$, 1) <> " " AND LEFT$(OBEY_TAIL$, 1) <> CHR$(9) THEN OBEY_SKIP% = 0
+        IF OBEY_SKIP% THEN OBEY_TAIL$ = MID$(OBEY_TAIL$, 2)
+    UNTIL OBEY_SKIP% = 0
+    IF LEN(OBEY_TAIL$) = 0 THEN PROC RaiseCliError("Syntax: OBEY <guest pathname> [parameters]")
+    IF LEFT$(OBEY_TAIL$, 3) = "-v " OR LEFT$(OBEY_TAIL$, 3) = "-V " OR LEFT$(OBEY_TAIL$, 3) = "-c " OR LEFT$(OBEY_TAIL$, 3) = "-C " THEN
+        PROC RaiseCliError("Obey options -v and -c are not in the hosted subset")
+    ENDIF
+    OBEY_QUOTED% = 0
+    IF LEFT$(OBEY_TAIL$, 1) = """" THEN
+        OBEY_QUOTED% = 1
+        OBEY_END% = INSTR(MID$(OBEY_TAIL$, 2), """")
+        IF OBEY_END% = 0 THEN
+            PROC RaiseCliError("Obey pathname has unmatched quotes")
+        ENDIF
+        OBEY_PATH$ = MID$(OBEY_TAIL$, 2, OBEY_END% - 1)
+        OBEY_TAIL$ = MID$(OBEY_TAIL$, OBEY_END% + 2)
+        IF LEN(OBEY_TAIL$) > 0 AND LEFT$(OBEY_TAIL$, 1) <> " " THEN
+            PROC RaiseCliError("Obey pathname must be followed by a space")
+        ENDIF
+    ENDIF
+    IF OBEY_QUOTED% = 0 THEN
+        OBEY_END% = INSTR(OBEY_TAIL$, " ")
+        OBEY_TAB% = INSTR(OBEY_TAIL$, CHR$(9))
+        IF OBEY_END% = 0 OR (OBEY_TAB% > 0 AND OBEY_TAB% < OBEY_END%) THEN OBEY_END% = OBEY_TAB%
+        IF OBEY_END% = 0 THEN
+            OBEY_PATH$ = OBEY_TAIL$
+            OBEY_TAIL$ = ""
+        ENDIF
+        IF OBEY_END% > 0 THEN
+            OBEY_PATH$ = LEFT$(OBEY_TAIL$, OBEY_END% - 1)
+            OBEY_TAIL$ = MID$(OBEY_TAIL$, OBEY_END% + 1)
+        ENDIF
+    ENDIF
+    IF LEN(OBEY_TAIL$) > 0 THEN
+        IF LEFT$(OBEY_TAIL$, 1) = " " THEN OBEY_TAIL$ = MID$(OBEY_TAIL$, 2)
+        OBEY_ARGS$ = OBEY_TAIL$
+    ENDIF
+    IF INSTR(OBEY_PATH$, "<") > 0 OR INSTR(OBEY_PATH$, ">") > 0 OR INSTR(OBEY_PATH$, "%") > 0 THEN
+        PROC RaiseCliError("Obey pathname variable substitution is unsupported")
+    ENDIF
+    IF LEN(OBEY_PATH$) = 0 THEN PROC RaiseCliError("Obey pathname is empty")
+    PROC ValidateObeyArguments(OBEY_ARGS$)
+ENDPROC
+
+DEF PROC ValidateObeyArguments(arguments$ AS STRING) THROWS CliError
+    ARG_QUOTED% = 0
+    FOR ARG_SCAN% = 1 TO LEN(arguments$)
+        ARG_CHAR$ = MID$(arguments$, ARG_SCAN%, 1)
+        IF ARG_CHAR$ = """" THEN ARG_QUOTED% = 1 - ARG_QUOTED%
+    NEXT
+    IF ARG_QUOTED% <> 0 THEN PROC RaiseCliError("Obey argument list has unmatched quotes")
+ENDPROC
+
+DEF PROC ExpandObeyLine(template$ AS STRING, arguments$ AS STRING) THROWS CliError
+    OBEY_RESULT$ = ""
+    EXPAND_SCAN% = 1
+    REPEAT
+        EXPAND_CODE% = ASC(MID$(template$, EXPAND_SCAN%, 1))
+        EXPAND_HANDLED% = 0
+        IF EXPAND_CODE% = 37 THEN
+            IF EXPAND_SCAN% = LEN(template$) THEN
+                OBEY_RESULT$ = OBEY_RESULT$ + "%"
+                EXPAND_SCAN% = EXPAND_SCAN% + 1
+                EXPAND_HANDLED% = 1
+            ENDIF
+            IF EXPAND_SCAN% <= LEN(template$) AND EXPAND_HANDLED% = 0 THEN
+                EXPAND_CODE% = ASC(MID$(template$, EXPAND_SCAN% + 1, 1))
+                IF EXPAND_CODE% >= 48 AND EXPAND_CODE% <= 57 THEN
+                    EXPAND_INDEX% = EXPAND_CODE% - 48
+                    PROC FindObeyArgument(arguments$, EXPAND_INDEX%)
+                    OBEY_RESULT$ = OBEY_RESULT$ + OBEY_ARGUMENT$
+                    EXPAND_SCAN% = EXPAND_SCAN% + 2
+                    EXPAND_HANDLED% = 1
+                ENDIF
+                IF EXPAND_CODE% = 37 THEN
+                    OBEY_RESULT$ = OBEY_RESULT$ + "%"
+                    EXPAND_SCAN% = EXPAND_SCAN% + 2
+                    EXPAND_HANDLED% = 1
+                ENDIF
+                IF EXPAND_CODE% = 42 THEN
+                    IF EXPAND_SCAN% + 2 > LEN(template$) THEN PROC RaiseCliError("Obey parameter substitution %* requires a digit")
+                    EXPAND_CODE% = ASC(MID$(template$, EXPAND_SCAN% + 2, 1))
+                    IF EXPAND_CODE% < 48 OR EXPAND_CODE% > 57 THEN PROC RaiseCliError("Obey parameter substitution %* requires a digit")
+                    EXPAND_INDEX% = EXPAND_CODE% - 48
+                    PROC FindObeyArgumentTail(arguments$, EXPAND_INDEX%)
+                    OBEY_RESULT$ = OBEY_RESULT$ + OBEY_ARGUMENT$
+                    EXPAND_SCAN% = EXPAND_SCAN% + 3
+                    EXPAND_HANDLED% = 1
+                ENDIF
+                IF EXPAND_HANDLED% = 0 THEN
+                    OBEY_RESULT$ = OBEY_RESULT$ + "%" + MID$(template$, EXPAND_SCAN% + 1, 1)
+                    EXPAND_SCAN% = EXPAND_SCAN% + 2
+                ENDIF
+            ENDIF
+            EXPAND_HANDLED% = 1
+        ENDIF
+        IF EXPAND_HANDLED% = 0 THEN
+            OBEY_RESULT$ = OBEY_RESULT$ + MID$(template$, EXPAND_SCAN%, 1)
+            EXPAND_SCAN% = EXPAND_SCAN% + 1
+        ENDIF
+        IF LEN(OBEY_RESULT$) > 255 THEN PROC RaiseCliError("Expanded Obey command exceeds the 255-byte CLI limit")
+    UNTIL EXPAND_SCAN% > LEN(template$)
+ENDPROC
+
+DEF PROC FindObeyArgument(arguments$ AS STRING, wanted%)
+    PROC FindObeyArgumentTail(arguments$, wanted%)
+    ARG_SCAN% = 1
+    ARG_QUOTED% = 0
+    ARG_DONE% = 0
+    IF OBEY_ARGUMENT$ <> "" THEN
+        REPEAT
+            IF ARG_SCAN% > LEN(OBEY_ARGUMENT$) THEN ARG_DONE% = 1
+            IF ARG_DONE% = 0 THEN
+                ARG_CHAR$ = MID$(OBEY_ARGUMENT$, ARG_SCAN%, 1)
+                IF ARG_CHAR$ = """" THEN ARG_QUOTED% = 1 - ARG_QUOTED%
+                IF ARG_CHAR$ = " " AND ARG_QUOTED% = 0 THEN ARG_DONE% = 1
+                IF ARG_DONE% = 0 THEN ARG_SCAN% = ARG_SCAN% + 1
+            ENDIF
+        UNTIL ARG_DONE% <> 0
+        IF ARG_DONE% THEN OBEY_ARGUMENT$ = LEFT$(OBEY_ARGUMENT$, ARG_SCAN% - 1)
+    ENDIF
+ENDPROC
+
+DEF PROC FindObeyArgumentTail(arguments$ AS STRING, wanted%)
+    OBEY_ARGUMENT$ = ""
+    OBEYARG_SCAN% = 1
+    OBEYARG_INDEX% = 0
+    OBEYARG_ACTIVE% = 1
+    REPEAT
+        OBEYARG_SKIP% = 1
+        REPEAT
+            IF OBEYARG_SCAN% > LEN(arguments$) THEN OBEYARG_SKIP% = 0
+            IF OBEYARG_SKIP% AND MID$(arguments$, OBEYARG_SCAN%, 1) <> " " THEN OBEYARG_SKIP% = 0
+            IF OBEYARG_SKIP% THEN OBEYARG_SCAN% = OBEYARG_SCAN% + 1
+        UNTIL OBEYARG_SKIP% = 0
+        IF OBEYARG_SCAN% > LEN(arguments$) THEN
+            OBEYARG_ACTIVE% = 0
+        ENDIF
+        IF OBEYARG_SCAN% <= LEN(arguments$) THEN
+            OBEYARG_INDEX% = OBEYARG_INDEX% + 1
+            OBEYARG_START% = OBEYARG_SCAN%
+            OBEYARG_QUOTED% = 0
+            OBEYARG_DONE% = 0
+            REPEAT
+                IF OBEYARG_SCAN% > LEN(arguments$) THEN OBEYARG_DONE% = 1
+                IF OBEYARG_DONE% = 0 THEN
+                    OBEYARG_CHAR$ = MID$(arguments$, OBEYARG_SCAN%, 1)
+                    IF OBEYARG_CHAR$ = """" THEN OBEYARG_QUOTED% = 1 - OBEYARG_QUOTED%
+                    IF OBEYARG_CHAR$ = " " AND OBEYARG_QUOTED% = 0 THEN OBEYARG_DONE% = 1
+                    IF OBEYARG_DONE% = 0 THEN OBEYARG_SCAN% = OBEYARG_SCAN% + 1
+                ENDIF
+            UNTIL OBEYARG_DONE% <> 0
+            IF OBEYARG_INDEX% = wanted% + 1 THEN
+                OBEY_ARGUMENT$ = MID$(arguments$, OBEYARG_START%)
+                OBEYARG_ACTIVE% = 0
+            ENDIF
+            IF OBEYARG_DONE% THEN OBEYARG_SCAN% = OBEYARG_SCAN% + 1
+        ENDIF
+    UNTIL OBEYARG_ACTIVE% = 0
+ENDPROC
+
+DEF PROC SetVariableEntrypoint(arguments$ AS STRING) THROWS CliError
+    PARSE_TEXT$ = arguments$
+    PROC NextArgument
+    VARIABLE_NAME$ = ARGWORD$
+    IF VARIABLE_NAME$ = "" THEN
+        PRINT "Syntax: *Set <name> [value]"
+        ENDPROC
+    ENDIF
+    VARIABLE_VALUE$ = PARSE_TEXT$
+    PROC TrimVariableValueLeading
+    IF LEN(VARIABLE_NAME$) > 32 THEN
+        PRINT "SET error: variable name or pattern must be 1..32 visible ASCII characters."
+        ENDPROC
+    ENDIF
+    IF LEN(VARIABLE_VALUE$) > 256 THEN
+        PRINT "SET error: value exceeds 256 UTF-8 bytes."
+        ENDPROC
+    ENDIF
+    PROC AcquireVariableCommandScratch
+    VARIABLE_NAME_ADDRESS = VARIABLE_SCRATCH_BASE
+    VARIABLE_VALUE_ADDRESS = VARIABLE_SCRATCH_BASE + &100
+    PROC WriteString(VARIABLE_NAME_ADDRESS, VARIABLE_NAME$)
+    PROC WriteString(VARIABLE_VALUE_ADDRESS, VARIABLE_VALUE$)
+    SYS "OS_SetVarVal", VARIABLE_NAME_ADDRESS, VARIABLE_VALUE_ADDRESS, LEN(VARIABLE_VALUE$), 0, 0
+    PRINT VARIABLE_NAME$; " set."
+    PROC ReleaseVariableCommandScratch
+ENDPROC
+
+DEF PROC UnsetVariableEntrypoint(arguments$ AS STRING) THROWS CliError
+    PARSE_TEXT$ = arguments$
+    PROC NextArgument
+    VARIABLE_PATTERN$ = ARGWORD$
+    PROC NextArgument
+    IF VARIABLE_PATTERN$ = "" OR ARGWORD$ <> "" THEN
+        PRINT "Syntax: *Unset <pattern>"
+        ENDPROC
+    ENDIF
+    IF LEN(VARIABLE_PATTERN$) > 32 THEN
+        PRINT "UNSET error: pattern exceeds 32 visible ASCII characters."
+        ENDPROC
+    ENDIF
+    PROC AcquireVariableCommandScratch
+    VARIABLE_NAME_ADDRESS = VARIABLE_SCRATCH_BASE
+    VARIABLE_VALUE_ADDRESS = VARIABLE_SCRATCH_BASE + &100
+    PROC WriteString(VARIABLE_NAME_ADDRESS, VARIABLE_PATTERN$)
+    SYS "OS_SetVarVal", VARIABLE_NAME_ADDRESS, VARIABLE_VALUE_ADDRESS, -1, 0, 0
+    PRINT "UNSET: matching variables removed."
+    PROC ReleaseVariableCommandScratch
+ENDPROC
+
+DEF PROC ShowVariablesEntrypoint(arguments$ AS STRING) THROWS CliError
+    PARSE_TEXT$ = arguments$
+    PROC NextArgument
+    SHOW_REQUEST$ = ARGWORD$
+    PROC NextArgument
+    IF ARGWORD$ <> "" THEN
+        PRINT "Syntax: *Show [pattern]"
+        ENDPROC
+    ENDIF
+    IF SHOW_REQUEST$ <> "" AND LEN(SHOW_REQUEST$) > 32 THEN
+        PRINT "SHOW error: pattern exceeds 32 visible ASCII characters."
+        ENDPROC
+    ENDIF
+    SHOW_FILTER_EXACT% = 0
+    IF SHOW_REQUEST$ <> "" AND INSTR(SHOW_REQUEST$, "*") = 0 AND INSTR(SHOW_REQUEST$, "#") = 0 THEN SHOW_FILTER_EXACT% = 1
+    SHOW_PATTERN$ = SHOW_REQUEST$
+    IF SHOW_PATTERN$ = "" OR SHOW_FILTER_EXACT% THEN SHOW_PATTERN$ = "*"
+    TEXTIN$ = SHOW_REQUEST$
+    PROC MakeUppercase
+    SHOW_EXACT_KEY$ = TEXTOUT$
+    PROC AcquireVariableCommandScratch
+    VARIABLE_NAME_ADDRESS = VARIABLE_SCRATCH_BASE
+    VARIABLE_VALUE_ADDRESS = VARIABLE_SCRATCH_BASE + &100
+    PROC WriteString(VARIABLE_NAME_ADDRESS, SHOW_PATTERN$)
+    SHOW_CONTEXT% = 0
+    SHOW_MATCHES% = 0
+    SHOW_DONE% = 0
+    REPEAT
+        SYS "XOS_ReadVarVal", VARIABLE_NAME_ADDRESS, VARIABLE_VALUE_ADDRESS, 256, SHOW_CONTEXT%, 0 TO SHOW_ERROR_ADDRESS%, SHOW_VALUE_ADDRESS%, SHOW_LENGTH%, SHOW_CONTEXT%, SHOW_TYPE% ; SHOW_FLAGS%
+        IF (SHOW_FLAGS% AND 1) <> 0 THEN
+            ERROR_CODE% = !SHOW_ERROR_ADDRESS%
+            IF ERROR_CODE% = 2 THEN SHOW_DONE% = 1
+            IF ERROR_CODE% <> 2 THEN SYS "OS_GenerateError", SHOW_ERROR_ADDRESS%
+        ENDIF
+        IF SHOW_DONE% = 0 THEN
+            IF SHOW_CONTEXT% = 0 THEN SHOW_DONE% = 1
+            IF SHOW_CONTEXT% <> 0 THEN
+                PROC ReadVariableContextName(SHOW_CONTEXT%)
+                SHOW_NAME$ = TEXT$
+                SHOW_INCLUDE% = 1
+                IF SHOW_FILTER_EXACT% THEN
+                    TEXTIN$ = SHOW_NAME$
+                    PROC MakeUppercase
+                    IF TEXTOUT$ <> SHOW_EXACT_KEY$ THEN SHOW_INCLUDE% = 0
+                ENDIF
+                IF SHOW_INCLUDE% THEN
+                    SHOW_MATCHES% = SHOW_MATCHES% + 1
+                    IF SHOW_TYPE% = 0 THEN PRINT SHOW_NAME$; " (String): ";
+                    IF SHOW_TYPE% = 4 THEN PRINT SHOW_NAME$; " (LiteralString): ";
+                    ?(VARIABLE_VALUE_ADDRESS + SHOW_LENGTH%) = 0
+                    SYS "OS_Write0", VARIABLE_VALUE_ADDRESS
+                    SYS "OS_NewLine"
+                    IF SHOW_FILTER_EXACT% THEN SHOW_DONE% = 1
+                ENDIF
+                IF SHOW_CONTEXT% = 0 THEN SHOW_DONE% = 1
+            ENDIF
+        ENDIF
+    UNTIL SHOW_DONE% <> 0
+    IF SHOW_MATCHES% = 0 THEN PRINT "No system variables match '"; SHOW_REQUEST$; "'."
+    PROC ReleaseVariableCommandScratch
+ENDPROC
+
+DEF PROC ReadVariableContextName(context AS UINT32)
+    TEXT$ = ""
+    ENUM_POINTER% = context
+    ENUM_DONE% = 0
+    ENUM_COUNT% = 0
+    REPEAT
+        BYTE% = ?ENUM_POINTER%
+        IF BYTE% = 0 THEN ENUM_DONE% = 1
+        IF BYTE% <> 0 AND ENUM_COUNT% < 33 THEN
+            TEXT$ = TEXT$ + CHR$(BYTE%)
+            ENUM_POINTER% = ENUM_POINTER% + 1
+            ENUM_COUNT% = ENUM_COUNT% + 1
+        ENDIF
+        IF ENUM_COUNT% >= 33 THEN ENUM_DONE% = 1
+    UNTIL ENUM_DONE% <> 0
+ENDPROC
+
+DEF PROC AcquireVariableCommandScratch
+    PRIMITIVE Host.Memory.AcquireCommandScratch TO VARIABLE_SCRATCH_ID%, VARIABLE_SCRATCH_BASE
+ENDPROC
+
+DEF PROC ReleaseVariableCommandScratch
+    IF VARIABLE_SCRATCH_ID% <> 0 THEN PRIMITIVE Host.Memory.ReleaseCommandScratch, VARIABLE_SCRATCH_ID%
+    VARIABLE_SCRATCH_ID% = 0
+ENDPROC
+
+DEF PROC TrimVariableValueLeading
+    VARIABLE_VALUE_START% = 1
+    VARIABLE_VALUE_SKIP% = 1
+    REPEAT
+        IF VARIABLE_VALUE_START% <= LEN(VARIABLE_VALUE$) THEN
+            VARIABLE_VALUE_BYTE% = ASC(MID$(VARIABLE_VALUE$, VARIABLE_VALUE_START%, 1))
+            IF VARIABLE_VALUE_SKIP% AND (VARIABLE_VALUE_BYTE% = 32 OR VARIABLE_VALUE_BYTE% = 9) THEN VARIABLE_VALUE_START% = VARIABLE_VALUE_START% + 1
+            IF VARIABLE_VALUE_SKIP% AND VARIABLE_VALUE_BYTE% <> 32 AND VARIABLE_VALUE_BYTE% <> 9 THEN VARIABLE_VALUE_SKIP% = 0
+        ENDIF
+    UNTIL VARIABLE_VALUE_SKIP% = 0 OR VARIABLE_VALUE_START% > LEN(VARIABLE_VALUE$)
+    VARIABLE_VALUE$ = MID$(VARIABLE_VALUE$, VARIABLE_VALUE_START%)
+ENDPROC
+
+DEF PROC RMLoadEntrypoint(arguments$ AS STRING) THROWS CliError
+    ARGS$ = arguments$: CLI_COMMAND$ = "RMLOAD": PROC OperateRMLoad
+ENDPROC
+
+DEF PROC RMRunEntrypoint(arguments$ AS STRING) THROWS CliError
+    ARGS$ = arguments$: CLI_COMMAND$ = "RMRUN": PROC OperateRMLoad
+ENDPROC
+
+DEF PROC RMKillEntrypoint(arguments$ AS STRING) THROWS CliError
+    ARGS$ = arguments$: PROC OperateRMKill
+ENDPROC
+
+DEF PROC RMEnsureEntrypoint(arguments$ AS STRING) THROWS CliError
+    ARGS$ = arguments$: PROC OperateRMEnsure
+ENDPROC
+
+DEF PROC UnsupportedModuleEntrypoint(command_name$ AS STRING, arguments$ AS STRING)
+    PRINT "Unsupported *"; command_name$; ": the hosted module manager has no native ROM/RMA implementation; no state changed."
+ENDPROC
+
+DEF PROC CommandHelp(arguments$ AS STRING) THROWS CliError
+    HELP_QUERY$ = arguments$
+    PROC TrimHelpQuery
+    TEXTIN$ = HELP_QUERY$
+    PROC MakeUppercase
+    HELP_QUERY_UPPER$ = TEXTOUT$
+    HELP_MODE% = 0
+    HELP_MATCHES% = 0
+    IF HELP_QUERY_UPPER$ = "ALIASES" THEN
+        PRINT "Aliases use the guest string variables Alias$<command> (String or LiteralString)."
+        PRINT "A leading % bypasses alias lookup once; aliases may substitute %0-%9, %*n, and %%."
+        PRINT "Aliases resolve before registered commands, including final-dot abbreviations."
+        PRINT "Alias targets are single commands; chains are limited to eight expansions."
+        PRINT "Use *Show Alias$* to inspect aliases. Macro variables and command chaining are unsupported."
+        ENDPROC
+    ENDIF
+    IF HELP_QUERY$ = "" THEN
+        PRINT "Commands (use *Help <command>, *Help <module>, or *Help Syntax):"
+    ENDIF
+    IF HELP_QUERY_UPPER$ = "COMMANDS" THEN
+        HELP_MODE% = 1
+        PRINT "Commands:"
+    ENDIF
+    IF HELP_QUERY_UPPER$ = "FILECOMMANDS" THEN
+        HELP_MODE% = 2
+        PRINT "File commands:"
+    ENDIF
+    IF HELP_QUERY_UPPER$ = "SYNTAX" THEN
+        HELP_MODE% = 3
+        PRINT "Command syntax (final-dot abbreviations select the first matching command):"
+        PRINT "  <value> is a required value to substitute; [value] is optional."
+        PRINT "  A vertical bar separates alternatives."
+    ENDIF
+    IF HELP_QUERY_UPPER$ = "MODULES" THEN
+        SUBARGS$ = ""
+        PROC AcquireCommandScratch
+        PROC ListModules
+        PROC ReleaseCommandScratch
+        ENDPROC
+    ENDIF
+    IF HELP_MODE% = 0 AND HELP_QUERY$ <> "" AND HELP_QUERY$ <> "." THEN
+        IF RIGHT$(HELP_QUERY$, 1) = "." THEN HELP_MODE% = 4
+        IF HELP_MODE% = 0 THEN
+            PROC FindHelpModule
+            IF HELP_MODULE_FOUND% THEN
+                HELP_MODE% = 5
+                PRINT HELP_MODULE_TITLE$; " "; STR$(HELP_MAJOR%); "."; STR$(HELP_MINOR%); "."; STR$(HELP_PATCH%)
+            ENDIF
+            IF HELP_MODULE_FOUND% = 0 THEN HELP_MODE% = 4
+        ENDIF
+    ENDIF
+    IF HELP_MODE% = 4 THEN
+        IF RIGHT$(HELP_QUERY_UPPER$, 1) = "." THEN HELP_QUERY_UPPER$ = LEFT$(HELP_QUERY_UPPER$, LEN(HELP_QUERY_UPPER$) - 1)
+        IF HELP_QUERY$ = "." THEN HELP_QUERY_UPPER$ = ""
+    ENDIF
+
+    HELP_CURSOR% = 0
+    PROC AcquireHelpScratch
+    REPEAT
+        PRIMITIVE Host.CommandRegistry.ReadEntry, HELP_CURSOR%, HELP_SCRATCH_BASE + &800, 1024 TO HELP_NEXT%, HELP_FOUND%
+        IF HELP_FOUND% THEN
+            PROC ReadString(HELP_SCRATCH_BASE + &800)
+            REGISTRY_ROW$ = TEXT$
+            PROC ParseCommandDescriptorRow
+            PROC MaybePrintHelpEntry
+            HELP_CURSOR% = HELP_NEXT%
+        ENDIF
+    UNTIL HELP_FOUND% = 0
+    PROC ReleaseHelpScratch
+    IF HELP_MATCHES% = 0 THEN PRINT "No help available for '"; HELP_QUERY$; "'."
+ENDPROC
+
+DEF PROC FindHelpModule THROWS CliError
+    HELP_MODULE_FOUND% = 0
+    IF HELP_QUERY$ = "" OR RIGHT$(HELP_QUERY$, 1) = "." THEN ENDPROC
+    PROC AcquireHelpScratch
+    PROC WriteString(HELP_SCRATCH_BASE + &200, HELP_QUERY$)
+    SYS "Ricochet_ModuleLookup", 1, HELP_SCRATCH_BASE + &200 TO HELP_ABI%, HELP_MODULE_FOUND%, HELP_MODULE_INDEX%, HELP_MAJOR%, HELP_MINOR%, HELP_PATCH%, HELP_MODULE_STATE%
+    IF HELP_MODULE_FOUND% THEN
+        SYS "Ricochet_ModuleInfo", 1, HELP_MODULE_INDEX% - 1, HELP_SCRATCH_BASE + &200, 128 TO HELP_ABI%, HELP_MODULE_AFTER%, HELP_NAMEPTR%, HELP_NAMECAP%, HELP_INFO_FOUND%, HELP_MAJOR%, HELP_MINOR%, HELP_PATCH%, HELP_MODULE_STATE%
+        IF HELP_INFO_FOUND% THEN
+            PROC ReadString(HELP_SCRATCH_BASE + &200)
+            HELP_MODULE_TITLE$ = TEXT$
+            TEXTIN$ = HELP_MODULE_TITLE$
+            PROC MakeUppercase
+            HELP_OWNER$ = TEXTOUT$
+        ENDIF
+    ENDIF
+    PROC ReleaseHelpScratch
+ENDPROC
+
+DEF PROC MaybePrintHelpEntry
+    SHOW_ENTRY% = 1
+    IF HELP_MODE% = 1 AND ENTRY_CATEGORY$ <> "Commands" THEN SHOW_ENTRY% = 0
+    IF HELP_MODE% = 2 AND ENTRY_CATEGORY$ <> "FileCommands" THEN SHOW_ENTRY% = 0
+    IF HELP_MODE% = 4 THEN
+        SHOW_ENTRY% = 0
+        TEXTIN$ = ENTRY_NAME$
+        PROC MakeUppercase
+        ENTRY_NAME_UPPER$ = TEXTOUT$
+        IF RIGHT$(HELP_QUERY$, 1) = "." THEN
+            IF HELP_QUERY_UPPER$ = "" OR LEFT$(ENTRY_NAME_UPPER$, LEN(HELP_QUERY_UPPER$)) = HELP_QUERY_UPPER$ THEN SHOW_ENTRY% = 1
+        ENDIF
+        IF RIGHT$(HELP_QUERY$, 1) <> "." AND ENTRY_NAME_UPPER$ = HELP_QUERY_UPPER$ THEN SHOW_ENTRY% = 1
+    ENDIF
+    IF HELP_MODE% = 5 THEN
+        TEXTIN$ = ENTRY_OWNER$
+        PROC MakeUppercase
+        IF TEXTOUT$ <> HELP_OWNER$ THEN SHOW_ENTRY% = 0
+    ENDIF
+    IF SHOW_ENTRY% THEN
+        HELP_MATCHES% = HELP_MATCHES% + 1
+        IF HELP_MODE% = 3 THEN
+            PRINT "  "; ENTRY_SYNTAX$; " - "; ENTRY_DESCRIPTION$
+        ENDIF
+        IF HELP_MODE% = 4 OR HELP_MODE% = 5 THEN
+            PRINT "  "; ENTRY_SYNTAX$; " - "; ENTRY_DESCRIPTION$
+        ENDIF
+        IF HELP_MODE% <> 3 AND HELP_MODE% <> 4 AND HELP_MODE% <> 5 THEN
+            PRINT "  *"; ENTRY_NAME$; " - "; ENTRY_DESCRIPTION$
+        ENDIF
+    ENDIF
+ENDPROC
+
+DEF PROC AcquireHelpScratch
+    PRIMITIVE Host.Memory.AcquireCommandScratch TO HELP_SCRATCH_ID%, HELP_SCRATCH_BASE
+ENDPROC
+
+DEF PROC ReleaseHelpScratch
+    IF HELP_SCRATCH_ID% <> 0 THEN PRIMITIVE Host.Memory.ReleaseCommandScratch, HELP_SCRATCH_ID%
+    HELP_SCRATCH_ID% = 0
+ENDPROC
+
+DEF PROC TrimHelpQuery
+    HELP_QUERY_START% = 1
+    REPEAT
+        HELP_QUERY_BYTE% = ASC(MID$(HELP_QUERY$, HELP_QUERY_START%, 1))
+        IF HELP_QUERY_BYTE% = 32 OR HELP_QUERY_BYTE% = 9 THEN HELP_QUERY_START% = HELP_QUERY_START% + 1
+    UNTIL (HELP_QUERY_BYTE% <> 32 AND HELP_QUERY_BYTE% <> 9) OR HELP_QUERY_START% > LEN(HELP_QUERY$)
+    HELP_QUERY$ = MID$(HELP_QUERY$, HELP_QUERY_START%)
+    IF LEFT$(HELP_QUERY$, 1) = "*" THEN HELP_QUERY$ = MID$(HELP_QUERY$, 2)
+    HELP_QUERY_END% = LEN(HELP_QUERY$)
+    REPEAT
+        HELP_QUERY_BYTE% = ASC(MID$(HELP_QUERY$, HELP_QUERY_END%, 1))
+        IF HELP_QUERY_BYTE% = 32 OR HELP_QUERY_BYTE% = 9 THEN HELP_QUERY_END% = HELP_QUERY_END% - 1
+    UNTIL (HELP_QUERY_BYTE% <> 32 AND HELP_QUERY_BYTE% <> 9) OR HELP_QUERY_END% = 0
+    HELP_QUERY$ = LEFT$(HELP_QUERY$, HELP_QUERY_END%)
 ENDPROC
 
 DEF PROC MakeUppercase
@@ -313,7 +1143,7 @@ DEF PROC ReadString(address AS ADDRESS32)
     REPEAT
         BYTE% = ?address
         IF BYTE% = 0 THEN STOP% = 1
-        IF COUNT% >= 512 THEN STOP% = 1
+        IF COUNT% >= 1023 THEN STOP% = 1
         IF STOP% = 0 THEN TEXT$ = TEXT$ + CHR$(BYTE%): address = address + 1: COUNT% = COUNT% + 1
     UNTIL STOP% <> 0
 ENDPROC

@@ -674,8 +674,9 @@ fn ricochet_configure_status_persist_and_enforce_task_scoped_write_authority() {
     assert!(modules_output.contains("RicochetCommands"));
     let (help, _, help_output) = cli(&mut dispatcher, &mut ordinary, &display_receiver, "*HELP");
     help.unwrap();
-    assert!(help_output.contains("Ricochet MOS commands"));
+    assert!(help_output.contains("Commands (use *Help"));
     assert!(help_output.contains("*CONFIGURE"));
+    assert!(!help_output.contains("Unsupported *CONFIGURE"));
 
     // A new dispatcher reads the persisted values through the same public CLI
     // and demonstrates that Language and BASICEngine are independent fields.

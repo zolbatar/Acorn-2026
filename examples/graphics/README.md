@@ -1,8 +1,8 @@
 # Text and pixel plotting
 
 `text-and-pixels.bas` is the readable source for a small shared-boundary BASIC
-V fixture. `text-and-pixels.bbc` is the tokenised saved-program form loaded by
-`BASICLOAD`. Its program selects MODE 1, prints two lines, and plots a red plus
+V fixture. `text-and-pixels.bbc` is the tokenised saved-program form run by
+`BASIC`. Its program selects MODE 1, prints two lines, and plots a red plus
 through `GCOL` and `PLOT` on the same display.
 
 Regenerate the fixture with:
@@ -17,8 +17,7 @@ general BASIC V tokenizer.
 In the windowed app, enter:
 
 ```text
-BASICLOAD examples/graphics/text-and-pixels.bbc
-BASICRUN
+BASIC examples/graphics/text-and-pixels.bbc
 ```
 
 The MOS prompt, help output, program text, and graphics all use the same

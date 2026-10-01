@@ -5,7 +5,6 @@ use std::{
 };
 
 use crate::filesystem::OpenFile;
-use crate::tokenized_basic::TokenizedBasicProgram;
 
 pub const GUEST_MEMORY_BASE: u32 = 0x1000;
 // Room for BASIC64 desktop artwork, menu trees and catalogue state. Addresses
@@ -52,6 +51,7 @@ pub struct GuestMemory {
     bytes: Vec<u8>,
     dynamic_areas: BTreeMap<u32, DynamicArea>,
     command_scratch_areas: BTreeSet<u32>,
+    system_variable_context_areas: BTreeSet<u32>,
     retired_dynamic_ranges: Vec<(u32, u32)>,
     next_dynamic_area_number: u32,
 }
@@ -82,6 +82,7 @@ impl Default for GuestMemory {
             bytes: vec![0; GUEST_MEMORY_BASE as usize + GUEST_MEMORY_SIZE + SWI_ERROR_BLOCK_SIZE],
             dynamic_areas: BTreeMap::new(),
             command_scratch_areas: BTreeSet::new(),
+            system_variable_context_areas: BTreeSet::new(),
             retired_dynamic_ranges: Vec::new(),
             next_dynamic_area_number: 256,
         }
@@ -136,6 +137,63 @@ impl GuestMemory {
         first_error.map_or(Ok(()), Err)
     }
 
+    pub(crate) fn command_scratch_snapshot(&self) -> BTreeSet<u32> {
+        self.command_scratch_areas.clone()
+    }
+
+    pub(crate) fn release_command_scratch_after(
+        &mut self,
+        existing: &BTreeSet<u32>,
+    ) -> Result<(), MemoryError> {
+        let areas = self
+            .command_scratch_areas
+            .difference(existing)
+            .copied()
+            .collect::<Vec<_>>();
+        let mut first_error = None;
+        for number in areas {
+            if let Err(error) = self.remove_dynamic_area(number) {
+                self.command_scratch_areas.remove(&number);
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Reserve caller-owned logical memory for a live OS_ReadVarVal wildcard
+    /// context. These areas are intentionally separate from command scratch:
+    /// an R3 context returned to guest code remains valid across later OS_CLI
+    /// calls until that enumeration is exhausted or explicitly abandoned.
+    pub(crate) fn acquire_system_variable_context(&mut self) -> Result<DynamicArea, MemoryError> {
+        let area = self.create_dynamic_area(
+            u32::MAX,
+            4096,
+            u32::MAX,
+            0,
+            4096,
+            0,
+            0,
+            0,
+            "system-variable context".into(),
+        )?;
+        self.system_variable_context_areas.insert(area.number);
+        Ok(area)
+    }
+
+    pub(crate) fn release_system_variable_context(
+        &mut self,
+        number: u32,
+    ) -> Result<(), MemoryError> {
+        if !self.system_variable_context_areas.contains(&number) {
+            return Err(MemoryError::InvalidDynamicArea(
+                "area is not a system-variable enumeration context".into(),
+            ));
+        }
+        self.remove_dynamic_area(number)
+    }
+
     pub fn read_byte(&self, address: u32) -> Result<u8, MemoryError> {
         let index = self.index(address, 1)?;
         Ok(self.bytes[index])
@@ -156,6 +214,37 @@ impl GuestMemory {
     pub fn read_bytes(&self, address: u32, length: usize) -> Result<Vec<u8>, MemoryError> {
         let index = self.index(address, length)?;
         Ok(self.bytes[index..index + length].to_vec())
+    }
+
+    /// Read caller-visible guest data while keeping the reserved X-form SWI
+    /// error block private from ordinary public memory services.
+    pub(crate) fn read_caller_data_bytes(
+        &self,
+        address: u32,
+        length: usize,
+    ) -> Result<Vec<u8>, MemoryError> {
+        self.reject_swi_error_block_overlap(address, length)?;
+        self.read_bytes(address, length)
+    }
+
+    /// Write caller-visible guest data atomically, excluding the runtime's
+    /// reserved X-form SWI error block from guest write access.
+    pub(crate) fn write_caller_data_bytes(
+        &mut self,
+        address: u32,
+        bytes: &[u8],
+    ) -> Result<(), MemoryError> {
+        self.reject_swi_error_block_overlap(address, bytes.len())?;
+        self.write_bytes(address, bytes)
+    }
+
+    pub(crate) fn validate_caller_data_span(
+        &self,
+        address: u32,
+        length: usize,
+    ) -> Result<(), MemoryError> {
+        self.reject_swi_error_block_overlap(address, length)?;
+        self.index(address, length).map(|_| ())
     }
 
     pub fn read_c_string(&self, address: u32, max_bytes: usize) -> Result<Vec<u8>, MemoryError> {
@@ -339,6 +428,7 @@ impl GuestMemory {
         self.retired_dynamic_ranges
             .push((area.base_address, area.maximum_size));
         self.command_scratch_areas.remove(&number);
+        self.system_variable_context_areas.remove(&number);
         Ok(())
     }
 
@@ -409,17 +499,63 @@ impl GuestMemory {
         }
         Ok(start)
     }
+
+    fn reject_swi_error_block_overlap(
+        &self,
+        address: u32,
+        length: usize,
+    ) -> Result<(), MemoryError> {
+        let end = u64::from(address)
+            .checked_add(u64::try_from(length).map_err(|_| MemoryError::AddressOverflow)?)
+            .ok_or(MemoryError::AddressOverflow)?;
+        let reserved_start = u64::from(self.swi_error_block_address());
+        let reserved_end = reserved_start + SWI_ERROR_BLOCK_SIZE as u64;
+        if u64::from(address) < reserved_end && end > reserved_start {
+            return Err(MemoryError::AddressOutsideSpace(address));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
 pub struct Task {
     pub id: u64,
     pub memory: GuestMemory,
-    pub loaded_tokenized_program: Option<TokenizedBasicProgram>,
     pub file_system: FileSystemContext,
     // Privileges belong to the task object, never to its public numeric ID.
     // BASIC64 and guest module data cannot create or alter these grants.
     authority: TaskAuthority,
+    system_variable_read_cursors: Vec<SystemVariableReadCursor>,
+    exec_input: Option<ExecInputSource>,
+    exec_input_provenance: Option<(String, u32)>,
+}
+
+#[derive(Debug)]
+struct ExecInputSource {
+    guest_path: String,
+    bytes: Vec<u8>,
+    offset: usize,
+    line: u32,
+    line_has_data: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ExecInputRead {
+    Inactive,
+    Byte {
+        byte: u8,
+        guest_path: String,
+        line: u32,
+    },
+    UnterminatedLineEnd,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SystemVariableReadCursor {
+    pub(crate) pattern: String,
+    pub(crate) after_key: Option<String>,
+    pub(crate) scratch_number: u32,
+    pub(crate) scratch_base: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -429,6 +565,7 @@ impl TaskAuthority {
     const SOURCE_READ: u8 = 1 << 0;
     const MODULE_MANAGEMENT: u8 = 1 << 1;
     const CONFIGURATION_WRITE: u8 = 1 << 2;
+    const SYSTEM_VARIABLE_WRITE: u8 = 1 << 3;
 
     const fn source_inspector() -> Self {
         Self(Self::SOURCE_READ)
@@ -439,7 +576,12 @@ impl TaskAuthority {
     }
 
     const fn trusted_mos_session() -> Self {
-        Self(Self::SOURCE_READ | Self::MODULE_MANAGEMENT | Self::CONFIGURATION_WRITE)
+        Self(
+            Self::SOURCE_READ
+                | Self::MODULE_MANAGEMENT
+                | Self::CONFIGURATION_WRITE
+                | Self::SYSTEM_VARIABLE_WRITE,
+        )
     }
 
     const fn configuration_manager() -> Self {
@@ -460,6 +602,8 @@ pub struct FileSystemContext {
     pub library_directory: Vec<String>,
     pub previous_directory: Vec<String>,
     pub open_files: BTreeMap<u32, OpenFile>,
+    pub gbpb_directory_snapshot: Vec<crate::filesystem::GuestObject>,
+    pub gbpb_directory_snapshot_id: u32,
     next_handle: u32,
 }
 
@@ -473,6 +617,8 @@ impl Default for FileSystemContext {
             library_directory: Vec::new(),
             previous_directory: Vec::new(),
             open_files: BTreeMap::new(),
+            gbpb_directory_snapshot: Vec::new(),
+            gbpb_directory_snapshot_id: 0,
             // FileSwitch file handles are conventionally returned in the
             // upper half of the byte range.
             next_handle: 0x80,
@@ -481,8 +627,12 @@ impl Default for FileSystemContext {
 }
 
 impl FileSystemContext {
+    pub fn has_file_slot(&self) -> bool {
+        self.open_files.len() < 0x80
+    }
+
     pub fn insert_file(&mut self, open_file: OpenFile) -> Option<u32> {
-        if self.open_files.len() >= 0x80 {
+        if !self.has_file_slot() {
             return None;
         }
         let mut handle = self.next_handle.clamp(0x80, 0xFF);
@@ -503,7 +653,9 @@ impl Task {
     /// Construct a host-authorized interactive MOS session.
     ///
     /// This is an explicit host bootstrap path; it is not exposed to BASIC64
-    /// or guest modules. Spawned desktop tasks must use `Task::new` instead.
+    /// or guest modules. It includes source-read, module-management,
+    /// configuration-write, and session system-variable-write authority.
+    /// Spawned desktop tasks must use `Task::new` instead.
     pub fn trusted_mos_session(id: u64) -> Self {
         Self::with_authority(id, TaskAuthority::trusted_mos_session())
     }
@@ -559,6 +711,85 @@ impl Task {
         }
     }
 
+    pub(crate) fn require_system_variable_write(&self) -> Result<(), crate::error::RuntimeError> {
+        if self.authority.allows(TaskAuthority::SYSTEM_VARIABLE_WRITE) {
+            Ok(())
+        } else {
+            Err(Self::authorization_denied(
+                8,
+                "caller task lacks system-variable write authority",
+            ))
+        }
+    }
+
+    pub(crate) fn set_system_variable_read_cursor(&mut self, cursor: SystemVariableReadCursor) {
+        self.system_variable_read_cursors.push(cursor);
+    }
+
+    pub(crate) fn system_variable_read_cursor(
+        &self,
+        context_address: u32,
+    ) -> Option<&SystemVariableReadCursor> {
+        self.system_variable_read_cursors
+            .iter()
+            .find(|cursor| cursor.scratch_base == context_address)
+    }
+
+    pub(crate) fn update_system_variable_read_cursor_after_key(
+        &mut self,
+        context_address: u32,
+        after_key: String,
+    ) -> Result<(), crate::error::RuntimeError> {
+        let cursor = self
+            .system_variable_read_cursors
+            .iter_mut()
+            .find(|cursor| cursor.scratch_base == context_address)
+            .ok_or_else(|| {
+                crate::error::RuntimeError::Program(
+                    "system-variable enumeration context disappeared".into(),
+                )
+            })?;
+        cursor.after_key = Some(after_key);
+        Ok(())
+    }
+
+    pub(crate) fn system_variable_read_context_addresses(&self) -> BTreeSet<u32> {
+        self.system_variable_read_cursors
+            .iter()
+            .map(|cursor| cursor.scratch_base)
+            .collect()
+    }
+
+    pub(crate) fn clear_new_system_variable_read_cursors(
+        &mut self,
+        existing_contexts: &BTreeSet<u32>,
+    ) {
+        let released = self
+            .system_variable_read_cursors
+            .iter()
+            .filter(|cursor| !existing_contexts.contains(&cursor.scratch_base))
+            .map(|cursor| cursor.scratch_number)
+            .collect::<Vec<_>>();
+        self.system_variable_read_cursors
+            .retain(|cursor| existing_contexts.contains(&cursor.scratch_base));
+        for number in released {
+            let _ = self.memory.release_system_variable_context(number);
+        }
+    }
+
+    pub(crate) fn remove_system_variable_read_cursor(&mut self, context_address: u32) {
+        if let Some(index) = self
+            .system_variable_read_cursors
+            .iter()
+            .position(|cursor| cursor.scratch_base == context_address)
+        {
+            let cursor = self.system_variable_read_cursors.remove(index);
+            let _ = self
+                .memory
+                .release_system_variable_context(cursor.scratch_number);
+        }
+    }
+
     fn authorization_denied(code: u32, message: &str) -> crate::error::RuntimeError {
         crate::error::RuntimeError::Structured {
             type_name: "TaskAuthorizationDenied".into(),
@@ -571,9 +802,72 @@ impl Task {
         Self {
             id,
             memory: GuestMemory::default(),
-            loaded_tokenized_program: None,
             file_system: FileSystemContext::default(),
             authority,
+            system_variable_read_cursors: Vec::new(),
+            exec_input: None,
+            exec_input_provenance: None,
         }
+    }
+
+    pub(crate) fn install_exec_input(&mut self, guest_path: String, bytes: Vec<u8>) {
+        self.exec_input = Some(ExecInputSource {
+            guest_path,
+            bytes,
+            offset: 0,
+            line: 1,
+            line_has_data: false,
+        });
+        self.exec_input_provenance = None;
+    }
+
+    pub(crate) fn close_exec_input(&mut self) {
+        self.exec_input = None;
+        self.exec_input_provenance = None;
+    }
+
+    pub(crate) fn has_exec_input(&self) -> bool {
+        self.exec_input.is_some()
+    }
+
+    pub(crate) fn exec_input_provenance(&self) -> Option<(&str, u32)> {
+        self.exec_input_provenance
+            .as_ref()
+            .map(|(path, line)| (path.as_str(), *line))
+    }
+
+    pub(crate) fn read_exec_input(&mut self) -> ExecInputRead {
+        let Some(source) = self.exec_input.as_mut() else {
+            return ExecInputRead::Inactive;
+        };
+        if source.offset >= source.bytes.len() {
+            let partial_line = source.line_has_data;
+            self.exec_input = None;
+            return if partial_line {
+                ExecInputRead::UnterminatedLineEnd
+            } else {
+                ExecInputRead::Inactive
+            };
+        }
+        let byte = source.bytes[source.offset];
+        source.offset += 1;
+        let line = source.line;
+        if byte == b'\r' {
+            source.line = source.line.saturating_add(1);
+            source.line_has_data = false;
+        } else {
+            source.line_has_data = true;
+        }
+        let guest_path = source.guest_path.clone();
+        self.exec_input_provenance = Some((guest_path.clone(), line));
+        ExecInputRead::Byte {
+            byte,
+            guest_path,
+            line,
+        }
+    }
+
+    pub(crate) fn set_exec_input_provenance(&mut self, provenance: Option<(String, u32)>) {
+        self.exec_input_provenance = provenance;
     }
 }

@@ -11,14 +11,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     error::RuntimeError,
     memory::Task,
+    ricochet::{
+        ArgumentDirection, CapabilityName, CommandCategory, CommandHandler, DefinitionDescriptor,
+        IdentityAllocator, LogicalMemoryContract, ModuleCommand, ModuleId, ModuleLifecycle,
+        ModuleManifest, ModuleSymbolImport, PrimitiveImport, PrimitiveRegistry, RegisterContract,
+        RegisterKind, ReplacementPolicy, SemanticVersion, SwiContract, SwiExport,
+    },
     swi::{SwiContext, SwiDispatcher},
     tokenized_basic::TokenizedBasicLine,
-    ricochet::{
-        ArgumentDirection, CapabilityName, DefinitionDescriptor, IdentityAllocator,
-        LogicalMemoryContract, ModuleId, ModuleLifecycle, ModuleManifest, ModuleSymbolImport,
-        PrimitiveImport, PrimitiveRegistry, RegisterContract, RegisterKind, ReplacementPolicy,
-        SemanticVersion, SwiContract, SwiExport,
-    },
 };
 
 use super::{
@@ -84,6 +84,7 @@ impl SystemModule {
         let mut symbol_imports: Vec<ModuleSymbolImport> = Vec::new();
         let mut requested_capabilities = BTreeSet::new();
         let mut exports: Vec<SwiExport> = Vec::new();
+        let mut commands: Vec<ModuleCommand> = Vec::new();
         let mut symbol_exports: BTreeSet<String> = BTreeSet::new();
         let mut private_symbols: BTreeSet<String> = BTreeSet::new();
         let mut lifecycle = ModuleLifecycle::default();
@@ -168,6 +169,7 @@ impl SystemModule {
                     "@STATE",
                     "@EXPORT",
                     "@PRIVATE",
+                    "@COMMAND",
                 ]
                 .iter()
                 .any(|name| kind.eq_ignore_ascii_case(name))
@@ -217,6 +219,19 @@ impl SystemModule {
                 let mut words = metadata.split_ascii_whitespace();
                 let kind = words.next().unwrap_or_default().to_ascii_uppercase();
                 match kind.as_str() {
+                    "@COMMAND" => {
+                        let command = parse_command_directive(metadata, line_number)?;
+                        if commands
+                            .iter()
+                            .any(|item| item.name.eq_ignore_ascii_case(&command.name))
+                        {
+                            return Err(module_error(
+                                line_number,
+                                "a module command name is declared more than once",
+                            ));
+                        }
+                        commands.push(command);
+                    }
                     "@SYSTEM_PROFILE" => {
                         if profile_seen || words.next() != Some("0.1") || words.next().is_some() {
                             return Err(module_error(
@@ -687,7 +702,11 @@ impl SystemModule {
             }
         }
         persistent_state = program.module_state_types.clone();
-        if exports.is_empty() && symbol_exports.is_empty() && lifecycle.start.is_none() {
+        if exports.is_empty()
+            && symbol_exports.is_empty()
+            && commands.is_empty()
+            && lifecycle.start.is_none()
+        {
             return Err(module_error(
                 0,
                 "system module must define a SWI, exported symbol, or startup hook",
@@ -789,6 +808,35 @@ impl SystemModule {
                 ));
             }
         }
+        for command in &commands {
+            if let CommandHandler::Basic64Proc(handler) = &command.handler {
+                let Some(definition) = program.procedures.get(handler) else {
+                    return Err(module_error(
+                        0,
+                        &format!(
+                            "command {} handler PROC {handler} is not defined",
+                            command.name
+                        ),
+                    ));
+                };
+                let typed_parameters = program.typed_parameters.get(handler);
+                let supported_signature = typed_parameters.is_some_and(|types| {
+                    (types.len() == 1 || types.len() == 2)
+                        && types.iter().all(|ty| *ty == SystemType::String)
+                });
+                if !supported_signature
+                    || typed_parameters
+                        .is_none_or(|types| definition.parameters.len() != types.len())
+                {
+                    return Err(module_error(
+                        0,
+                        &format!(
+                            "command handler PROC {handler} must take one typed STRING argument, or two typed STRING arguments (command name and arguments)"
+                        ),
+                    ));
+                }
+            }
+        }
         validate_dependencies(&name, &dependencies)?;
         for import in &symbol_imports {
             if !dependencies
@@ -824,6 +872,7 @@ impl SystemModule {
             lifecycle,
             replacement_policy,
             symbol_exports,
+            commands,
             exports,
             source_path: source_path.clone(),
             source_hash: source_hash.clone(),
@@ -1132,6 +1181,60 @@ impl SystemModule {
             task,
             dispatcher,
         )
+    }
+
+    pub(crate) fn invoke_command_handler(
+        &self,
+        module_id: ModuleId,
+        handler: &str,
+        command_name: String,
+        arguments: String,
+        task: &mut Task,
+        dispatcher: &mut SwiDispatcher,
+    ) -> Result<(), RuntimeError> {
+        if !self
+            .program
+            .procedures
+            .contains_key(&handler.to_ascii_uppercase())
+        {
+            return Err(module_error(
+                0,
+                &format!("command handler PROC {handler} is not defined"),
+            ));
+        }
+        self.typed_ir
+            .prepare(SystemIrBackend::Interpreter)
+            .map_err(|error| RuntimeError::Program(error.to_string()))?;
+        let program = self
+            .typed_ir
+            .lower_for_reference_interpreter()
+            .map_err(RuntimeError::Program)?;
+        let handler_key = handler.to_ascii_uppercase();
+        let parameter_count = self
+            .program
+            .typed_parameters
+            .get(&handler_key)
+            .map_or(1, Vec::len);
+        let mut values = Vec::with_capacity(parameter_count);
+        if parameter_count == 2 {
+            values.push(runtime::Value::String(command_name.into_bytes()));
+        }
+        values.push(runtime::Value::String(arguments.into_bytes()));
+        let result = runtime::invoke_imported_system_symbol(
+            program,
+            &handler_key,
+            false,
+            values,
+            module_id,
+            &self.workspace,
+            &self.persistent_state,
+            task,
+            dispatcher,
+        )?;
+        if result.is_some() {
+            return Err(module_error(0, "a command handler PROC returned a value"));
+        }
+        Ok(())
     }
 
     /// Runs a lifecycle hook transactionally with respect to private module
@@ -2411,6 +2514,141 @@ fn validate_symbol_calls(
         statement(&instruction.statement, imports, instruction.line_number)?;
     }
     Ok(())
+}
+
+fn parse_command_directive(line: &str, line_number: u16) -> Result<ModuleCommand, RuntimeError> {
+    let fields = parse_quoted_directive_fields(line)
+        .map_err(|message| module_error(line_number, &message))?;
+    if fields.len() != 7 || !fields[0].eq_ignore_ascii_case("@COMMAND") {
+        return Err(module_error(
+            line_number,
+            "@COMMAND syntax is NAME Commands|FileCommands PROC|BRIDGE handler \"syntax\" \"description\"",
+        ));
+    }
+    // Preserve source spelling for neat Help output; lookup, uniqueness, and
+    // abbreviation matching remain ASCII case-insensitive at the registry.
+    let name = fields[1].clone();
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(module_error(
+            line_number,
+            "@COMMAND name must be an ASCII command word",
+        ));
+    }
+    let category = if fields[2].eq_ignore_ascii_case("Commands") {
+        CommandCategory::Commands
+    } else if fields[2].eq_ignore_ascii_case("FileCommands") {
+        CommandCategory::FileCommands
+    } else {
+        return Err(module_error(
+            line_number,
+            "@COMMAND category must be Commands or FileCommands",
+        ));
+    };
+    let handler = if fields[3].eq_ignore_ascii_case("PROC") {
+        let handler = fields[4].to_ascii_uppercase();
+        if !is_basic_identifier(&handler) {
+            return Err(module_error(
+                line_number,
+                "@COMMAND PROC handler is invalid",
+            ));
+        }
+        CommandHandler::Basic64Proc(handler)
+    } else if fields[3].eq_ignore_ascii_case("BRIDGE") {
+        if !fields[4].eq_ignore_ascii_case(&name) {
+            return Err(module_error(
+                line_number,
+                "Rust bridge target must equal its command name",
+            ));
+        }
+        CommandHandler::RustBridge
+    } else {
+        return Err(module_error(
+            line_number,
+            "@COMMAND handler kind must be PROC or BRIDGE",
+        ));
+    };
+    let syntax = fields[5].clone();
+    let description = fields[6].clone();
+    if syntax.is_empty()
+        || description.is_empty()
+        || syntax.contains('|')
+        || description.contains('|')
+    {
+        return Err(module_error(
+            line_number,
+            "@COMMAND syntax and description must be non-empty and cannot contain |",
+        ));
+    }
+    Ok(ModuleCommand {
+        name,
+        category,
+        handler,
+        syntax,
+        description,
+    })
+}
+
+fn parse_quoted_directive_fields(line: &str) -> Result<Vec<String>, String> {
+    let mut fields = Vec::new();
+    let mut cursor = 0;
+    while cursor < line.len() {
+        while cursor < line.len() && line.as_bytes()[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor == line.len() {
+            break;
+        }
+        if line.as_bytes()[cursor] == b'"' {
+            cursor += 1;
+            let mut field = String::new();
+            let mut closed = false;
+            while cursor < line.len() {
+                let character = line[cursor..]
+                    .chars()
+                    .next()
+                    .ok_or_else(|| "invalid UTF-8 command metadata".to_owned())?;
+                cursor += character.len_utf8();
+                match character {
+                    '"' => {
+                        closed = true;
+                        break;
+                    }
+                    '\\' => {
+                        let escaped = line[cursor..].chars().next().ok_or_else(|| {
+                            "trailing escape in quoted command metadata".to_owned()
+                        })?;
+                        cursor += escaped.len_utf8();
+                        if !matches!(escaped, '"' | '\\') {
+                            return Err(
+                                "only quote and backslash may be escaped in command metadata"
+                                    .into(),
+                            );
+                        }
+                        field.push(escaped);
+                    }
+                    _ => field.push(character),
+                }
+            }
+            if !closed {
+                return Err("unterminated quoted command metadata".into());
+            }
+            if cursor < line.len() && !line.as_bytes()[cursor].is_ascii_whitespace() {
+                return Err("quoted command metadata must be separated by whitespace".into());
+            }
+            fields.push(field);
+        } else {
+            let start = cursor;
+            while cursor < line.len() && !line.as_bytes()[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            fields.push(line[start..cursor].to_owned());
+        }
+    }
+    Ok(fields)
 }
 
 fn module_error(line: u16, message: &str) -> RuntimeError {

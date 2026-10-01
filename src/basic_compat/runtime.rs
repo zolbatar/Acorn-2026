@@ -461,7 +461,10 @@ pub(super) extern "C" fn native_procedure_tick(context: *mut std::ffi::c_void, l
     if *steps & 0x3FF == 0 {
         // SAFETY: both pointers remain exclusively borrowed for this call.
         let dispatcher = unsafe { &mut *context.dispatcher };
-        if let Some(key) = dispatcher.poll_key() {
+        // SAFETY: the task pointer is installed alongside the dispatcher and
+        // remains valid for this synchronous callback.
+        let task = unsafe { &*context.task };
+        if let Some(key) = dispatcher.poll_key(task) {
             unsafe { *context.pending_key = Some(key) };
         }
     }
@@ -707,7 +710,7 @@ impl Interpreter {
             let inline_instruction = self.inline_continuations.pop_front();
             self.steps += 1;
             if self.steps & 0x3FF == 0 && self.pending_key.is_none() {
-                if let Some(key) = dispatcher.poll_key() {
+                if let Some(key) = dispatcher.poll_key(task) {
                     self.pending_key = Some(key);
                 }
             }
@@ -1450,6 +1453,9 @@ impl Interpreter {
                         Value::Number(f64::from(u8::from(context.carry)))
                     } else {
                         match signature.results.get(register) {
+                            Some(crate::ricochet::RegisterKind::Unsigned { bits: 32 }) => {
+                                Value::Integer(i128::from(context.registers[register]))
+                            }
                             Some(crate::ricochet::RegisterKind::OpaqueHandle { type_name }) => {
                                 Value::Handle {
                                     type_name: type_name.to_ascii_uppercase(),
@@ -1461,6 +1467,17 @@ impl Interpreter {
                                     owner_task: task.id,
                                     raw: context.registers[register],
                                 }
+                            }
+                            Some(crate::ricochet::RegisterKind::Signed { bits }) => {
+                                let raw = context.registers[register];
+                                let signed = match *bits {
+                                    1..=31 => {
+                                        let shift = 32 - u32::from(*bits);
+                                        ((raw << shift) as i32) >> shift
+                                    }
+                                    _ => raw as i32,
+                                };
+                                Value::Number(f64::from(signed))
                             }
                             _ => Value::Number(f64::from(context.registers[register])),
                         }
@@ -2960,6 +2977,12 @@ impl Interpreter {
                         owner_task: actual_owner,
                         raw,
                     },
+                    Value::Integer(number) if (0..=i128::from(u32::MAX)).contains(&number) => {
+                        Value::LogicalAddress {
+                            owner_task: *owner_task,
+                            raw: number as u32,
+                        }
+                    }
                     Value::Number(number)
                         if (0.0..=f64::from(u32::MAX)).contains(&number)
                             && number.fract() == 0.0 =>
@@ -3999,6 +4022,22 @@ fn value_to_contract_register(
     task_id: u64,
     line: u16,
 ) -> Result<u32, RuntimeError> {
+    if matches!(kind, crate::ricochet::RegisterKind::Unsigned { bits: 32 }) {
+        match value {
+            Value::Number(number)
+                if (f64::from(i32::MIN)..0.0).contains(number) && number.fract() == 0.0 =>
+            {
+                return Ok(*number as i32 as u32);
+            }
+            Value::Integer(number) if (i128::from(i32::MIN)..0).contains(number) => {
+                return Ok(*number as i32 as u32);
+            }
+            Value::Int64(number) if (i64::from(i32::MIN)..0).contains(number) => {
+                return Ok(*number as i32 as u32);
+            }
+            _ => {}
+        }
+    }
     value_to_primitive_register(value, kind, task_id, line)
 }
 

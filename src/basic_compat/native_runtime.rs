@@ -181,7 +181,7 @@ impl NativeExecutionContext {
         if self.steps & 0x3FF == 0 && self.pending_key.is_none() {
             // SAFETY: these pointers are installed from the exclusively
             // borrowed task and dispatcher and remain valid for the run.
-            if let Some(key) = unsafe { (&mut *self.dispatcher).poll_key() } {
+            if let Some(key) = unsafe { (&mut *self.dispatcher).poll_key(&*self.task) } {
                 self.pending_key = Some(key);
             }
         }

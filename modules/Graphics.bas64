@@ -1,0 +1,35 @@
+REM @BASIC64 MODE=BASIC64
+REM @SYSTEM_PROFILE 0.1
+REM @MODULE Graphics 1.0.0
+REM @CAPABILITY GraphicsRaster
+REM @CAPABILITY RuntimeErrors
+REM @IMPORT Host.Graphics.Plot GraphicsRaster
+REM @IMPORT Host.Graphics.ReadPoint GraphicsRaster
+ERROR GraphicsError
+    Code AS UINT32 READONLY
+    Message AS STRING READONLY
+END ERROR
+REM @SWI OS_Plot &45 PlotService REGISTERS=R0:U32:INOUT|R1:U32:INOUT|R2:U32:INOUT;BLOCKING=FALSE;REENTRANT=FALSE;ERROR=GraphicsError
+REM @SWI OS_ReadPoint &32 ReadPointService REGISTERS=R0:U32:IN|R1:U32:IN|R2:U32:OUT|R3:U32:OUT|R4:U32:OUT;BLOCKING=FALSE;REENTRANT=FALSE;ERROR=GraphicsError
+
+DEF PROC PlotService THROWS GraphicsError
+    CODEBYTE% = R0% AND &FF
+    PRIMITIVE Host.Graphics.Plot, CODEBYTE%, R1%, R2%
+ENDPROC
+
+DEF PROC ReadPointService THROWS GraphicsError
+    PRIMITIVE Host.Graphics.ReadPoint, R0%, R1% TO C%, T%, ONSCR%, MODERN%
+    IF MODERN% <> 0 THEN
+        THROW GraphicsError, &32, "OS_ReadPoint requires TEXT=CLASSIC because Modern text is not stored in the guest raster"
+    ENDIF
+    IF ONSCR% <> 0 THEN
+        R2% = C%
+        R3% = T%
+        R4% = 0
+    ENDIF
+    IF ONSCR% = 0 THEN
+        R2% = &FFFFFFFF
+        R3% = 0
+        R4% = &FFFFFFFF
+    ENDIF
+ENDPROC

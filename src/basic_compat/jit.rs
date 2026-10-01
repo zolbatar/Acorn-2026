@@ -1,4 +1,4 @@
-//! Experimental Cranelift kernels used by `BASICJIT`.
+//! Experimental Cranelift kernels used by the configured Hybrid engine.
 //!
 //! The compatibility interpreter handles statements outside verified hot
 //! regions. The Mandelbrot frame kernel routes ColourTrans and OS_Plot through
@@ -185,7 +185,7 @@ extern "C" fn render_mandelbrot_pixel(
         // the native frame is running is available to its final INKEY call.
         // SAFETY: the pending-key slot and dispatcher remain exclusively
         // borrowed for this synchronous native invocation.
-        if let Some(key) = unsafe { (&mut *context.dispatcher).poll_key() } {
+        if let Some(key) = unsafe { (&mut *context.dispatcher).poll_key(&*context.task) } {
             unsafe { *context.pending_key = Some(key) };
         }
     }
@@ -306,9 +306,15 @@ impl JitProgram {
         jit_builder.symbol("ricochet_basic_sin", basic_sin as *const () as *const u8);
         jit_builder.symbol("ricochet_basic_tan", basic_tan as *const () as *const u8);
         jit_builder.symbol("ricochet_basic_sqrt", basic_sqrt as *const () as *const u8);
-        jit_builder.symbol("ricochet_basic_floor", basic_floor as *const () as *const u8);
+        jit_builder.symbol(
+            "ricochet_basic_floor",
+            basic_floor as *const () as *const u8,
+        );
         jit_builder.symbol("ricochet_basic_ln", basic_ln as *const () as *const u8);
-        jit_builder.symbol("ricochet_basic_log10", basic_log10 as *const () as *const u8);
+        jit_builder.symbol(
+            "ricochet_basic_log10",
+            basic_log10 as *const () as *const u8,
+        );
         if !numeric_procedure_regions.is_empty() {
             jit_builder.symbol(
                 "ricochet_basic_jit_procedure_enter",
@@ -587,7 +593,7 @@ impl JitProgram {
         }
         if status == 0 {
             return Err(RuntimeError::Program(
-                "BASICJIT Mandelbrot frame stopped without a runtime error".into(),
+                "Hybrid JIT Mandelbrot frame stopped without a runtime error".into(),
             ));
         }
         let Some(last_pixel) = callback_context.last_pixel else {
@@ -740,7 +746,7 @@ impl JitProgram {
         }
         if status == 0 {
             return Err(RuntimeError::Program(format!(
-                "BASICJIT native procedure PROC {} stopped without a runtime error",
+                "Hybrid JIT native procedure PROC {} stopped without a runtime error",
                 procedure.region.name
             )));
         }

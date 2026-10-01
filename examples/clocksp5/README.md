@@ -7,8 +7,7 @@ ClockSP5.bbc is a generated ARM BBC BASIC V tokenised saved-program file for tes
 Run `cargo run`, then enter these commands at the MOS prompt:
 
 ```text
-BASICLOAD $.clocksp5.ClockSP5
-BASICRUN
+BASIC $.clocksp5.ClockSP5
 ```
 
 Both `.bbc` fixtures from this folder are staged under `demo-volume/clocksp5` with BASIC file type metadata and extensionless guest names (`ClockSP5` and `integer-repeat-jit`).

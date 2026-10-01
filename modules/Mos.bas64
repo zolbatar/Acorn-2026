@@ -1,0 +1,93 @@
+REM @BASIC64 MODE=BASIC64
+REM @SYSTEM_PROFILE 0.1
+REM @MODULE Mos 1.0.0
+REM @CAPABILITY MosInput
+REM @CAPABILITY MosClock
+REM @CAPABILITY TaskMemory
+REM @CAPABILITY RuntimeErrors
+REM @IMPORT Host.MosInput.InsertKey MosInput
+REM @IMPORT Host.MosInput.FlushKeyboard MosInput
+REM @IMPORT Host.MosInput.ReadTimed MosInput
+REM @IMPORT Host.Clock.ReadSystemChunks MosClock
+REM @IMPORT Host.Clock.WriteSystemChunks MosClock
+REM @IMPORT Host.Clock.ReadIntervalChunks MosClock
+REM @IMPORT Host.Clock.WriteIntervalChunks MosClock
+REM @IMPORT Host.Memory.ReadFiveBytes TaskMemory
+REM @IMPORT Host.Memory.WriteFiveBytes TaskMemory
+REM @IMPORT Host.Runtime.UnsupportedServiceReason RuntimeErrors
+REM @SWI OS_Byte &06 ByteService REGISTERS=R0:U32:INOUT|R1:U32:INOUT|R2:U32:INOUT;CARRY=OUT;BLOCKING=TRUE;REENTRANT=FALSE;ERROR=UnsupportedServiceReason
+REM @SWI OS_Word &07 WordService REGISTERS=R0:U32:IN|R1:ADDRESS32:IN;BLOCKING=FALSE;REENTRANT=FALSE;ERROR=UnsupportedServiceReason
+
+DEF PROC ByteService
+    BYTE_REASON% = R0% AND &FF
+    BYTE_X% = R1% AND &FF
+    BYTE_Y% = R2% AND &FF
+    IF BYTE_REASON% = 138 THEN
+        IF BYTE_X% = 0 THEN
+            PRIMITIVE Host.MosInput.InsertKey, BYTE_Y% TO INPUT_FULL%
+            CARRY% = INPUT_FULL%
+        ENDIF
+        IF BYTE_X% <> 0 THEN PROC UnsupportedByteReason(BYTE_REASON%)
+    ENDIF
+    IF BYTE_REASON% = 21 THEN
+        IF BYTE_X% = 0 THEN
+            PRIMITIVE Host.MosInput.FlushKeyboard
+        ENDIF
+        IF BYTE_X% <> 0 THEN PROC UnsupportedByteReason(BYTE_REASON%)
+    ENDIF
+    IF BYTE_REASON% = 129 THEN
+        IF BYTE_Y% < 128 THEN
+            WAITCS% = BYTE_X% + BYTE_Y% * 256
+            PRIMITIVE Host.MosInput.ReadTimed, WAITCS% TO KEY%, KEY_STATUS%
+            R1% = KEY%
+            IF KEY_STATUS% = 0 THEN R2% = 0: CARRY% = 0
+            IF KEY_STATUS% = 1 THEN R2% = 27: CARRY% = 1
+            IF KEY_STATUS% = 2 THEN R2% = 255: CARRY% = 1
+        ENDIF
+        IF BYTE_Y% >= 128 THEN PROC UnsupportedByteReason(BYTE_REASON%)
+    ENDIF
+    IF BYTE_REASON% <> 138 AND BYTE_REASON% <> 21 AND BYTE_REASON% <> 129 THEN
+        PROC UnsupportedByteReason(BYTE_REASON%)
+    ENDIF
+ENDPROC
+
+DEF PROC UnsupportedByteReason(reason% AS UINT32)
+    PRIMITIVE Host.Runtime.UnsupportedServiceReason, &06, reason%
+ENDPROC
+
+DEF PROC WordService
+    WORD_REASON% = R0%
+    IF WORD_REASON% = 1 THEN
+        PRIMITIVE Host.Clock.ReadSystemChunks TO CLOCK_LOW%, CLOCK_MID%, CLOCK_HIGH%
+        BYTE0% = CLOCK_LOW% AND &FF
+        BYTE1% = INT(CLOCK_LOW% / 256) AND &FF
+        BYTE2% = CLOCK_MID% AND &FF
+        BYTE3% = INT(CLOCK_MID% / 256) AND &FF
+        BYTE4% = CLOCK_HIGH% AND &FF
+        PRIMITIVE Host.Memory.WriteFiveBytes, R1%, BYTE0%, BYTE1%, BYTE2%, BYTE3%, BYTE4%
+    ENDIF
+    IF WORD_REASON% = 3 THEN
+        PRIMITIVE Host.Clock.ReadIntervalChunks TO CLOCK_LOW%, CLOCK_MID%, CLOCK_HIGH%
+        BYTE0% = CLOCK_LOW% AND &FF
+        BYTE1% = INT(CLOCK_LOW% / 256) AND &FF
+        BYTE2% = CLOCK_MID% AND &FF
+        BYTE3% = INT(CLOCK_MID% / 256) AND &FF
+        BYTE4% = CLOCK_HIGH% AND &FF
+        PRIMITIVE Host.Memory.WriteFiveBytes, R1%, BYTE0%, BYTE1%, BYTE2%, BYTE3%, BYTE4%
+    ENDIF
+    IF WORD_REASON% = 2 OR WORD_REASON% = 4 THEN
+        PRIMITIVE Host.Memory.ReadFiveBytes, R1% TO BYTE0%, BYTE1%, BYTE2%, BYTE3%, BYTE4%
+        CLOCK_LOW% = BYTE0% + BYTE1% * 256
+        CLOCK_MID% = BYTE2% + BYTE3% * 256
+        CLOCK_HIGH% = BYTE4%
+        IF WORD_REASON% = 2 THEN
+            PRIMITIVE Host.Clock.WriteSystemChunks, CLOCK_LOW%, CLOCK_MID%, CLOCK_HIGH%
+        ENDIF
+        IF WORD_REASON% = 4 THEN
+            PRIMITIVE Host.Clock.WriteIntervalChunks, CLOCK_LOW%, CLOCK_MID%, CLOCK_HIGH%
+        ENDIF
+    ENDIF
+    IF WORD_REASON% <> 1 AND WORD_REASON% <> 2 AND WORD_REASON% <> 3 AND WORD_REASON% <> 4 THEN
+        PRIMITIVE Host.Runtime.UnsupportedServiceReason, &07, WORD_REASON%
+    ENDIF
+ENDPROC

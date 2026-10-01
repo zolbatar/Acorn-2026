@@ -1,0 +1,743 @@
+REM @BASIC64 MODE=BASIC64
+REM @SYSTEM_PROFILE 0.1
+REM @MODULE FileSwitch 1.0.0
+REM @CAPABILITY FileSystem
+REM @CAPABILITY RuntimeErrors
+REM @CAPABILITY SystemVariableStore
+REM @CAPABILITY TaskMemory
+ERROR FileSwitchError
+    Code AS UINT32 READONLY
+    Message AS STRING READONLY
+END ERROR
+REM @IMPORT Host.FileChannel.Open FileSystem
+REM @IMPORT Host.FileChannel.Close FileSystem
+REM @IMPORT Host.FileChannel.ReadByte FileSystem
+REM @IMPORT Host.FileChannel.WriteByte FileSystem
+REM @IMPORT Host.FileChannel.ReadPosition FileSystem
+REM @IMPORT Host.FileChannel.SetPosition FileSystem
+REM @IMPORT Host.FileChannel.ReadExtent FileSystem
+REM @IMPORT Host.FileChannel.SetExtent FileSystem
+REM @IMPORT Host.FileChannel.CanonicalNameLength FileSystem
+REM @IMPORT Host.FileChannel.Args7SpareBytes FileSystem
+REM @IMPORT Host.FileChannel.WriteCanonicalName FileSystem
+REM @IMPORT Host.FileChannel.ValidateTransferSpan FileSystem
+REM @IMPORT Host.FileChannel.ValidateDirectoryInfoAddress FileSystem
+REM @IMPORT Host.FileChannel.ValidateTransferRange FileSystem
+REM @IMPORT Host.FileChannel.ValidateTransferRangeRaw FileSystem
+REM @IMPORT Host.FileChannel.ReadTransfer FileSystem
+REM @IMPORT Host.FileChannel.WriteTransfer FileSystem
+REM @IMPORT Host.FileChannel.FixedNameLength FileSystem
+REM @IMPORT Host.FileChannel.FixedNameByte FileSystem
+REM @IMPORT Host.FileChannel.OpenDirectorySnapshot FileSystem
+REM @IMPORT Host.FileChannel.ReadDirectoryEntry FileSystem
+REM @IMPORT Host.FileChannel.NormalizeDirectoryStart FileSystem
+REM @IMPORT Host.FileChannel.ReadDirectoryFieldByte FileSystem
+REM @IMPORT Host.FileChannel.ReadDirectoryNameByte FileSystem
+REM @IMPORT Host.FileChannel.WriteCallerByte FileSystem
+REM @IMPORT Host.FileObject.Catalogue FileSystem
+REM @IMPORT Host.FileObject.SaveBlock FileSystem
+REM @IMPORT Host.FileObject.LoadBlock FileSystem
+REM @IMPORT Host.FileObject.SetMetadata FileSystem
+REM @IMPORT Host.FileObject.CreateEmpty FileSystem
+REM @IMPORT Host.FileObject.CreateDirectory FileSystem
+REM @IMPORT Host.FileObject.DeleteFile FileSystem
+REM @IMPORT Host.FileObject.DeleteDirectory FileSystem
+REM @IMPORT Host.FileObject.InvalidSaveRange FileSystem
+REM @IMPORT Host.FileObject.CatalogueCandidate FileSystem
+REM @IMPORT Host.FileObject.LoadCandidate FileSystem
+REM @IMPORT Host.FileObject.SearchPathNotFound FileSystem
+REM @IMPORT Host.FileSwitch.SetDirectory FileSystem
+REM @IMPORT Host.FileSwitch.UnsetDirectory FileSystem
+REM @IMPORT Host.FileSwitch.SwapDirectories FileSystem
+REM @IMPORT Host.FileSwitch.SetTemporaryFromPrefix FileSystem
+REM @IMPORT Host.FileSwitch.ReadPathVariable FileSystem
+REM @IMPORT Host.FileSwitch.ReadPathSpecification FileSystem
+REM @IMPORT Host.FileSwitch.ReadPathName FileSystem
+REM @IMPORT Host.FileSwitch.CanonicalPathExists FileSystem
+REM @IMPORT Host.FileSwitch.RestoreTemporary FileSystem
+REM @IMPORT Host.Memory.AcquireCommandScratch TaskMemory
+REM @IMPORT Host.Memory.ReleaseCommandScratch TaskMemory
+REM @IMPORT Host.FileSwitch.ProbeFileSystemNumber FileSystem
+REM @IMPORT Host.FileSwitch.ProbeFileSystemName FileSystem
+REM @IMPORT Host.FileSwitch.SelectFileSystem FileSystem
+REM @IMPORT Host.FileSwitch.ClearFileSystemSelection FileSystem
+REM @IMPORT Host.FileSwitch.CloseAllChannels FileSystem
+REM @IMPORT Host.FileSwitch.RenameObject FileSystem
+REM @IMPORT Host.FileSwitch.SetVolumeName FileSystem
+REM @IMPORT Host.FileSwitch.FileTypeText FileSystem
+REM @IMPORT Host.FileSwitch.ParseFileType FileSystem
+REM @IMPORT Host.FileSwitch.FileSystemNameLength FileSystem
+REM @IMPORT Host.FileSwitch.FileSystemNameByte FileSystem
+REM @IMPORT Host.FileSwitch.VolumeNameWriteLength FileSystem
+REM @IMPORT Host.FileSwitch.CanonicalPathLength FileSystem
+REM @IMPORT Host.FileSwitch.CanonicalPathByte FileSystem
+REM @IMPORT Host.FileSwitch.CanonicalCapacityFits FileSystem
+REM @IMPORT Host.FileSwitch.CanonicalSpareBytes FileSystem
+REM @IMPORT Host.FileSwitch.WriteCanonicalPath FileSystem
+REM @IMPORT Host.FileSwitch.OpenCatalogueSnapshot FileSystem
+REM @IMPORT Host.Runtime.UnsupportedServiceReason RuntimeErrors
+REM @SWI OS_Args &09 ArgsService REGISTERS=R0:U32:INOUT|R1:U32:IN|R2:U32:INOUT|R5:U32:INOUT;BLOCKING=FALSE;REENTRANT=FALSE;ERROR=UnsupportedServiceReason
+REM @SWI OS_BGet &0A ByteGetService REGISTERS=R0:U32:INOUT|R1:U32:IN;CARRY=OUT;BLOCKING=FALSE;REENTRANT=TRUE
+REM @SWI OS_BPut &0B BytePutService REGISTERS=R0:U32:IN|R1:U32:IN;BLOCKING=FALSE;REENTRANT=TRUE
+REM @SWI OS_Find &0D FindService REGISTERS=R0:U32:INOUT|R1:U32:IN|R2:U32:IN;BLOCKING=FALSE;REENTRANT=FALSE;ERROR=UnsupportedServiceReason
+REM @SWI OS_GBPB &0C BulkTransferService REGISTERS=R0:U32:INOUT|R1:U32:INOUT|R2:U32:INOUT|R3:U32:INOUT|R4:U32:INOUT|R5:U32:INOUT|R6:U32:INOUT;CARRY=OUT;BLOCKING=FALSE;REENTRANT=FALSE;ERROR=UnsupportedServiceReason
+REM @SWI OS_File &08 FileService REGISTERS=R0:U32:INOUT|R1:U32:IN|R2:U32:INOUT|R3:U32:INOUT|R4:U32:INOUT|R5:U32:INOUT;BLOCKING=FALSE;REENTRANT=FALSE;ERROR=UnsupportedServiceReason
+REM @SWI OS_FSControl &29 FileSystemControl REGISTERS=R0:U32:INOUT|R1:U32:INOUT|R2:U32:INOUT|R3:U32:INOUT|R4:U32:INOUT|R5:S32:INOUT;BLOCKING=FALSE;REENTRANT=FALSE;ERROR=UnsupportedServiceReason
+
+DEF PROC FileSystemControl THROWS FileSwitchError
+    FSC_REASON% = R0% AND &FF
+    IF FSC_REASON% = 0 OR FSC_REASON% = 1 OR FSC_REASON% = 39 THEN
+        FSC_DIRECTORY_KIND% = FSC_REASON%
+        PRIMITIVE Host.FileSwitch.SetDirectory, FSC_DIRECTORY_KIND%, R1%
+    ENDIF
+    IF FSC_REASON% >= 5 AND FSC_REASON% <= 9 THEN PROC CatalogueService
+    IF FSC_REASON% = 11 THEN PROC SetTemporaryFromPrefix
+    IF FSC_REASON% = 13 THEN PROC ProbeFileSystem
+    IF FSC_REASON% = 14 THEN PROC SelectFileSystem
+    IF FSC_REASON% = 18 THEN
+        PRIMITIVE Host.FileSwitch.FileTypeText, R2% AND &FFF TO FSC_TYPE_R2%, FSC_TYPE_R3%
+        R2% = FSC_TYPE_R2%
+        R3% = FSC_TYPE_R3%
+    ENDIF
+    IF FSC_REASON% = 19 THEN PRIMITIVE Host.FileSwitch.RestoreTemporary
+    IF FSC_REASON% = 22 THEN PRIMITIVE Host.FileSwitch.CloseAllChannels
+    IF FSC_REASON% = 25 THEN PRIMITIVE Host.FileSwitch.RenameObject, R1%, R2%
+    IF FSC_REASON% = 31 THEN PRIMITIVE Host.FileSwitch.ParseFileType, R1% TO R2%
+    IF FSC_REASON% = 33 THEN PROC FileSystemName
+    IF FSC_REASON% = 37 THEN PROC CanonicalName
+    IF FSC_REASON% = 40 THEN PRIMITIVE Host.FileSwitch.SwapDirectories
+    IF FSC_REASON% = 43 THEN PRIMITIVE Host.FileSwitch.UnsetDirectory, 0
+    IF FSC_REASON% = 44 THEN PRIMITIVE Host.FileSwitch.UnsetDirectory, 1
+    IF FSC_REASON% = 45 THEN PRIMITIVE Host.FileSwitch.UnsetDirectory, 2
+    IF FSC_REASON% = 50 THEN PRIMITIVE Host.FileSwitch.SetVolumeName, R1%, R2%
+    IF FSC_REASON% <> 0 AND FSC_REASON% <> 1 AND FSC_REASON% <> 5 AND FSC_REASON% <> 6 AND FSC_REASON% <> 7 AND FSC_REASON% <> 8 AND FSC_REASON% <> 9 AND FSC_REASON% <> 11 AND FSC_REASON% <> 13 AND FSC_REASON% <> 14 AND FSC_REASON% <> 18 AND FSC_REASON% <> 19 AND FSC_REASON% <> 22 AND FSC_REASON% <> 25 AND FSC_REASON% <> 31 AND FSC_REASON% <> 33 AND FSC_REASON% <> 37 AND FSC_REASON% <> 39 AND FSC_REASON% <> 40 AND FSC_REASON% <> 43 AND FSC_REASON% <> 44 AND FSC_REASON% <> 45 AND FSC_REASON% <> 50 THEN
+        PRIMITIVE Host.Runtime.UnsupportedServiceReason, &29, FSC_REASON%
+    ENDIF
+ENDPROC
+
+DEF PROC ProbeFileSystem
+    FSC_PRESENT% = 0
+    IF R1% < &100 THEN
+        PRIMITIVE Host.FileSwitch.ProbeFileSystemNumber, R1% TO FSC_PRESENT%, FSC_CONTROL_BLOCK%
+        FSC_NUMBER% = R1%
+    ENDIF
+    IF R1% >= &100 THEN
+        FSC_TERMINATORS% = 0
+        IF R2% = 0 THEN FSC_TERMINATORS% = 1
+        PRIMITIVE Host.FileSwitch.ProbeFileSystemName, R1%, FSC_TERMINATORS% TO FSC_PRESENT%, FSC_NUMBER%, FSC_CONTROL_BLOCK%
+    ENDIF
+    IF FSC_PRESENT% <> 0 THEN
+        FSC_NUMBER% = 1
+        FSC_CONTROL_BLOCK% = &1000
+    ENDIF
+    IF FSC_PRESENT% <> 0 THEN
+        R1% = FSC_NUMBER%
+        R2% = FSC_CONTROL_BLOCK%
+    ENDIF
+    IF FSC_PRESENT% = 0 THEN R2% = 0
+ENDPROC
+
+DEF PROC SelectFileSystem THROWS FileSwitchError
+    IF R1% = 0 THEN
+        PRIMITIVE Host.FileSwitch.ClearFileSystemSelection
+    ENDIF
+    IF R1% <> 0 THEN
+        FSC_PRESENT% = 0
+        IF R1% < &100 THEN
+            PRIMITIVE Host.FileSwitch.ProbeFileSystemNumber, R1% TO FSC_PRESENT%, FSC_CONTROL_BLOCK%
+            FSC_NUMBER% = R1%
+        ENDIF
+        IF R1% >= &100 THEN
+            PRIMITIVE Host.FileSwitch.ProbeFileSystemName, R1%, 1 TO FSC_PRESENT%, FSC_NUMBER%, FSC_CONTROL_BLOCK%
+        ENDIF
+        IF FSC_PRESENT% = 0 THEN PROC RaiseFileSwitchError(1, "filing system is not present")
+        PRIMITIVE Host.FileSwitch.SelectFileSystem, FSC_NUMBER%
+    ENDIF
+ENDPROC
+
+DEF PROC FileSystemName
+    PRIMITIVE Host.FileSwitch.FileSystemNameLength, R1% TO FSC_NAME_LENGTH%
+    PRIMITIVE Host.FileSwitch.VolumeNameWriteLength, R3%, FSC_NAME_LENGTH% TO FSC_COPY_LENGTH%
+    FSC_OUTPUT_LENGTH% = FSC_COPY_LENGTH% + 1
+    IF FSC_COPY_LENGTH% > 0 OR R3% > 0 THEN PRIMITIVE Host.FileChannel.ValidateTransferSpan, R2%, FSC_OUTPUT_LENGTH%
+    FSC_OUT% = R2%
+    FOR FSC_INDEX% = 0 TO FSC_COPY_LENGTH% - 1
+        PRIMITIVE Host.FileSwitch.FileSystemNameByte, R1%, FSC_INDEX% TO FSC_BYTE%
+        PRIMITIVE Host.FileChannel.WriteCallerByte, FSC_OUT%, FSC_BYTE%
+        FSC_OUT% = FSC_OUT% + 1
+    NEXT
+    IF R3% > 0 THEN PRIMITIVE Host.FileChannel.WriteCallerByte, FSC_OUT%, 0
+ENDPROC
+
+DEF PROC CanonicalName THROWS FileSwitchError
+    PRIMITIVE Host.Memory.AcquireCommandScratch TO FSC_SCRATCH_ID%, FSC_SCRATCH_BASE
+    FSC_PATH$ = ""
+    PRIMITIVE Host.FileSwitch.ReadPathName, R1%, FSC_SCRATCH_BASE TO FSC_PATH_LENGTH%
+    FOR FSC_PATH_INDEX% = 0 TO FSC_PATH_LENGTH% - 1
+        FSC_PATH$ = FSC_PATH$ + CHR$(?(FSC_SCRATCH_BASE + FSC_PATH_INDEX%))
+    NEXT
+    FSC_PATH_SPEC$ = ""
+    FSC_PATH_FOUND% = 0
+    FSC_IS_QUALIFIED% = 0
+    IF INSTR(FSC_PATH$, ":") > 0 THEN FSC_IS_QUALIFIED% = 1
+    FSC_CANDIDATE$ = FSC_PATH$
+    IF FSC_IS_QUALIFIED% = 0 THEN
+        IF R3% <> 0 THEN
+            PRIMITIVE Host.FileSwitch.ReadPathVariable, R3%, FSC_SCRATCH_BASE TO FSC_PATH_FOUND%, FSC_PATH_SPEC_LENGTH%
+            IF FSC_PATH_FOUND% <> 0 THEN PROC ReadPathSpecFromScratch
+        ENDIF
+        IF FSC_PATH_FOUND% = 0 AND R4% <> 0 THEN
+            PRIMITIVE Host.FileSwitch.ReadPathSpecification, R4%, FSC_SCRATCH_BASE TO FSC_PATH_SPEC_LENGTH%
+            PROC ReadPathSpecFromScratch
+        ENDIF
+        PROC SelectCanonicalCandidate
+    ENDIF
+    IF LEN(FSC_CANDIDATE$) > 4095 THEN PROC RaiseFileSwitchError(2, "canonical candidate exceeds 4095 bytes")
+    PROC WriteString(FSC_SCRATCH_BASE, FSC_CANDIDATE$)
+    FSC_CANONICAL_ADDRESS = FSC_SCRATCH_BASE
+    PRIMITIVE Host.FileSwitch.CanonicalPathLength, FSC_CANONICAL_ADDRESS TO FSC_CANONICAL_LENGTH%
+    FSC_FITS% = 0
+    PRIMITIVE Host.FileSwitch.CanonicalCapacityFits, R5%, FSC_CANONICAL_LENGTH% TO FSC_FITS%
+    IF FSC_FITS% <> 0 THEN PRIMITIVE Host.FileSwitch.WriteCanonicalPath, FSC_CANONICAL_ADDRESS, R2%, FSC_CANONICAL_LENGTH%
+    PRIMITIVE Host.FileSwitch.CanonicalSpareBytes, R5%, FSC_CANONICAL_LENGTH% TO R5%
+    PRIMITIVE Host.Memory.ReleaseCommandScratch, FSC_SCRATCH_ID%
+ENDPROC
+
+DEF PROC ReadPathSpecFromScratch
+    FSC_PATH_SPEC$ = ""
+    FOR FSC_SPEC_INDEX% = 0 TO FSC_PATH_SPEC_LENGTH% - 1
+        FSC_SPEC_BYTE% = ?(FSC_SCRATCH_BASE + FSC_SPEC_INDEX%)
+        FSC_PATH_SPEC$ = FSC_PATH_SPEC$ + CHR$(FSC_SPEC_BYTE%)
+    NEXT
+ENDPROC
+
+DEF PROC SelectCanonicalCandidate THROWS FileSwitchError
+    FSC_LIST_REMAINING$ = FSC_PATH_SPEC$
+    FSC_LIST_INDEX% = 0
+    FSC_PATH_FOUND_OBJECT% = 0
+    FSC_FINAL_CANDIDATE$ = ""
+    FSC_DONE% = 0
+    REPEAT
+        FSC_COMMA% = INSTR(FSC_LIST_REMAINING$, ",")
+        FSC_PREFIX$ = FSC_LIST_REMAINING$
+        IF FSC_COMMA% <> 0 THEN
+            FSC_PREFIX$ = LEFT$(FSC_LIST_REMAINING$, FSC_COMMA% - 1)
+            FSC_LIST_REMAINING$ = MID$(FSC_LIST_REMAINING$, FSC_COMMA% + 1)
+        ENDIF
+        IF FSC_COMMA% = 0 THEN FSC_DONE% = 1
+        PROC TrimPathPrefix
+        IF FSC_LIST_INDEX% >= 16 THEN PROC RaiseFileSwitchError(3, "path list exceeds 16 candidates")
+        IF FSC_PREFIX$ <> "" AND RIGHT$(FSC_PREFIX$, 1) <> "." AND RIGHT$(FSC_PREFIX$, 1) <> ":" THEN PROC RaiseFileSwitchError(4, "path prefix must end in dot or colon")
+        FSC_CANDIDATE$ = FSC_PREFIX$ + FSC_PATH$
+        IF LEN(FSC_CANDIDATE$) > 4095 THEN PROC RaiseFileSwitchError(5, "canonical candidate exceeds 4095 bytes")
+        PROC WriteString(FSC_SCRATCH_BASE, FSC_CANDIDATE$)
+        FSC_CANDIDATE_ADDRESS = FSC_SCRATCH_BASE
+        PRIMITIVE Host.FileSwitch.CanonicalPathExists, FSC_CANDIDATE_ADDRESS TO FSC_CANDIDATE_EXISTS%
+        FSC_FINAL_CANDIDATE$ = FSC_CANDIDATE$
+        IF FSC_CANDIDATE_EXISTS% <> 0 THEN
+            FSC_PATH_FOUND_OBJECT% = 1
+            FSC_DONE% = 1
+        ENDIF
+        FSC_LIST_INDEX% = FSC_LIST_INDEX% + 1
+    UNTIL FSC_DONE% <> 0
+    FSC_CANDIDATE$ = FSC_FINAL_CANDIDATE$
+ENDPROC
+
+DEF PROC TrimPathPrefix
+    FSC_TRIM_START% = 1
+    FSC_TRIM_END% = LEN(FSC_PREFIX$)
+    REPEAT
+        IF FSC_TRIM_START% <= FSC_TRIM_END% THEN
+            FSC_TRIM_BYTE% = ASC(MID$(FSC_PREFIX$, FSC_TRIM_START%, 1))
+            IF FSC_TRIM_BYTE% = 32 THEN FSC_TRIM_START% = FSC_TRIM_START% + 1
+        ENDIF
+    UNTIL FSC_TRIM_START% > FSC_TRIM_END% OR FSC_TRIM_BYTE% <> 32
+    REPEAT
+        IF FSC_TRIM_END% >= FSC_TRIM_START% THEN
+            FSC_TRIM_BYTE% = ASC(MID$(FSC_PREFIX$, FSC_TRIM_END%, 1))
+            IF FSC_TRIM_BYTE% = 32 THEN FSC_TRIM_END% = FSC_TRIM_END% - 1
+        ENDIF
+    UNTIL FSC_TRIM_END% < FSC_TRIM_START% OR FSC_TRIM_BYTE% <> 32
+    FSC_PREFIX$ = MID$(FSC_PREFIX$, FSC_TRIM_START%, FSC_TRIM_END% - FSC_TRIM_START% + 1)
+ENDPROC
+
+DEF PROC SetTemporaryFromPrefix THROWS FileSwitchError
+    PRIMITIVE Host.FileSwitch.SetTemporaryFromPrefix, R1% TO FSC_NEXT_PATH%, FSC_OLD_FILESYSTEM%, FSC_SPECIAL_FIELD%
+    R1% = FSC_NEXT_PATH%
+    R2% = FSC_OLD_FILESYSTEM%
+    R3% = FSC_SPECIAL_FIELD%
+ENDPROC
+
+DEF PROC RaiseFileSwitchError(code%, message$) THROWS FileSwitchError
+    THROW FileSwitchError, code%, message$
+ENDPROC
+
+DEF PROC CatalogueService THROWS FileSwitchError
+    FSC_DIRECTORY_KIND% = 0
+    IF FSC_REASON% = 7 OR FSC_REASON% = 8 THEN FSC_DIRECTORY_KIND% = 1
+    FSC_CATALOGUE_SCRATCH_ID% = 0
+    FSC_PATTERN_SCRATCH_ID% = 0
+    PRIMITIVE Host.Memory.AcquireCommandScratch TO FSC_CATALOGUE_SCRATCH_ID%, FSC_CATALOGUE_SCRATCH_BASE
+    PRIMITIVE Host.Memory.AcquireCommandScratch TO FSC_PATTERN_SCRATCH_ID%, FSC_PATTERN_SCRATCH_BASE
+    PRIMITIVE Host.FileSwitch.ReadPathName, R1%, FSC_CATALOGUE_SCRATCH_BASE TO FSC_PATH_LENGTH%
+    IF FSC_REASON% = 9 AND FSC_PATH_LENGTH% = 0 THEN PROC RaiseFileSwitchError(3, "object pattern is required")
+    FSC_DIRECTORY$ = ""
+    FOR FSC_PATH_INDEX% = 0 TO FSC_PATH_LENGTH% - 1
+        FSC_DIRECTORY$ = FSC_DIRECTORY$ + CHR$(?(FSC_CATALOGUE_SCRATCH_BASE + FSC_PATH_INDEX%))
+    NEXT
+    IF FSC_DIRECTORY$ = "" THEN FSC_DIRECTORY$ = "@"
+    IF (FSC_REASON% = 7 OR FSC_REASON% = 8) AND FSC_PATH_LENGTH% = 0 THEN FSC_DIRECTORY$ = "%"
+    IF (FSC_REASON% = 7 OR FSC_REASON% = 8) AND FSC_PATH_LENGTH% > 0 AND INSTR(FSC_DIRECTORY$, ":") = 0 AND LEFT$(FSC_DIRECTORY$, 1) <> "%" THEN FSC_DIRECTORY$ = "%." + FSC_DIRECTORY$
+    IF FSC_REASON% = 9 THEN PROC SplitCatalogueWildcard
+    IF FSC_REASON% <> 9 THEN
+        PROC WriteString(FSC_CATALOGUE_SCRATCH_BASE, FSC_DIRECTORY$)
+        PROC WriteString(FSC_PATTERN_SCRATCH_BASE, "*")
+        PRIMITIVE Host.FileSwitch.OpenCatalogueSnapshot, FSC_CATALOGUE_SCRATCH_BASE, FSC_PATTERN_SCRATCH_BASE TO FSC_SNAPSHOT%, FSC_ENTRY_COUNT%
+    ENDIF
+    FSC_TITLE_LENGTH% = 0
+    IF FSC_REASON% <> 9 THEN PRIMITIVE Host.FileSwitch.CanonicalPathLength, FSC_CATALOGUE_SCRATCH_BASE TO FSC_TITLE_LENGTH%
+    FOR FSC_INDEX% = 0 TO FSC_TITLE_LENGTH% - 1
+        PRIMITIVE Host.FileSwitch.CanonicalPathByte, FSC_CATALOGUE_SCRATCH_BASE, FSC_INDEX% TO FSC_BYTE%
+        SYS "OS_WriteC", FSC_BYTE%
+    NEXT
+    SYS "OS_NewLine"
+    FOR FSC_ENTRY% = 0 TO FSC_ENTRY_COUNT% - 1
+        PRIMITIVE Host.FileChannel.ReadDirectoryEntry, FSC_SNAPSHOT%, FSC_ENTRY% TO FSC_NAME_LENGTH%, FSC_OBJECT_TYPE%
+        IF FSC_REASON% = 5 OR FSC_REASON% = 7 OR FSC_REASON% = 9 THEN
+            PROC PrintDirectoryName
+        ENDIF
+        IF FSC_REASON% = 6 OR FSC_REASON% = 8 THEN
+            PROC PrintDirectoryInformation
+        ENDIF
+        SYS "OS_NewLine"
+    NEXT
+    PRIMITIVE Host.Memory.ReleaseCommandScratch, FSC_PATTERN_SCRATCH_ID%
+    IF FSC_CATALOGUE_SCRATCH_ID% <> 0 THEN PRIMITIVE Host.Memory.ReleaseCommandScratch, FSC_CATALOGUE_SCRATCH_ID%
+ENDPROC
+
+DEF PROC SplitCatalogueWildcard THROWS FileSwitchError
+    FSC_PATTERN_SOURCE$ = FSC_DIRECTORY$
+    FSC_PATTERN_DOT% = 0
+    FOR FSC_PATTERN_SCAN% = 1 TO LEN(FSC_PATTERN_SOURCE$)
+        IF MID$(FSC_PATTERN_SOURCE$, FSC_PATTERN_SCAN%, 1) = "." THEN FSC_PATTERN_DOT% = FSC_PATTERN_SCAN%
+    NEXT
+    FSC_WILDCARD$ = FSC_PATTERN_SOURCE$
+    FSC_DIRECTORY$ = "@"
+    IF FSC_PATTERN_DOT% <> 0 THEN
+        FSC_WILDCARD$ = MID$(FSC_PATTERN_SOURCE$, FSC_PATTERN_DOT% + 1)
+        FSC_DIRECTORY$ = LEFT$(FSC_PATTERN_SOURCE$, FSC_PATTERN_DOT% - 1)
+        IF FSC_DIRECTORY$ = "" THEN FSC_DIRECTORY$ = "@"
+    ENDIF
+    PROC WriteString(FSC_CATALOGUE_SCRATCH_BASE, FSC_DIRECTORY$)
+    PROC WriteString(FSC_PATTERN_SCRATCH_BASE, FSC_WILDCARD$)
+    PRIMITIVE Host.FileSwitch.OpenCatalogueSnapshot, FSC_CATALOGUE_SCRATCH_BASE, FSC_PATTERN_SCRATCH_BASE TO FSC_SNAPSHOT%, FSC_ENTRY_COUNT%
+ENDPROC
+
+DEF PROC WriteString(address AS ADDRESS32, text$ AS STRING)
+    FOR FSC_WRITE_INDEX% = 1 TO LEN(text$)
+        ?address = ASC(MID$(text$, FSC_WRITE_INDEX%, 1))
+        address = address + 1
+    NEXT
+    ?address = 0
+ENDPROC
+
+DEF PROC PrintDirectoryName
+    FOR FSC_NAME_INDEX% = 0 TO FSC_NAME_LENGTH% - 1
+        PRIMITIVE Host.FileChannel.ReadDirectoryNameByte, FSC_SNAPSHOT%, FSC_ENTRY%, FSC_NAME_INDEX% TO FSC_BYTE%
+        SYS "OS_WriteC", FSC_BYTE%
+    NEXT
+ENDPROC
+
+DEF PROC PrintDirectoryInformation
+    PROC PrintDirectoryName
+    FSC_PADDING% = 10 - FSC_NAME_LENGTH%
+    IF FSC_PADDING% < 1 THEN FSC_PADDING% = 1
+    FOR FSC_SPACE% = 1 TO FSC_PADDING%
+        SYS "OS_WriteC", 32
+    NEXT
+    FSC_LENGTH% = 0
+    FOR FSC_BYTE_INDEX% = 0 TO 3
+        PRIMITIVE Host.FileChannel.ReadDirectoryFieldByte, FSC_SNAPSHOT%, FSC_ENTRY%, 2, FSC_BYTE_INDEX% TO FSC_BYTE%
+        FSC_LENGTH% = FSC_LENGTH% + FSC_BYTE% * (256 ^ FSC_BYTE_INDEX%)
+    NEXT
+    PRINT RIGHT$("        " + STR$(FSC_LENGTH%), 8);
+    IF FSC_OBJECT_TYPE% = 2 THEN
+        PRINT " <DIR>";
+    ENDIF
+    IF FSC_OBJECT_TYPE% <> 2 THEN
+        PRINT "      ";
+    ENDIF
+ENDPROC
+
+DEF PROC FileService
+    FILE_REASON% = R0% AND &FF
+    IF FILE_REASON% = 0 OR FILE_REASON% = 10 THEN PROC FileSave
+    IF FILE_REASON% = 1 OR FILE_REASON% = 2 OR FILE_REASON% = 3 OR FILE_REASON% = 4 OR FILE_REASON% = 9 OR FILE_REASON% = 18 THEN PROC FileUpdateMetadata
+    IF FILE_REASON% = 5 OR FILE_REASON% = 13 OR FILE_REASON% = 15 OR FILE_REASON% = 17 THEN PROC FileCatalogue
+    IF FILE_REASON% = 6 THEN PROC FileDelete
+    IF FILE_REASON% = 7 OR FILE_REASON% = 11 THEN PROC FileCreateEmpty
+    IF FILE_REASON% = 8 THEN PRIMITIVE Host.FileObject.CreateDirectory, R1%
+    IF FILE_REASON% = 12 OR FILE_REASON% = 14 OR FILE_REASON% = 16 OR FILE_REASON% = 255 THEN PROC FileLoad
+    IF FILE_REASON% > 18 AND FILE_REASON% <> 255 THEN PRIMITIVE Host.Runtime.UnsupportedServiceReason, &08, FILE_REASON%
+ENDPROC
+
+DEF PROC FileSave
+    FILE_START% = R4%
+    FILE_END% = R5%
+    IF FILE_END% < FILE_START% THEN PRIMITIVE Host.FileObject.InvalidSaveRange
+    FILE_LENGTH% = FILE_END% - FILE_START%
+    IF FILE_REASON% = 0 THEN PRIMITIVE Host.FileObject.SaveBlock, R1%, FILE_START%, FILE_LENGTH%, R2%, R3%, &FFF, 0
+    IF FILE_REASON% = 10 THEN PRIMITIVE Host.FileObject.SaveBlock, R1%, FILE_START%, FILE_LENGTH%, 0, 0, R2% AND &FFF, 0
+ENDPROC
+
+DEF PROC FileUpdateMetadata
+    FILE_FIELD% = 0
+    FILE_VALUE% = 0
+    IF FILE_REASON% = 1 THEN
+        FILE_FIELD% = 7
+        FILE_VALUE% = R2%
+        PRIMITIVE Host.FileObject.SetMetadata, R1%, FILE_FIELD%, FILE_VALUE%, R3%, 0, R5%
+    ENDIF
+    IF FILE_REASON% = 2 THEN PRIMITIVE Host.FileObject.SetMetadata, R1%, 1, R2%, 0, 0, 0
+    IF FILE_REASON% = 3 THEN PRIMITIVE Host.FileObject.SetMetadata, R1%, 2, 0, R3%, 0, 0
+    IF FILE_REASON% = 4 THEN PRIMITIVE Host.FileObject.SetMetadata, R1%, 4, 0, 0, 0, R5%
+    IF FILE_REASON% = 9 THEN PRIMITIVE Host.FileObject.SetMetadata, R1%, 16, 0, 0, &FFD, 0
+    IF FILE_REASON% = 18 THEN PRIMITIVE Host.FileObject.SetMetadata, R1%, 8, 0, 0, R2% AND &FFF, 0
+ENDPROC
+
+DEF PROC FileCatalogue
+    PROC FilePathSource
+    FILE_PATH_INDEX% = 0
+    FILE_PATH_DONE% = 0
+    REPEAT
+        PRIMITIVE Host.FileObject.CatalogueCandidate, FILE_PATH_SOURCE%, R1%, R4%, FILE_PATH_INDEX% TO FILE_HAS_CANDIDATE%, FILE_OBJECT%, FILE_LOAD%, FILE_EXEC%, FILE_LENGTH%, FILE_ATTRIBUTES%
+        IF FILE_HAS_CANDIDATE% = 0 THEN FILE_PATH_DONE% = 1
+        IF FILE_OBJECT% <> 0 THEN FILE_PATH_DONE% = 1
+        IF FILE_PATH_DONE% = 0 THEN FILE_PATH_INDEX% = FILE_PATH_INDEX% + 1
+    UNTIL FILE_PATH_DONE% <> 0 OR FILE_PATH_INDEX% >= 16
+    R0% = FILE_OBJECT%
+    IF FILE_OBJECT% <> 0 THEN
+        R2% = FILE_LOAD%
+        R3% = FILE_EXEC%
+        R4% = FILE_LENGTH%
+        R5% = FILE_ATTRIBUTES%
+    ENDIF
+ENDPROC
+
+DEF PROC FileDelete
+    PRIMITIVE Host.FileObject.Catalogue, R1% TO FILE_OBJECT%, FILE_LOAD%, FILE_EXEC%, FILE_LENGTH%, FILE_ATTRIBUTES%
+    R0% = FILE_OBJECT%
+    IF FILE_OBJECT% = 1 THEN PRIMITIVE Host.FileObject.DeleteFile, R1%
+    IF FILE_OBJECT% = 2 THEN PRIMITIVE Host.FileObject.DeleteDirectory, R1%
+    IF FILE_OBJECT% <> 0 THEN
+        R2% = FILE_LOAD%
+        R3% = FILE_EXEC%
+        R4% = FILE_LENGTH%
+        R5% = FILE_ATTRIBUTES%
+    ENDIF
+ENDPROC
+
+DEF PROC FileCreateEmpty
+    IF FILE_REASON% = 7 THEN PRIMITIVE Host.FileObject.CreateEmpty, R1%, R2%, R3%, &FFF, 0
+    IF FILE_REASON% = 11 THEN PRIMITIVE Host.FileObject.CreateEmpty, R1%, 0, 0, R2% AND &FFF, 0
+ENDPROC
+
+DEF PROC FileLoad
+    PROC FilePathSource
+    FILE_PATH_INDEX% = 0
+    FILE_PATH_DONE% = 0
+    FILE_FORCE_CATALOGUE% = 0
+    IF (R3% AND &FF) <> 0 THEN FILE_FORCE_CATALOGUE% = 1
+    REPEAT
+        PRIMITIVE Host.FileObject.CatalogueCandidate, FILE_PATH_SOURCE%, R1%, R4%, FILE_PATH_INDEX% TO FILE_HAS_CANDIDATE%, FILE_OBJECT%, FILE_LOAD%, FILE_EXEC%, FILE_LENGTH%, FILE_ATTRIBUTES%
+        IF FILE_HAS_CANDIDATE% = 0 THEN FILE_PATH_DONE% = 1
+        IF FILE_OBJECT% <> 0 THEN FILE_PATH_DONE% = 1
+        IF FILE_PATH_DONE% = 0 THEN FILE_PATH_INDEX% = FILE_PATH_INDEX% + 1
+    UNTIL FILE_PATH_DONE% <> 0 OR FILE_PATH_INDEX% >= 16
+    IF FILE_OBJECT% = 0 THEN PRIMITIVE Host.FileObject.SearchPathNotFound
+    PRIMITIVE Host.FileObject.LoadCandidate, FILE_PATH_SOURCE%, R1%, R4%, FILE_PATH_INDEX%, R2%, FILE_FORCE_CATALOGUE% TO FILE_LOAD%, FILE_EXEC%, FILE_LENGTH%, FILE_ATTRIBUTES%
+    R0% = 1
+    R2% = FILE_LOAD%
+    R3% = FILE_EXEC%
+    R4% = FILE_LENGTH%
+    R5% = FILE_ATTRIBUTES%
+ENDPROC
+
+DEF PROC FilePathSource
+    FILE_PATH_SOURCE% = 0
+    IF FILE_REASON% = 5 OR FILE_REASON% = 255 THEN FILE_PATH_SOURCE% = 1
+    IF FILE_REASON% = 12 OR FILE_REASON% = 13 THEN FILE_PATH_SOURCE% = 2
+    IF FILE_REASON% = 14 OR FILE_REASON% = 15 THEN FILE_PATH_SOURCE% = 3
+ENDPROC
+
+DEF PROC BulkTransferService
+    GBPB_REASON% = R0% AND &FF
+    IF GBPB_REASON% >= 1 AND GBPB_REASON% <= 4 THEN PROC BulkFileTransfer
+    IF GBPB_REASON% >= 5 AND GBPB_REASON% <= 7 THEN PROC BulkFixedName
+    IF GBPB_REASON% >= 8 AND GBPB_REASON% <= 10 THEN PROC BulkDirectory
+    IF GBPB_REASON% < 1 OR GBPB_REASON% > 10 THEN
+        PRIMITIVE Host.Runtime.UnsupportedServiceReason, &0C, GBPB_REASON%
+    ENDIF
+ENDPROC
+
+DEF PROC BulkFileTransfer
+    GBPB_HANDLE% = R1%
+    GBPB_BUFFER% = R2%
+    GBPB_REQUESTED% = R3%
+    GBPB_EXPLICIT% = 0
+    IF GBPB_REASON% = 1 OR GBPB_REASON% = 3 THEN GBPB_EXPLICIT% = 1
+    PRIMITIVE Host.FileChannel.ValidateTransferSpan, GBPB_BUFFER%, GBPB_REQUESTED%
+    GBPB_WRITING% = 0
+    IF GBPB_REASON% = 1 OR GBPB_REASON% = 2 THEN GBPB_WRITING% = 1
+    IF GBPB_EXPLICIT% = 0 THEN
+        PRIMITIVE Host.FileChannel.ReadPosition, GBPB_HANDLE% TO GBPB_START%
+    ENDIF
+    IF GBPB_EXPLICIT% <> 0 THEN
+        PRIMITIVE Host.FileChannel.ValidateTransferRangeRaw, GBPB_HANDLE%, R4%, GBPB_REQUESTED%, GBPB_WRITING% TO GBPB_PAST_EOF%, GBPB_END%
+    ENDIF
+    IF GBPB_EXPLICIT% = 0 THEN
+        PRIMITIVE Host.FileChannel.ValidateTransferRange, GBPB_HANDLE%, GBPB_START%, GBPB_REQUESTED%, GBPB_WRITING% TO GBPB_PAST_EOF%, GBPB_END%
+    ENDIF
+    IF GBPB_REASON% = 3 AND GBPB_PAST_EOF% <> 0 THEN
+        R3% = GBPB_REQUESTED%
+        PRIMITIVE Host.FileChannel.ReadTransfer, GBPB_HANDLE%, GBPB_BUFFER%, 0 TO GBPB_TRANSFERRED%
+        CARRY% = 0
+        IF R3% <> 0 THEN CARRY% = 1
+    ENDIF
+    IF GBPB_REASON% <> 3 OR GBPB_PAST_EOF% = 0 THEN
+        IF GBPB_REASON% = 1 OR GBPB_REASON% = 3 THEN
+            PRIMITIVE Host.FileChannel.SetPosition, GBPB_HANDLE%, R4%
+        ENDIF
+        IF GBPB_WRITING% <> 0 THEN
+            PRIMITIVE Host.FileChannel.WriteTransfer, GBPB_HANDLE%, GBPB_BUFFER%, GBPB_REQUESTED%
+            GBPB_TRANSFERRED% = GBPB_REQUESTED%
+        ENDIF
+        IF GBPB_WRITING% = 0 THEN
+            PRIMITIVE Host.FileChannel.ReadTransfer, GBPB_HANDLE%, GBPB_BUFFER%, GBPB_REQUESTED% TO GBPB_TRANSFERRED%
+            IF GBPB_EXPLICIT% <> 0 THEN
+                PRIMITIVE Host.FileChannel.ValidateTransferRangeRaw, GBPB_HANDLE%, R4%, GBPB_TRANSFERRED%, GBPB_WRITING% TO GBPB_PAST_EOF%, GBPB_END%
+            ENDIF
+            IF GBPB_EXPLICIT% = 0 THEN
+                PRIMITIVE Host.FileChannel.ValidateTransferRange, GBPB_HANDLE%, GBPB_START%, GBPB_TRANSFERRED%, GBPB_WRITING% TO GBPB_PAST_EOF%, GBPB_END%
+            ENDIF
+        ENDIF
+        R2% = GBPB_BUFFER% + GBPB_TRANSFERRED%
+        IF GBPB_WRITING% <> 0 THEN R3% = 0
+        IF GBPB_WRITING% = 0 THEN R3% = GBPB_REQUESTED% - GBPB_TRANSFERRED%
+        R4% = GBPB_END%
+        CARRY% = 0
+        IF GBPB_WRITING% = 0 AND R3% <> 0 THEN CARRY% = 1
+    ENDIF
+    R0% = GBPB_REASON%
+    R1% = GBPB_HANDLE%
+ENDPROC
+
+DEF PROC BulkFixedName
+    GBPB_NAME_KIND% = GBPB_REASON% - 5
+    PRIMITIVE Host.FileChannel.FixedNameLength, GBPB_NAME_KIND% TO GBPB_NAME_LENGTH%
+    IF GBPB_REASON% = 5 THEN GBPB_RECORD_LENGTH% = GBPB_NAME_LENGTH% + 2
+    IF GBPB_REASON% = 6 OR GBPB_REASON% = 7 THEN GBPB_RECORD_LENGTH% = GBPB_NAME_LENGTH% + 3
+    PRIMITIVE Host.FileChannel.ValidateTransferSpan, R2%, GBPB_RECORD_LENGTH%
+    GBPB_OUT% = R2%
+    IF GBPB_REASON% = 5 THEN
+        PRIMITIVE Host.FileChannel.WriteCallerByte, GBPB_OUT%, GBPB_NAME_LENGTH%
+        GBPB_OUT% = GBPB_OUT% + 1
+    ENDIF
+    IF GBPB_REASON% = 6 OR GBPB_REASON% = 7 THEN
+        PRIMITIVE Host.FileChannel.WriteCallerByte, GBPB_OUT%, 0
+        GBPB_OUT% = GBPB_OUT% + 1
+        PRIMITIVE Host.FileChannel.WriteCallerByte, GBPB_OUT%, GBPB_NAME_LENGTH%
+        GBPB_OUT% = GBPB_OUT% + 1
+    ENDIF
+    FOR GBPB_BYTE% = 0 TO GBPB_NAME_LENGTH% - 1
+        PRIMITIVE Host.FileChannel.FixedNameByte, GBPB_NAME_KIND%, GBPB_BYTE% TO GBPB_VALUE%
+        PRIMITIVE Host.FileChannel.WriteCallerByte, GBPB_OUT%, GBPB_VALUE%
+        GBPB_OUT% = GBPB_OUT% + 1
+    NEXT
+    PRIMITIVE Host.FileChannel.WriteCallerByte, GBPB_OUT%, 0
+    IF GBPB_REASON% = 5 THEN GBPB_OUT% = GBPB_OUT% + 1
+    IF GBPB_REASON% = 6 OR GBPB_REASON% = 7 THEN
+        GBPB_OUT% = GBPB_OUT% + 1
+    ENDIF
+    CARRY% = 0
+ENDPROC
+
+DEF PROC BulkDirectory
+    GBPB_REQUESTED% = R3%
+    GBPB_CAPACITY% = R5%
+    GBPB_BUFFER% = R2%
+    GBPB_START_REQUEST% = R4%
+    GBPB_PATH% = R1%
+    GBPB_WILDCARD% = R6%
+    IF GBPB_REASON% = 8 THEN
+        GBPB_PATH% = 0
+        GBPB_WILDCARD% = 0
+    ENDIF
+    IF GBPB_REASON% = 10 THEN PRIMITIVE Host.FileChannel.ValidateDirectoryInfoAddress, R2%
+    PRIMITIVE Host.FileChannel.OpenDirectorySnapshot, GBPB_PATH%, GBPB_WILDCARD% TO GBPB_SNAPSHOT%, GBPB_TOTAL%
+    PRIMITIVE Host.FileChannel.NormalizeDirectoryStart, GBPB_SNAPSHOT%, GBPB_START_REQUEST% TO GBPB_START%
+    GBPB_AVAILABLE% = GBPB_TOTAL% - GBPB_START%
+    GBPB_LIMIT% = GBPB_REQUESTED%
+    IF GBPB_LIMIT% < 0 THEN GBPB_LIMIT% = GBPB_AVAILABLE%
+    IF GBPB_LIMIT% > GBPB_AVAILABLE% THEN GBPB_LIMIT% = GBPB_AVAILABLE%
+    GBPB_WRITE_COUNT% = 0
+    GBPB_STAGED% = 0
+    GBPB_STOP_PLAN% = 0
+    FOR GBPB_RELATIVE% = 0 TO GBPB_LIMIT% - 1
+        GBPB_INDEX% = GBPB_START% + GBPB_RELATIVE%
+        PRIMITIVE Host.FileChannel.ReadDirectoryEntry, GBPB_SNAPSHOT%, GBPB_INDEX% TO GBPB_NAME_LENGTH%, GBPB_OBJECT_TYPE%
+        GBPB_RECORD_SIZE% = GBPB_NAME_LENGTH% + 1
+        IF GBPB_REASON% = 8 THEN GBPB_RECORD_SIZE% = GBPB_NAME_LENGTH% + 1
+        IF GBPB_REASON% = 9 THEN GBPB_RECORD_SIZE% = GBPB_NAME_LENGTH% + 1
+        IF GBPB_REASON% = 10 THEN GBPB_RECORD_SIZE% = ((GBPB_NAME_LENGTH% + 24) DIV 4) * 4
+        IF GBPB_REASON% = 8 THEN
+            GBPB_FITS% = 1
+        ENDIF
+        IF GBPB_REASON% <> 8 THEN
+            GBPB_FITS% = 0
+            IF GBPB_CAPACITY% < 0 THEN GBPB_FITS% = 1
+            IF GBPB_CAPACITY% >= 0 AND GBPB_STAGED% + GBPB_RECORD_SIZE% <= GBPB_CAPACITY% THEN GBPB_FITS% = 1
+        ENDIF
+        IF GBPB_STOP_PLAN% = 0 AND GBPB_FITS% <> 0 THEN
+            GBPB_STAGED% = GBPB_STAGED% + GBPB_RECORD_SIZE%
+            GBPB_WRITE_COUNT% = GBPB_WRITE_COUNT% + 1
+        ENDIF
+        IF GBPB_FITS% = 0 THEN GBPB_STOP_PLAN% = 1
+    NEXT
+    PRIMITIVE Host.FileChannel.ValidateTransferSpan, R2%, GBPB_STAGED%
+    GBPB_OUT% = R2%
+    FOR GBPB_RELATIVE% = 0 TO GBPB_WRITE_COUNT% - 1
+        GBPB_INDEX% = GBPB_START% + GBPB_RELATIVE%
+        PRIMITIVE Host.FileChannel.ReadDirectoryEntry, GBPB_SNAPSHOT%, GBPB_INDEX% TO GBPB_NAME_LENGTH%, GBPB_OBJECT_TYPE%
+        IF GBPB_REASON% = 8 THEN
+            PRIMITIVE Host.FileChannel.WriteCallerByte, GBPB_OUT%, GBPB_NAME_LENGTH%
+            GBPB_OUT% = GBPB_OUT% + 1
+            GBPB_TERMINATE% = 0
+            PROC WriteDirectoryName
+        ENDIF
+        IF GBPB_REASON% = 9 THEN
+            GBPB_TERMINATE% = 1
+            PROC WriteDirectoryName
+        ENDIF
+        IF GBPB_REASON% = 10 THEN PROC WriteInfoRecord
+    NEXT
+    IF GBPB_REASON% = 8 THEN
+        R3% = GBPB_REQUESTED% - GBPB_WRITE_COUNT%
+        IF GBPB_START% + GBPB_WRITE_COUNT% >= GBPB_TOTAL% THEN R4% = -1
+        IF GBPB_START% + GBPB_WRITE_COUNT% < GBPB_TOTAL% THEN R4% = GBPB_START% + GBPB_WRITE_COUNT%
+        CARRY% = 0
+        IF R3% <> 0 THEN CARRY% = 1
+    ENDIF
+    IF GBPB_REASON% <> 8 THEN
+        R3% = GBPB_WRITE_COUNT%
+        IF GBPB_START% + GBPB_WRITE_COUNT% >= GBPB_TOTAL% THEN R4% = -1
+        IF GBPB_START% + GBPB_WRITE_COUNT% < GBPB_TOTAL% THEN R4% = GBPB_START% + GBPB_WRITE_COUNT%
+        CARRY% = 0
+        IF R3% <> 0 THEN CARRY% = 1
+    ENDIF
+ENDPROC
+
+DEF PROC WriteInfoRecord
+    FOR GBPB_FIELD% = 0 TO 4
+        FOR GBPB_BYTE% = 0 TO 3
+            PRIMITIVE Host.FileChannel.ReadDirectoryFieldByte, GBPB_SNAPSHOT%, GBPB_INDEX%, GBPB_FIELD%, GBPB_BYTE% TO GBPB_VALUE%
+            PRIMITIVE Host.FileChannel.WriteCallerByte, GBPB_OUT%, GBPB_VALUE%
+            GBPB_OUT% = GBPB_OUT% + 1
+        NEXT
+    NEXT
+    GBPB_TERMINATE% = 1
+    PROC WriteDirectoryName
+    GBPB_VALUE% = 0
+    GBPB_PAD_DONE% = 0
+    REPEAT
+        IF GBPB_OUT% MOD 4 = 0 THEN GBPB_PAD_DONE% = 1
+        IF GBPB_OUT% MOD 4 <> 0 THEN GBPB_PAD_DONE% = 0
+        IF GBPB_PAD_DONE% = 0 THEN
+        PRIMITIVE Host.FileChannel.WriteCallerByte, GBPB_OUT%, GBPB_VALUE%
+        GBPB_OUT% = GBPB_OUT% + 1
+        ENDIF
+    UNTIL GBPB_PAD_DONE% <> 0
+ENDPROC
+
+DEF PROC WriteDirectoryName
+    FOR GBPB_BYTE% = 0 TO GBPB_NAME_LENGTH% - 1
+        PRIMITIVE Host.FileChannel.ReadDirectoryNameByte, GBPB_SNAPSHOT%, GBPB_INDEX%, GBPB_BYTE% TO GBPB_VALUE%
+        PRIMITIVE Host.FileChannel.WriteCallerByte, GBPB_OUT%, GBPB_VALUE%
+        GBPB_OUT% = GBPB_OUT% + 1
+    NEXT
+    IF GBPB_TERMINATE% <> 0 THEN
+        PRIMITIVE Host.FileChannel.WriteCallerByte, GBPB_OUT%, 0
+        GBPB_OUT% = GBPB_OUT% + 1
+    ENDIF
+ENDPROC
+
+DEF PROC FindService THROWS FileSwitchError
+    FIND_REASON% = R0% AND &FF
+    IF FIND_REASON% = 0 THEN
+        PRIMITIVE Host.FileChannel.Close, R1%
+    ENDIF
+    IF FIND_REASON% <> 0 THEN
+        FIND_MODE% = FIND_REASON% AND &C0
+        IF FIND_MODE% <> &40 AND FIND_MODE% <> &80 AND FIND_MODE% <> &C0 THEN
+            PRIMITIVE Host.Runtime.UnsupportedServiceReason, &0D, FIND_REASON%
+        ENDIF
+        IF FIND_REASON% AND &30 THEN PRIMITIVE Host.Runtime.UnsupportedServiceReason, &0D, FIND_REASON%
+        IF FIND_REASON% AND &03 THEN PRIMITIVE Host.Runtime.UnsupportedServiceReason, &0D, FIND_REASON%
+        IF FIND_MODE% = &40 THEN OPEN_MODE% = 0
+        IF FIND_MODE% = &80 THEN OPEN_MODE% = 1
+        IF FIND_MODE% = &C0 THEN OPEN_MODE% = 2
+        OPEN_PATH% = R1%
+        PRIMITIVE Host.FileChannel.Open, OPEN_PATH%, OPEN_MODE% TO OPEN_HANDLE%, OPEN_MISSING%
+        R1% = OPEN_PATH%
+        R0% = OPEN_HANDLE%
+        IF OPEN_MISSING% <> 0 THEN R0% = 0
+        IF OPEN_MISSING% <> 0 AND (FIND_REASON% AND 8) <> 0 THEN
+            THROW FileSwitchError, 1, "file not found"
+        ENDIF
+    ENDIF
+ENDPROC
+
+DEF PROC ByteGetService
+    GET_HANDLE% = R1%
+    PRIMITIVE Host.FileChannel.ReadByte, GET_HANDLE% TO GET_BYTE%, GET_EOF%
+    CARRY% = 0
+    IF GET_EOF% <> 0 THEN CARRY% = 1
+    IF GET_EOF% = 0 THEN R0% = GET_BYTE%
+ENDPROC
+
+DEF PROC BytePutService
+    PRIMITIVE Host.FileChannel.WriteByte, R1%, R0% AND &FF
+ENDPROC
+
+DEF PROC ArgsService
+    ARGS_REASON% = R0%
+    ARGS_HANDLE% = R1%
+    IF ARGS_REASON% = 0 AND ARGS_HANDLE% = 0 THEN R0% = 1
+    IF ARGS_REASON% = 0 AND ARGS_HANDLE% <> 0 THEN
+            PRIMITIVE Host.FileChannel.ReadPosition, ARGS_HANDLE% TO ARGS_VALUE%
+            R2% = ARGS_VALUE%
+    ENDIF
+    IF ARGS_REASON% = 1 THEN PRIMITIVE Host.FileChannel.SetPosition, ARGS_HANDLE%, R2%
+    IF ARGS_REASON% = 2 OR ARGS_REASON% = 4 THEN
+        PRIMITIVE Host.FileChannel.ReadExtent, ARGS_HANDLE% TO ARGS_VALUE%
+        R2% = ARGS_VALUE%
+    ENDIF
+    IF ARGS_REASON% = 3 THEN PRIMITIVE Host.FileChannel.SetExtent, ARGS_HANDLE%, R2%
+    IF ARGS_REASON% = 5 THEN
+        PRIMITIVE Host.FileChannel.ReadPosition, ARGS_HANDLE% TO ARGS_POSITION%
+        PRIMITIVE Host.FileChannel.ReadExtent, ARGS_HANDLE% TO ARGS_EXTENT%
+        R2% = 0
+        IF ARGS_POSITION% >= ARGS_EXTENT% THEN R2% = 1
+    ENDIF
+    IF ARGS_REASON% = 7 THEN
+        PRIMITIVE Host.FileChannel.CanonicalNameLength, ARGS_HANDLE% TO ARGS_LENGTH%
+        ARGS_CAPACITY = R5%
+        IF ARGS_CAPACITY > ARGS_LENGTH% THEN PRIMITIVE Host.FileChannel.WriteCanonicalName, ARGS_HANDLE%, R2%
+        PRIMITIVE Host.FileChannel.Args7SpareBytes, ARGS_CAPACITY, ARGS_LENGTH% TO R5%
+    ENDIF
+    IF ARGS_REASON% <> 0 AND ARGS_REASON% <> 1 AND ARGS_REASON% <> 2 AND ARGS_REASON% <> 3 AND ARGS_REASON% <> 4 AND ARGS_REASON% <> 5 AND ARGS_REASON% <> 7 THEN
+        PRIMITIVE Host.Runtime.UnsupportedServiceReason, &09, ARGS_REASON%
+    ENDIF
+    IF ARGS_REASON% <> 0 OR ARGS_HANDLE% <> 0 THEN R0% = ARGS_REASON%
+    R1% = ARGS_HANDLE%
+ENDPROC

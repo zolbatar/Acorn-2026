@@ -13,11 +13,11 @@ This project was also inspired by [pmirvine/risc-os](https://github.com/pmirvine
 
 ## Project status
 
-The hosted Rust MOS prompt is available in one graphics-capable window: `HELP` displays help and returns to `*`, `DESKTOP` starts the BASIC64 desktop, and `QUIT` exits. The desktop shows the mounted HostFS volume and opens a BASIC64 Filer for browsing and launching programs. `cargo run -- --desktop-demo` remains a separate two-window Wimp test. The window manager and desktop services implement a documented first subset, not full RISC OS redraw or task scheduling; see the design brief for its boundaries. UTF-8 `.bas64` and `.bas` source and decoded `.bbc` programs use one parser output and compatibility execution engine; the optional Cranelift JIT consumes the same representation. `REM @BASIC64 MODE=HYBRID TARGET=AGON` selects the Agon graphics mode table at runtime. `BASICLOAD` accepts two observed tokenized saved-program record layouts and preserves their token bytes. `BASICRUN` supports the string echo fixture, a narrow shared-boundary legacy core, ClockSP5 program version 5.08, and the source-derived full Mandelbrot listing through its selected 32-bit extended mode and `ColourTrans` path. These fixtures exercise specific compatibility slices; they do not establish broad BBC BASIC V/VI compatibility or full Agon VDP emulation. See the [tokenized BASIC compatibility matrix](docs/tokenized-basic-compatibility.md) for evidence and gaps.
+The hosted Rust MOS prompt is available in one graphics-capable window: `HELP` displays help and returns to `*`, `DESKTOP` starts the BASIC64 desktop, and `QUIT` exits. The desktop shows the mounted HostFS volume and opens a BASIC64 Filer for browsing and launching programs. `cargo run -- --desktop-demo` remains a separate two-window Wimp test. The window manager and desktop services implement a documented first subset, not full RISC OS redraw or task scheduling; see the design brief for its boundaries. UTF-8 `.bas64` and `.bas` source and decoded `.bbc` programs use one parser output and compatibility execution engine; the optional Cranelift JIT consumes the same representation. `REM @BASIC64 MODE=HYBRID TARGET=AGON` selects the Agon graphics mode table at runtime. Tokenized saved-program decoding accepts two observed record layouts and preserves token bytes; decoded `.bbc` files run directly through `BASIC` or `RUN`. The supported fixtures cover a string echo, a narrow shared-boundary legacy core, ClockSP5 program version 5.08, and the source-derived full Mandelbrot listing through its selected 32-bit extended mode and `ColourTrans` path. These fixtures exercise specific compatibility slices; they do not establish broad BBC BASIC V/VI compatibility or full Agon VDP emulation. See the [tokenized BASIC compatibility matrix](docs/tokenized-basic-compatibility.md) for evidence and gaps.
 
 ## Agon demo
 
-The only Agon demo included is [`AgonTREE.bbc`](demo-volume/AgonTREE.bbc). Its HostFS guest name is `TREE` on the default `DemoDisk` volume, and its embedded `REM @BASIC64` directive selects `TARGET=AGON`. Load it from the MOS prompt with `BASICLOAD HostFS::DemoDisk.$.TREE`, then enter `BASICRUN`. The hosted Agon profile supplies its graphics mode table, but does not emulate the full Agon VDP or firmware.
+The only Agon demo included is [`AgonTREE.bbc`](demo-volume/AgonTREE.bbc). Its HostFS guest name is `TREE` on the default `DemoDisk` volume, and its embedded `REM @BASIC64` directive selects `TARGET=AGON`. Run it from the MOS prompt with `BASIC HostFS::DemoDisk.$.TREE`. The hosted Agon profile supplies its graphics mode table, but does not emulate the full Agon VDP or firmware.
 
 ## Start here
 
@@ -69,7 +69,7 @@ accepts `Auto` or a profile name; `BASICTarget` accepts `Auto`, `Hosted`,
 `CONFIGURE DEFAULTS` to restore the interpreter and automatic mode, profile,
 and target choices.
 
-The settings apply to `BASIC <file>`, `RUN <file>`, `BASICRUN`, and BASIC
+The settings apply to `BASIC <file>`, `RUN <file>`, `BASIC64 <file>`, and BASIC
 programs launched in the desktop. A program's `REM @BASIC64` fields override
 the matching saved mode, target, or profile; the saved engine preference stays
 in effect. Settings are read again for each run, so they apply to the next
@@ -170,8 +170,7 @@ This produces a separate 800 × 600 P6 PPM sheet; the desktop does not add a gue
 To see text and plotted pixels together, enter:
 
 ```text
-BASICLOAD examples/graphics/text-and-pixels.bbc
-BASICRUN
+BASIC examples/graphics/text-and-pixels.bbc
 ```
 
 The program selects MODE 1, prints two lines, and plots a red plus below the text. See [`examples/graphics`](examples/graphics) for source and fixture details.
@@ -179,8 +178,7 @@ The program selects MODE 1, prints two lines, and plots a red plus below the tex
 To run the full 1680 × 1050 Mandelbrot listing in the windowed app, enter:
 
 ```text
-BASICLOAD examples/mandelbrot/mandelbrot.bbc
-BASICRUN
+BASIC examples/mandelbrot/mandelbrot.bbc
 ```
 
 The program can take a while because it is interpreted and allows up to 8192 iterations per pixel. Press a key after it finishes to return to the prompt. Its source-derived tokenized file can be regenerated with `python3 tools/tokenize_full_mandelbrot.py`.
@@ -188,8 +186,7 @@ The program can take a while because it is interpreted and allows up to 8192 ite
 For a faster 640 × 256 example, enter:
 
 ```text
-BASICLOAD examples/mandelbrot/reduced.bbc
-BASICRUN
+BASIC examples/mandelbrot/reduced.bbc
 ```
 
 The reduced image appears progressively with display snapshots capped at about 60 Hz. See [`examples/mandelbrot`](examples/mandelbrot) for source, generation, and compatibility details.
@@ -202,18 +199,18 @@ RUN examples/echo.bas64
 
 The program asks for a line with `? ` and prints the entered string. UTF-8 source uses `.bas64`, `.bas`, `.txt`, or `.asc`; all four extensions enter the same execution engine. Tokenized saved programs use `.bbc`.
 
-To run source directly through the JIT, start with `cargo run-jit` and pass a
-source or tokenized file to `BASICJIT`, for example:
+To run a program through the Hybrid JIT, start with `cargo run-jit`, select the
+engine, then use the ordinary file-running command:
 
 ```text
-BASICJIT examples/mandelbrot/reduced.bas
+CONFIGURE BASICEngine Hybrid
+BASIC examples/mandelbrot/reduced.bas
 ```
 
 To run the small tokenised BASIC echo fixture, enter:
 
 ```text
-BASICLOAD examples/basicv-echo/echo.bbc
-BASICRUN
+BASIC examples/basicv-echo/echo.bbc
 ```
 
 Type a line when the program shows `? `; it prints that line back and returns to the MOS prompt.
@@ -221,8 +218,7 @@ Type a line when the program shows `? `; it prints that line back and returns to
 To run the shared-boundary legacy smoke fixture, enter:
 
 ```text
-BASICLOAD examples/tokenized-compat/classic-core-smoke.bbc
-BASICRUN
+BASIC examples/tokenized-compat/classic-core-smoke.bbc
 ```
 
 It prints `LEGACY` and returns to `*`. This project-generated fixture validates a deliberately small profile for leading `REM`, literal-string `PRINT`, and `END`; it is not a saved program from a named historical ROM.
@@ -230,8 +226,7 @@ It prints `LEGACY` and returns to `*`. This project-generated fixture validates 
 To run ClockSP5, enter:
 
 ```text
-BASICLOAD examples/clocksp5/ClockSP5.bbc
-BASICRUN
+BASIC examples/clocksp5/ClockSP5.bbc
 ```
 
 It runs three workload passes, printing the benchmark sections and comparison each time, then returns to `*`. In this hosted profile, `TIME` is monotonic centiseconds and `INKEY` reads queued host keys; with no key pending, bare `INKEY` returns -256 and `INKEY(0)` returns -1. ClockSP5 follows its guarded path when no key is pending, skipping native ARM and hardware setup. Its final hardware reset command is accepted as a no-op. The displayed MHz figures compare this hosted BASIC interpreter's performance against the program's BBC B reference data; they do not measure the host processor's physical clock speed.
@@ -244,16 +239,18 @@ From the repository root, start the Cranelift-enabled runtime:
 cargo run-jit
 ```
 
-At the MOS prompt, run either checked-in form with benchmark validation:
+At the MOS prompt, configure Strict and run either checked-in form through the
+normal launch route:
 
 ```text
-BASICJIT STRICT --benchmark-validation examples/clocksp5/ClockSP5.bas
-BASICJIT STRICT --benchmark-validation examples/clocksp5/ClockSP5.bbc
+CONFIGURE BASICEngine Strict
+BASIC examples/clocksp5/ClockSP5.bas
+BASIC examples/clocksp5/ClockSP5.bbc
 ```
 
 Strict mode compiles the whole program before execution and reports zero
-interpreter statement and expression counts. Benchmark-validation mode keeps
-ClockSP5's measured loops and empty procedure calls. The hosted MHz figures are
+interpreter statement and expression counts. The public MOS command surface
+does not expose the test-only benchmark-validation option. The hosted MHz figures are
 the program's comparison against its BBC B reference data; they are not a
 physical host clock reading or a strict-JIT speedup claim. See the
 [`ClockSP5 run plan`](docs/clocksp5-run-plan.md) for coverage and limits.
@@ -275,39 +272,37 @@ From the repository root, start the optimized UI with Cranelift support:
 cargo run-jit
 ```
 
-Then load either demo and enter `BASICJIT`:
+Then select Hybrid and run either demo through `BASIC`:
 
 ```text
-BASICLOAD examples/mandelbrot/reduced.bbc
-BASICJIT
+CONFIGURE BASICEngine Hybrid
+BASIC examples/mandelbrot/reduced.bbc
 ```
 
 To try the source-derived full-size listing instead:
 
 ```text
-BASICLOAD examples/mandelbrot/mandelbrot.bbc
-BASICJIT
+BASIC examples/mandelbrot/mandelbrot.bbc
 ```
 
 It can take substantially longer because it plots 1680 × 1050 points with a
 higher iteration cap.
 
 ```text
-BASICLOAD examples/clocksp5/ClockSP5.bbc
-BASICJIT
+BASIC examples/clocksp5/ClockSP5.bbc
 ```
 
-`BASICJIT` compiles the full listing's verified Mandelbrot raster loop and
+The Hybrid engine compiles the full listing's verified Mandelbrot raster loop and
 iteration math into one Cranelift frame kernel. Per-pixel ColourTrans and
 `OS_Plot` effects go through checked runtime services. Mode setup and the final
 key wait remain interpreted. The reduced fixture uses its verified iteration
 kernel, and ClockSP5 uses its verified nested integer `REPEAT` region.
-`BASICJIT` selects a one-run engine override. With default preferences,
-`BASICRUN` remains the interpreter reference. The summary reports compiled
+The selected engine is persistent until changed with `CONFIGURE`; select
+`Interpreter` for the reference path. The summary reports compiled
 calls, rendered pixels where applicable, and elapsed native-region time; this
 is a kernel measurement, not a whole-program speedup. Use the windowed UI to
 see Mandelbrot. In stdio mode, the same MOS command works with
 `cargo run-jit -- --stdio`. In
-windowed mode, `BASICJIT` progress, timing, and runtime errors go to the host
+windowed mode, JIT progress, timing, and runtime errors go to the host
 application's stderr console, keeping the graphics display clear. BASIC
 program output continues to use the emulated display.

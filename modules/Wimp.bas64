@@ -1,0 +1,206 @@
+REM @BASIC64 MODE=BASIC64
+REM @SYSTEM_PROFILE 0.1
+REM @MODULE Wimp 1.0.0
+REM @CAPABILITY WimpTaskLifecycle
+REM @CAPABILITY WimpWindowState
+REM @CAPABILITY RuntimeErrors
+REM @IMPORT Host.Wimp.ValidateInitialiseInputs WimpTaskLifecycle
+REM @IMPORT Host.Wimp.RegisterTask WimpTaskLifecycle
+REM @IMPORT Host.Wimp.CloseTask WimpTaskLifecycle
+REM @IMPORT Host.Wimp.ReadStartTaskByte WimpTaskLifecycle
+REM @IMPORT Host.Wimp.QueueCommandsTask WimpTaskLifecycle
+REM @IMPORT Host.Wimp.QueueBasicWindowTask WimpTaskLifecycle
+REM @IMPORT Host.Wimp.QueueBasicFileTask WimpTaskLifecycle
+REM @IMPORT Host.Wimp.OpenWindow WimpWindowState
+REM @IMPORT Host.Wimp.CloseWindow WimpWindowState
+REM @IMPORT Host.Wimp.ReadWindowState WimpWindowState
+REM @IMPORT Host.Wimp.SetExtent WimpWindowState
+REM @IMPORT Host.Runtime.UnsupportedServiceReason RuntimeErrors
+REM @SWI Wimp_Initialise &400C0 InitialiseService REGISTERS=R0:U32:INOUT|R1:U32:INOUT|R2:ADDRESS32:IN|R3:ADDRESS32:IN;BLOCKING=FALSE;REENTRANT=FALSE;ERROR=WimpLifecycleError
+REM @SWI Wimp_CloseDown &400DD CloseDownService REGISTERS=R0:U32:INOUT|R1:U32:IN;BLOCKING=FALSE;REENTRANT=FALSE;ERROR=WimpLifecycleError
+REM @SWI Wimp_StartTask &400DE StartTaskService REGISTERS=R0:ADDRESS32:INOUT;BLOCKING=FALSE;REENTRANT=FALSE;ERROR=WimpLifecycleError
+REM @SWI Wimp_OpenWindow &400C5 OpenWindowService REGISTERS=R0:U32:INOUT|R1:ADDRESS32:IN;MEMORY=R1:READ:32;BLOCKING=FALSE;REENTRANT=FALSE;ERROR=WimpWindowError
+REM @SWI Wimp_CloseWindow &400C6 CloseWindowService REGISTERS=R0:U32:INOUT|R1:ADDRESS32:IN;MEMORY=R1:READ:4;BLOCKING=FALSE;REENTRANT=FALSE;ERROR=WimpWindowError
+REM @SWI Wimp_GetWindowState &400CB GetWindowStateService REGISTERS=R0:U32:INOUT|R1:ADDRESS32:INOUT;MEMORY=R1:READWRITE:36;BLOCKING=FALSE;REENTRANT=FALSE;ERROR=WimpWindowError
+REM @SWI Wimp_SetExtent &400D7 SetExtentService REGISTERS=R0:U32:INOUT|R1:ADDRESS32:IN;MEMORY=R1:READ:16;BLOCKING=FALSE;REENTRANT=FALSE;ERROR=WimpWindowError
+
+ERROR WimpLifecycleError
+    Code AS UINT32 READONLY
+    Message AS STRING READONLY
+END ERROR
+
+ERROR WimpWindowError
+    Code AS UINT32 READONLY
+    Message AS STRING READONLY
+END ERROR
+
+DEF PROC OpenWindowService THROWS WimpWindowError
+    OPEN_HANDLE% = !R1%
+    OPEN_MIN_X% = !(R1% + 4)
+    OPEN_MIN_Y% = !(R1% + 8)
+    OPEN_MAX_X% = !(R1% + 12)
+    OPEN_MAX_Y% = !(R1% + 16)
+    OPEN_SCROLL_X% = !(R1% + 20)
+    OPEN_SCROLL_Y% = !(R1% + 24)
+    OPEN_BEHIND% = !(R1% + 28)
+    IF OPEN_BEHIND% <> -1 AND OPEN_BEHIND% <> -2 AND OPEN_BEHIND% <= 0 THEN THROW WimpWindowError, 1, "Wimp_OpenWindow stack position is unsupported"
+    PRIMITIVE Host.Wimp.OpenWindow, OPEN_HANDLE%, OPEN_MIN_X%, OPEN_MIN_Y%, OPEN_MAX_X%, OPEN_MAX_Y%, OPEN_SCROLL_X%, OPEN_SCROLL_Y%, OPEN_BEHIND%
+ENDPROC
+
+DEF PROC CloseWindowService THROWS WimpWindowError
+    CLOSE_HANDLE% = !R1%
+    PRIMITIVE Host.Wimp.CloseWindow, CLOSE_HANDLE%
+ENDPROC
+
+DEF PROC GetWindowStateService THROWS WimpWindowError
+    STATE_HANDLE% = !R1%
+    PRIMITIVE Host.Wimp.ReadWindowState, STATE_HANDLE% TO STATE_MIN_X%, STATE_MIN_Y%, STATE_MAX_X%, STATE_MAX_Y%, STATE_SCROLL_X%, STATE_SCROLL_Y%, STATE_FRONT%, STATE_FLAGS%
+    !R1% = STATE_HANDLE%
+    !(R1% + 4) = STATE_MIN_X%
+    !(R1% + 8) = STATE_MIN_Y%
+    !(R1% + 12) = STATE_MAX_X%
+    !(R1% + 16) = STATE_MAX_Y%
+    !(R1% + 20) = STATE_SCROLL_X%
+    !(R1% + 24) = STATE_SCROLL_Y%
+    !(R1% + 28) = STATE_FRONT%
+    !(R1% + 32) = STATE_FLAGS%
+ENDPROC
+
+DEF PROC SetExtentService THROWS WimpWindowError
+    EXTENT_MIN_X% = !R1%
+    EXTENT_MIN_Y% = !(R1% + 4)
+    EXTENT_MAX_X% = !(R1% + 8)
+    EXTENT_MAX_Y% = !(R1% + 12)
+    PRIMITIVE Host.Wimp.SetExtent, R0%, EXTENT_MIN_X%, EXTENT_MIN_Y%, EXTENT_MAX_X%, EXTENT_MAX_Y%
+    R0% = 0
+ENDPROC
+
+DEF PROC InitialiseService THROWS WimpLifecycleError
+    IF R0% <> 200 AND R0% <> 300 AND R0% <> 310 THEN THROW WimpLifecycleError, 1, "Wimp_Initialise version must be 200, 300 or 310"
+    IF R1% <> &4B534154 THEN THROW WimpLifecycleError, 2, "Wimp_Initialise R1 must contain 'TASK'"
+    PRIMITIVE Host.Wimp.ValidateInitialiseInputs, R0%, R2%, R3%
+    PRIMITIVE Host.Wimp.RegisterTask TO WIMP_VERSION%, WIMP_TASK_HANDLE%
+    R0% = WIMP_VERSION%
+    R1% = WIMP_TASK_HANDLE%
+ENDPROC
+
+DEF PROC CloseDownService THROWS WimpLifecycleError
+    IF R1% <> &4B534154 THEN THROW WimpLifecycleError, 3, "Wimp_CloseDown R1 must contain 'TASK'"
+    PRIMITIVE Host.Wimp.CloseTask, R0%
+    R0% = 0
+ENDPROC
+
+DEF PROC StartTaskService THROWS WimpLifecycleError
+    START_COMMAND_ADDRESS% = R0%
+    START_SCAN% = 0
+    START_BYTE% = 0
+    START_TERMINATED% = 0
+    START_SCAN_COUNT% = 0
+    START_DONE% = 0
+    REPEAT
+        PRIMITIVE Host.Wimp.ReadStartTaskByte, START_COMMAND_ADDRESS%, START_SCAN% TO START_BYTE%
+        IF START_BYTE% = 0 THEN START_TERMINATED% = 1
+        IF START_TERMINATED% = 0 AND START_BYTE% <> 32 AND START_BYTE% <> 9 THEN START_DONE% = 1
+        IF START_TERMINATED% = 0 AND START_DONE% = 0 THEN
+            START_SCAN% = START_SCAN% + 1
+            START_SCAN_COUNT% = START_SCAN_COUNT% + 1
+        ENDIF
+    UNTIL START_TERMINATED% <> 0 OR START_DONE% <> 0 OR START_SCAN_COUNT% >= 256
+    IF START_TERMINATED% <> 0 OR START_SCAN_COUNT% >= 256 THEN THROW WimpLifecycleError, 4, "Wimp_StartTask command is empty or too long"
+    IF START_BYTE% = 42 THEN
+        START_SCAN% = START_SCAN% + 1
+        START_SCAN_COUNT% = START_SCAN_COUNT% + 1
+    ENDIF
+    START_VERB$ = ""
+    START_VERB_LENGTH% = 0
+    START_DELIMITER% = 0
+    START_DONE% = 0
+    REPEAT
+        PRIMITIVE Host.Wimp.ReadStartTaskByte, START_COMMAND_ADDRESS%, START_SCAN% TO START_BYTE%
+        IF START_BYTE% = 0 THEN START_TERMINATED% = 1
+        IF START_TERMINATED% = 0 AND (START_BYTE% = 32 OR START_BYTE% = 9) THEN START_DELIMITER% = 1
+        IF START_TERMINATED% = 0 AND START_DELIMITER% = 0 THEN
+            IF START_VERB_LENGTH% >= 16 THEN THROW WimpLifecycleError, 5, "Wimp_StartTask command verb is too long"
+            START_NORMALIZED_BYTE% = START_BYTE%
+            IF START_NORMALIZED_BYTE% >= 97 AND START_NORMALIZED_BYTE% <= 122 THEN START_NORMALIZED_BYTE% = START_NORMALIZED_BYTE% - 32
+            START_VERB$ = START_VERB$ + CHR$(START_NORMALIZED_BYTE%)
+            START_VERB_LENGTH% = START_VERB_LENGTH% + 1
+            START_SCAN% = START_SCAN% + 1
+            START_SCAN_COUNT% = START_SCAN_COUNT% + 1
+        ENDIF
+    UNTIL START_TERMINATED% <> 0 OR START_DELIMITER% <> 0 OR START_SCAN_COUNT% >= 256
+    IF START_SCAN_COUNT% >= 256 THEN THROW WimpLifecycleError, 6, "Wimp_StartTask command is too long"
+    IF START_DELIMITER% <> 0 THEN
+        START_DONE% = 0
+        REPEAT
+            PRIMITIVE Host.Wimp.ReadStartTaskByte, START_COMMAND_ADDRESS%, START_SCAN% TO START_BYTE%
+            IF START_BYTE% = 0 THEN START_TERMINATED% = 1
+            IF START_TERMINATED% = 0 AND START_BYTE% <> 32 AND START_BYTE% <> 9 THEN START_DONE% = 1
+            IF START_TERMINATED% = 0 AND START_DONE% = 0 THEN
+                START_SCAN% = START_SCAN% + 1
+                START_SCAN_COUNT% = START_SCAN_COUNT% + 1
+            ENDIF
+        UNTIL START_TERMINATED% <> 0 OR START_DONE% <> 0 OR START_SCAN_COUNT% >= 256
+    ENDIF
+    IF START_VERB$ = "COMMANDS" THEN
+        IF START_TERMINATED% = 0 THEN THROW WimpLifecycleError, 7, "Commands takes no argument"
+        PRIMITIVE Host.Wimp.QueueCommandsTask TO R0%
+    ENDIF
+    IF START_VERB$ = "BASIC" AND START_TERMINATED% <> 0 THEN PRIMITIVE Host.Wimp.QueueBasicWindowTask TO R0%
+    IF START_VERB$ = "BASIC" AND START_TERMINATED% = 0 THEN PROC QueueBasicFile
+    IF START_VERB$ <> "COMMANDS" AND START_VERB$ <> "BASIC" THEN THROW WimpLifecycleError, 8, "Wimp_StartTask supports Commands, BASIC, or BASIC <guest-path>"
+ENDPROC
+
+DEF PROC QueueBasicFile THROWS WimpLifecycleError
+    START_PATH_OFFSET% = START_SCAN%
+    START_PATH_LENGTH% = 0
+    START_QUOTE% = 0
+    IF START_BYTE% = 34 OR START_BYTE% = 39 THEN
+        START_QUOTE% = START_BYTE%
+        START_PATH_OFFSET% = START_PATH_OFFSET% + 1
+        START_SCAN% = START_SCAN% + 1
+        START_SCAN_COUNT% = START_SCAN_COUNT% + 1
+        START_CLOSED_QUOTE% = 0
+        START_DONE% = 0
+        REPEAT
+            PRIMITIVE Host.Wimp.ReadStartTaskByte, START_COMMAND_ADDRESS%, START_SCAN% TO START_BYTE%
+            IF START_BYTE% = START_QUOTE% THEN
+                START_CLOSED_QUOTE% = 1
+                START_DONE% = 1
+            ENDIF
+            IF START_BYTE% = 0 THEN START_DONE% = 1
+            IF START_DONE% = 0 THEN
+                START_PATH_LENGTH% = START_PATH_LENGTH% + 1
+                START_SCAN% = START_SCAN% + 1
+                START_SCAN_COUNT% = START_SCAN_COUNT% + 1
+            ENDIF
+        UNTIL START_DONE% <> 0 OR START_SCAN_COUNT% >= 256
+        IF START_CLOSED_QUOTE% = 0 THEN THROW WimpLifecycleError, 9, "Wimp_StartTask path quote is not terminated"
+        START_SCAN% = START_SCAN% + 1
+        START_SCAN_COUNT% = START_SCAN_COUNT% + 1
+        REPEAT
+            PRIMITIVE Host.Wimp.ReadStartTaskByte, START_COMMAND_ADDRESS%, START_SCAN% TO START_BYTE%
+            IF START_BYTE% = 0 THEN START_TERMINATED% = 1
+            IF START_TERMINATED% = 0 AND START_BYTE% <> 32 AND START_BYTE% <> 9 THEN THROW WimpLifecycleError, 10, "Wimp_StartTask has unexpected text after its path"
+            IF START_TERMINATED% = 0 THEN START_SCAN% = START_SCAN% + 1
+            START_SCAN_COUNT% = START_SCAN_COUNT% + 1
+        UNTIL START_TERMINATED% <> 0 OR START_SCAN_COUNT% >= 256
+    ENDIF
+    IF START_QUOTE% = 0 THEN
+        START_PATH_OFFSET% = START_SCAN%
+        START_LAST_NONSPACE% = 0
+        REPEAT
+            PRIMITIVE Host.Wimp.ReadStartTaskByte, START_COMMAND_ADDRESS%, START_SCAN% TO START_BYTE%
+            IF START_BYTE% = 0 THEN START_TERMINATED% = 1
+            IF START_TERMINATED% = 0 THEN
+                START_PATH_LENGTH% = START_PATH_LENGTH% + 1
+                IF START_BYTE% <> 32 AND START_BYTE% <> 9 THEN START_LAST_NONSPACE% = START_PATH_LENGTH%
+                START_SCAN% = START_SCAN% + 1
+                START_SCAN_COUNT% = START_SCAN_COUNT% + 1
+            ENDIF
+        UNTIL START_TERMINATED% <> 0 OR START_SCAN_COUNT% >= 256
+        START_PATH_LENGTH% = START_LAST_NONSPACE%
+    ENDIF
+    IF START_TERMINATED% = 0 OR START_PATH_LENGTH% = 0 OR START_PATH_LENGTH% > 255 THEN THROW WimpLifecycleError, 11, "Wimp_StartTask path is empty, unterminated, or too long"
+    PRIMITIVE Host.Wimp.QueueBasicFileTask, START_COMMAND_ADDRESS%, START_PATH_OFFSET%, START_PATH_LENGTH% TO R0%
+ENDPROC

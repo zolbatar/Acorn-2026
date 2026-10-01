@@ -14,14 +14,15 @@ and bootstrap boundary described here are firm design decisions. The complete
 live-system experience, language extensions, persistence model, optimisation
 strategy, and desktop projections remain staged design work.
 
-### Implementation checkpoint — 2026-09-30, Phases 0–4 plus partial WP5.1/WP5.3
+### Implementation checkpoint — 2026-10-01, Phases 0–4 plus partial WP5.1/WP5.3/WP5.4/WP5.5/WP5.6
 
 The initial Console SWIs (`OS_ReadLine`, `OS_WriteC`, `OS_WriteS`, `OS_Write0`,
 `OS_NewLine`, and `OS_ReadC`) remain versioned entry cells implemented by
 interpreted definitions in `modules/Console.bas64`. Phase 4 assembles a
 deterministic v1 boot capsule from the visible source and canonical manifests
-for eight foundation/command modules: System, ModuleManager, Error, TaskManager,
-Memory, Console, RicochetCommands, and Boot. The executable has no hand-maintained capsule
+for fifteen foundation/command modules: System, ModuleManager, Error,
+TaskManager, Memory, Console, RicochetCommands, Boot, Mos, FileSwitch,
+Graphics, ColourTrans, DesktopServices, DisplayManager, and Wimp. The executable has no hand-maintained capsule
 archive: `include_str!` rebuilds its source inputs and `--write-boot-capsule`
 emits the same validated bytes on demand. Integrity uses CRC-32 for corruption
 detection, not cryptographic authentication; embedded sources are the trust
@@ -44,11 +45,117 @@ handoff definitions. `System.bas64` alone imports those protected settings and
 handoff primitives. `Runtime::run` only consumes the selected request; it does
 not interpret the saved language value. `RicochetCommands.bas64` owns OS_CLI
 (`&05`) dispatch plus read-only `*INSPECT`, the supported classic module
-commands, `*CONFIGURE`, and `*STATUS`. It owns configuration
-setting/default/value policy and output formatting, calling checked persistence
-mechanisms; remaining MOS commands, including the explicit `DESKTOP` command,
-still use the narrow transitional Rust legacy adapter and host handoff
-mechanism.
+commands, `*CONFIGURE`, `*STATUS`, and module-owned `*HELP`. A live registry of
+`@COMMAND` descriptors is the sole command inventory for execution and Help.
+Transitional Rust command semantics are reachable only through explicit,
+closed-allowlist bridge rows in `RicochetCommands`; a registry miss is a
+BASIC64 `Bad command`, never a catch-all Rust fallback. Registry order is
+alphabetic by case-folded module title, then source declaration order.
+Execution selects the first exact or final-dot prefix match; Help displays all
+matches for a prefix. Module publication, replacement and removal update rows
+atomically with the owning module. Help follows RISC OS topics (`Commands`,
+`FileCommands`, `Modules`, and `Syntax`), streams output without a terminal
+pager, and reports actual versions without inventing dates or addresses.
+Configuration policy remains in BASIC64, with checked persistence as a host
+mechanism. `FileSwitch.bas64` owns bounded `OS_File` reasons 0–12, 16–18, and
+255, `OS_Find`, `OS_BGet`, `OS_BPut`, `OS_Args`, `OS_GBPB` reasons 1–10, and
+bounded `OS_FSControl` reasons.
+Its OS_File routing selects File$Path, R4 path-list, path-variable, or direct
+search by reason and iterates candidates in BASIC64. Rust provides bounded
+runtime-variable/path-string retrieval, checked candidate construction and
+guest-sandbox lookup/load mechanisms, task-local channels, catalogue snapshots,
+transfers, and checked caller buffers. String/LiteralString variables only are
+supported; Run$Path, macro expansion, wildcards, and general path search remain
+deferred. OS_FSControl owns bounded reasons 0, 1, 5–9, 11, 13, 14, 18, 19, 22,
+25, 31, 33, 37, 39, 40, 43–45, and 50. Reason 11 reports the supported
+temporary HostFS selection and prior selector; unsupported special fields fail
+atomically. Reason 37 supports bounded R3 path-variable and R4 ordered path-list
+lookup with qualified-path bypass; general GSTrans/macros remain unsupported.
+Reasons 7/8 use one library-relative effective path for title and entries.
+Reason 50 changes the shared HostFS volume label. Other FileSwitch reasons, native BASIC file statements,
+and full compatibility remain deferred, so WP5.4 is still incomplete.
+
+The partial WP5.5 graphics ownership slice adds `Graphics.bas64` to the
+foundation capsule. It owns public `OS_Plot` (`&45`) plot-byte/coordinate
+adaptation and `OS_ReadPoint` (`&32`) profile/result policy. Protected raster
+mechanisms resolve the original caller's active Wimp redraw context or bounded
+task-default raster and retain the CPU-authoritative plot plus
+display-event/batch publication path. The
+existing VDU byte-stream parser, raster algorithms, and renderer remain Rust
+mechanisms; indexed-colour fidelity and full plot-code compatibility remain
+open. `ColourTrans.bas64` also owns the existing three name-only ColourTrans
+services without inventing numeric SWI identities. It implements the hosted
+HSV conversion and SetGCOL policy over the same caller-raster mechanism;
+WritePalette remains an explicit no-op. Native numeric ColourTrans ABI and
+palette mutation remain unsupported. This is not completion of WP5.5 or Phase 5.
+
+The same command module now owns the bounded guest system-variable policy:
+`*SET <name> [value]`, `*SHOW [pattern]`, and `*UNSET <pattern>` use the
+module-owned `OS_ReadVarVal` (`&23`) and `OS_SetVarVal` (`&24`) exports. Rust
+provides one runtime-scoped store and checked logical-memory/context
+mechanisms. Type 0 immediately expands exact `<name>` references, outer and
+doubled quotes, and the printable escapes `|<`, `|>`, `||`, `|"`; type 4
+remains raw. Substituted bytes are not rescanned. Numeric angle operands,
+wildcards in references, control-code escapes, malformed syntax, and missing
+variables fail before mutation. The PRM source documents this substitution
+and escape behavior; the hosted subset does not expose an `OS_GSTrans`
+register contract. Values are guest-owned, session-local, and never imported
+from the host process environment. Names are visible ASCII up to 32 bytes,
+values and expanded results are UTF-8 up to 256 bytes, and the store is bounded
+to 128 entries and 32 KiB aggregate data. Lookups are case-insensitive and
+preserve the first display spelling; enumeration order is deterministic. The
+bounded `*`/`#` wildcard matcher allows SET only if exactly one existing
+variable matches, while UNSET removes all matches. `OS_ReadVarVal` uses checked
+caller-owned strings/buffers and task-owned dynamic name/context areas; errors
+release the matching continuation context. Variable mutation has its own
+`SystemVariableWrite` Task right, deliberately granted to the trusted
+interactive MOS Task and separate from configuration, source-read, and
+module-management rights. Ordinary tasks can read this guest store but cannot
+read host environment variables. The initial `*OBEY <guest-path>` subset is
+also available through the active command registry. BASIC64 owns line
+classification and dispatch; bounded Rust primitives read checked guest files
+and maintain task-local nested source frames. It supports LF, CRLF, and CR,
+blank lines, `|` comments after leading spaces/tabs, and a final line without a
+terminator. It stops on the first command error and reports guest path and line;
+prior command effects are retained. QUIT unwinds without reading later lines.
+The hosted limits are 65,536 bytes across active sources, 255 bytes per command
+line, 4,096 physical lines per nested session, and eight active nested sources.
+This is a deliberate hosted subset, not full PRM Obey compatibility. It
+supports bounded one-pass `%0`–`%9`, `%*n`, and `%%` substitution in BASIC64:
+arguments are separated by spaces outside double quotes, quote spelling is
+preserved, missing arguments become empty strings, and `%*n` preserves the raw
+suffix from argument n. Unmatched quotes and incomplete `%*` forms fail before
+that line is dispatched; expanded commands over 255 UTF-8 bytes fail without
+truncation. While a script frame is active, task-local read-only `Obey$Dir` is
+exposed through OS_ReadVarVal and type-0 expansion. It contains the stable
+resolved guest parent path (not a host path), shadows any stored value only
+during the active frame, and restores naturally across nesting, errors, and
+QUIT. This intentionally differs from PRM's invocation-text parent fragment.
+Bounded `Alias$<command>` variables are checked before the registry, and a
+leading `%` bypasses alias lookup once. Existing String and LiteralString
+variables are accepted; aliases can shadow commands, use final-dot unique
+prefixes, and recursively expand one command with `%0`–`%9`, `%*n`, and `%%`.
+The hosted cap is eight alias expansions, 255 UTF-8 bytes per expanded line,
+and 2,048 cumulative expansion bytes. These are static string aliases, not
+native Type-2 macro variables; command chaining, redirection, pipelines and
+general GSTrans remain unsupported. `*SHOW Alias$*` inspects live values and
+`*HELP ALIASES` explains the feature; aliases are not registry entries and do
+not add caller rights. PRM `-v`/`-c`, general command substitution, and
+automatic filetype or `!Boot` execution remain deferred. Bounded `*EXEC`
+installs one task-scoped guest input source consumed through `OS_ReadC`,
+`OS_ReadLine`, and BASIC input; it replaces atomically, bare `*EXEC` closes,
+and EOF returns reads to the queued/host stream. The source is preflighted as
+UTF-8 text, limited to 65,536 bytes, 255 bytes per line, and 4,096 lines, and
+does not expose native `OS_Byte 198` handle control. See the Exec audit.
+
+`Mos.bas64` owns public `OS_Byte` (`&06`) and `OS_Word` (`&07`) reason
+selection for the hosted subset. It calls narrowly typed input, clock, and
+checked five-byte caller-memory primitives; Rust no longer has numeric
+fallback implementations for these SWIs. Supported byte reasons are 21
+(`X=0`), 129 (`Y<128`), and 138 (`X=0`); supported word reasons 1-4 read or
+write the system/interval 40-bit clocks. Other selectors fail explicitly.
+`*FX` routes its numeric form through the same public `OS_Byte` dispatch.
+This is not native hardware/timer compatibility and does not add reason 198.
 
 Configuration-file recovery is a separate post-foundation path, not native
 capsule recovery. The typed store bounds reads at 64 KiB and classifies
@@ -82,7 +189,8 @@ commands and full configuration resets. The renderer has one flat
 appearance, and `WindowFurnitureLayout` is only a geometry/hit-test type.
 
 The Phase 4 foundation was the original seven-module set; the current capsule
-adds `RicochetCommands` as the first bounded WP5.3 command module. Console owns the six
+adds `RicochetCommands` as the first bounded WP5.3 command module and `Mos` for
+the bounded `OS_Byte`/`OS_Word` policy. Console owns the six
 migrated character services; `Error` owns `OS_GenerateError`; `Memory` owns
 `OS_ChangeDynamicArea` and `OS_DynamicArea`; `ModuleManager` owns
 `Ricochet_ModuleInfo`, `OS_Module`, `Ricochet_ModuleLookup`, and `Ricochet_SwiInfo`; and
@@ -116,6 +224,19 @@ read from retained active BASIC64 definitions using checked caller memory and
 bounded chunks; source output escapes display control bytes. Active
 module/version/state and exported SWI identities are explicitly public
 metadata; they describe published service names, not source or task state.
+The named-only project services `RICOCHET_DESKTOP` and `RICOCHET_DISPLAY`
+are also module-owned: a closed dispatcher map invokes
+`DesktopServices.bas64::DESKTOPSERVICE` and
+`DisplayManager.bas64::DISPLAYSERVICE`, without assigning numeric SWI IDs.
+Their BASIC64 definitions own action/version/enum/register policy. Rust
+provides bounded HostFS catalogue, Wimp menu, and display query/persistence
+mechanisms. Display apply checks the original caller's `ConfigurationWrite`
+right before any settings effect; module grants do not confer that right.
+`Wimp.bas64` now owns the lifecycle trio and the bounded OpenWindow,
+CloseWindow, GetWindowState, and SetExtent SWIs. BASIC64 decodes caller blocks
+and applies the supported stack policy; narrow Rust methods recheck task/window
+ownership and geometry while committing synchronized state transitions. The
+other Wimp entries remain transitional hosted routes, so WP5.6 remains partial.
 Definition-source queries require the original caller Task's `SourceRead`
 authority, and OS_Module Load/Replace/Delete requires the separately scoped
 `ModuleManagement` authority. ModuleManager BASIC64 asks for each right before
@@ -156,6 +277,15 @@ Same-title Load uses Ricochet' compatible atomic guest-replacement rules, which
 are deliberately rollback-safe and differ from PRM's destructive native `&FFA`
 replacement lifecycle.
 
+The supported public BASIC file routes are `*BASIC <guest-path>` and
+`*RUN <guest-path>`; both run source or tokenized BASIC directly through the
+configured execution engine. `*BASIC64` retains its mode/text launch options.
+The saved `BASICEngine` setting selects Interpreter, Hybrid, or Strict for the
+next file/desktop launch. Separate load-then-run commands, their per-task
+tokenized-program cache, and one-shot JIT command overrides were removed as
+redundant public surface. See the bounded command/script milestone audit for
+the migration and explicit losses.
+
 Known classic names `*RMReInit`, `*RMInsert`, `*RMTidy`, `*RMClear`,
 `*RMFaster`, `*ROMModules`, and `*Unplug` return explicit unsupported
 diagnostics because this host has no ROM/RMA/unplug state model. This is not a
@@ -165,8 +295,8 @@ prefixes), not the PRM's dynamically assembled module alias order; collisions
 such as `*INSPECT MOD.` are reported as ambiguous while exact `MODULE.` selects
 detail. OS_CLI strips repeated leading `*`/whitespace, accepts PRM NUL/LF/CR
 terminators, and preserves R0.
-The Rust legacy command fallback is only for unrelated commands not yet
-migrated. Broader MOS migration and other WP5.1 compatibility remain open. The
+Transitional Rust command handlers are explicit registry bridge descriptors,
+not a hidden fallback. Broader MOS command policy and other WP5.1 compatibility remain open. The
 native loader still installs the initial namespace directly and never calls
 public `OS_Module`.
 
@@ -561,9 +691,10 @@ Console
 Boot
 ```
 
-The current capsule contains the original seven Phase 4 foundation modules
-plus `RicochetCommands`: `System`, `ModuleManager`, `Error`, `TaskManager`,
-`Memory`, `Console`, `Boot`, and `RicochetCommands`. The first usable service
+The current capsule contains the original seven Phase 4 foundation modules,
+plus `RicochetCommands` and the MOS policy owner: `System`, `ModuleManager`,
+`Error`, `TaskManager`, `Memory`, `Console`, `Boot`, `RicochetCommands`, and
+`Mos`. The first usable service
 slices are source-defined and manifest-owned;
 their precise boundaries and remaining breadth are recorded in
 [`ricochet-boot-capsule.md`](ricochet-boot-capsule.md).

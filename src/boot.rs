@@ -530,7 +530,9 @@ pub fn embedded_capsule_bytes() -> Result<&'static [u8], BootCapsuleError> {
                 grants: &[
                     "ConfigurationStoreRead",
                     "ConfigurationStoreWrite",
-                    "MosCommandBridge",
+                    "CommandRegistry",
+                    "CommandScripts",
+                    "ExecInput",
                     "RuntimeErrors",
                     "TaskMemory",
                 ],
@@ -546,9 +548,49 @@ pub fn embedded_capsule_bytes() -> Result<&'static [u8], BootCapsuleError> {
                 ],
             },
             BootModuleInput {
+                source_path: "modules/Mos.bas64",
+                source: include_str!("../modules/Mos.bas64"),
+                grants: &["MosInput", "MosClock", "TaskMemory", "RuntimeErrors"],
+            },
+            BootModuleInput {
+                source_path: "modules/FileSwitch.bas64",
+                source: include_str!("../modules/FileSwitch.bas64"),
+                grants: &[
+                    "FileSystem",
+                    "RuntimeErrors",
+                    "SystemVariableStore",
+                    "TaskMemory",
+                ],
+            },
+            BootModuleInput {
+                source_path: "modules/Graphics.bas64",
+                source: include_str!("../modules/Graphics.bas64"),
+                grants: &["GraphicsRaster", "RuntimeErrors"],
+            },
+            BootModuleInput {
+                source_path: "modules/ColourTrans.bas64",
+                source: include_str!("../modules/ColourTrans.bas64"),
+                grants: &["GraphicsRaster"],
+            },
+            BootModuleInput {
+                source_path: "modules/DesktopServices.bas64",
+                source: include_str!("../modules/DesktopServices.bas64"),
+                grants: &["FileSystem", "WimpSystemMenu"],
+            },
+            BootModuleInput {
+                source_path: "modules/DisplayManager.bas64",
+                source: include_str!("../modules/DisplayManager.bas64"),
+                grants: &["DisplaySettings"],
+            },
+            BootModuleInput {
+                source_path: "modules/Wimp.bas64",
+                source: include_str!("../modules/Wimp.bas64"),
+                grants: &["RuntimeErrors", "WimpTaskLifecycle", "WimpWindowState"],
+            },
+            BootModuleInput {
                 source_path: "modules/System.bas64",
                 source: include_str!("../modules/System.bas64"),
-                grants: &["StartupPolicy", "SystemQueries"],
+                grants: &["StartupPolicy", "SystemQueries", "SystemVariableStore"],
             },
         ];
         BootCapsule::build(RUNTIME_ABI_VERSION, &inputs)
@@ -885,9 +927,16 @@ mod tests {
             BTreeSet::from([
                 "Boot",
                 "Console",
+                "ColourTrans",
+                "DesktopServices",
+                "DisplayManager",
                 "Error",
+                "FileSwitch",
+                "Graphics",
                 "Memory",
                 "ModuleManager",
+                "Mos",
+                "Wimp",
                 "System",
                 "TaskManager",
                 "RicochetCommands",
@@ -919,7 +968,22 @@ mod tests {
             ("Console", "ConsoleOutput"),
             ("Console", "GraphicsVduStream"),
             ("Console", "RuntimeErrors"),
+            ("Mos", "MosInput"),
+            ("Mos", "MosClock"),
+            ("Mos", "TaskMemory"),
+            ("Mos", "RuntimeErrors"),
+            ("Graphics", "GraphicsRaster"),
+            ("Graphics", "RuntimeErrors"),
+            ("ColourTrans", "GraphicsRaster"),
+            ("DesktopServices", "FileSystem"),
+            ("DesktopServices", "WimpSystemMenu"),
+            ("DisplayManager", "DisplaySettings"),
+            ("Wimp", "RuntimeErrors"),
+            ("Wimp", "WimpTaskLifecycle"),
+            ("Wimp", "WimpWindowState"),
+            ("FileSwitch", "TaskMemory"),
             ("System", "SystemQueries"),
+            ("System", "SystemVariableStore"),
             ("Error", "ErrorDispatch"),
             ("Memory", "TaskMemory"),
             ("Memory", "RuntimeErrors"),
@@ -928,7 +992,7 @@ mod tests {
             ("ModuleManager", "RuntimeErrors"),
             ("TaskManager", "TaskQuery"),
             ("TaskManager", "RuntimeErrors"),
-            ("RicochetCommands", "MosCommandBridge"),
+            ("RicochetCommands", "CommandRegistry"),
             ("RicochetCommands", "ConfigurationStoreRead"),
             ("RicochetCommands", "ConfigurationStoreWrite"),
             ("RicochetCommands", "TaskMemory"),
@@ -958,6 +1022,7 @@ mod tests {
                 "Error",
                 "Memory",
                 "ModuleManager",
+                "Mos",
                 "System",
                 "TaskManager",
                 "RicochetCommands",
@@ -976,7 +1041,7 @@ mod tests {
                 })
             })
             .collect::<BTreeSet<_>>();
-        assert_eq!(owned_exports.len(), 20);
+        assert_eq!(owned_exports.len(), 40);
         for (owner, swi) in [
             ("ERROR", "OS_GENERATEERROR"),
             ("MEMORY", "OS_CHANGEDYNAMICAREA"),
@@ -989,7 +1054,19 @@ mod tests {
             ("MODULEMANAGER", "RICOCHET_DEFINITIONSOURCE"),
             ("MODULEMANAGER", "OS_MODULE"),
             ("RICOCHETCOMMANDS", "OS_CLI"),
+            ("MOS", "OS_BYTE"),
+            ("MOS", "OS_WORD"),
+            ("GRAPHICS", "OS_PLOT"),
+            ("GRAPHICS", "OS_READPOINT"),
+            ("FILESWITCH", "OS_GBPB"),
+            ("FILESWITCH", "OS_FILE"),
+            ("FILESWITCH", "OS_ARGS"),
+            ("FILESWITCH", "OS_BGET"),
+            ("FILESWITCH", "OS_BPUT"),
+            ("FILESWITCH", "OS_FIND"),
             ("SYSTEM", "OS_READMONOTONICTIME"),
+            ("SYSTEM", "OS_READVARVAL"),
+            ("SYSTEM", "OS_SETVARVAL"),
             ("SYSTEM", "OS_SWINUMBERTOSTRING"),
             ("SYSTEM", "OS_SWINUMBERFROMSTRING"),
         ] {
@@ -1007,6 +1084,10 @@ mod tests {
         );
         assert!(
             order.iter().position(|name| *name == "System").unwrap()
+                < order.iter().position(|name| *name == "Boot").unwrap()
+        );
+        assert!(
+            order.iter().position(|name| *name == "Mos").unwrap()
                 < order.iter().position(|name| *name == "Boot").unwrap()
         );
     }

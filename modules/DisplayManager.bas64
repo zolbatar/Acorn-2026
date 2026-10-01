@@ -1,0 +1,35 @@
+REM @BASIC64 MODE=BASIC64
+REM @SYSTEM_PROFILE 0.1
+REM @MODULE DisplayManager 1.0.0
+REM @CAPABILITY DisplaySettings
+REM @IMPORT Host.Display.Query DisplaySettings
+REM @IMPORT Host.Display.Apply DisplaySettings
+REM @IMPORT Host.Display.RequireConfigurationWrite DisplaySettings
+REM @EXPORT PROC DISPLAYSERVICE
+
+ERROR DisplayServiceError
+    Code AS UINT32 READONLY
+    Message AS STRING READONLY
+END ERROR
+
+REM Versioned project-specific service. This does not claim a historical SWI ID.
+DEF PROC DISPLAYSERVICE THROWS DisplayServiceError
+    IF R0% <> 1 THEN THROW DisplayServiceError, 1, "display service ABI version is unsupported"
+    IF R1% = 0 THEN
+        PRIMITIVE Host.Display.Query TO R2%, R3%, R4%, R5%, R6%, R7%
+        R8% = 0
+    ENDIF
+    IF R1% = 1 THEN
+        PRIMITIVE Host.Display.RequireConfigurationWrite
+        IF R2% > 6 OR R3% > 7 THEN THROW DisplayServiceError, 3, "display resolution or colour ID is invalid"
+        PRIMITIVE Host.Display.Apply, R2%, R3% TO SAVE_STATUS%, ACTIVE_RESOLUTION%, ACTIVE_COLOUR%, ACTIVE_WIDTH%, ACTIVE_HEIGHT%, HOST_WIDTH%, HOST_HEIGHT%
+        R2% = ACTIVE_RESOLUTION%
+        R3% = ACTIVE_COLOUR%
+        R4% = ACTIVE_WIDTH%
+        R5% = ACTIVE_HEIGHT%
+        R6% = HOST_WIDTH%
+        R7% = HOST_HEIGHT%
+        R8% = SAVE_STATUS%
+    ENDIF
+    IF R1% <> 0 AND R1% <> 1 THEN THROW DisplayServiceError, 2, "display settings action is unsupported"
+ENDPROC

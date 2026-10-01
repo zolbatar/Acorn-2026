@@ -91,42 +91,97 @@ The native `SystemModule` parser is profile-gated. Classic and Hybrid parsing
 still uses the legacy source lexer; tests prove `TRY%`, `CATCH%`, and `PRIMITIVE%`
 remain ordinary identifiers there. The new block/type syntax is not silently
 enabled by setting `MODE=BASIC64` on an ordinary source file. Representative
-Error, FileSwitch, and Wimp fragments are executable unit-test fixtures in
-`src/basic_compat/system_profile.rs`; the Console example is the real source
+Error and Wimp fragments remain executable unit-test fixtures in
+`src/basic_compat/system_profile.rs`; FileSwitch is also the active bounded
+channel module at [`../modules/FileSwitch.bas64`](../modules/FileSwitch.bas64).
+The current capsule also loads [`../modules/Graphics.bas64`](../modules/Graphics.bas64),
+which owns the public BASIC64 policy for `OS_Plot` and `OS_ReadPoint` while
+retaining the existing Rust CPU-raster mechanisms. This is a partial WP5.5
+ownership migration, not a complete graphics or Phase 5 delivery. It also loads
+[`../modules/ColourTrans.bas64`](../modules/ColourTrans.bas64), which owns the
+three existing name-only `ColourTrans_*` SYS services; no numeric SWI IDs are
+published. The hosted HSV and SetGCOL paths are implemented, while
+`ColourTrans_WritePalette` is an explicit no-op compatibility shim.
+The capsule also publishes [`../modules/Wimp.bas64`](../modules/Wimp.bas64),
+which owns `Wimp_Initialise`, `Wimp_CloseDown`, `Wimp_StartTask`,
+`Wimp_OpenWindow`, `Wimp_CloseWindow`, `Wimp_GetWindowState`, and
+`Wimp_SetExtent`. BASIC64 handles lifecycle and window-block decoding/result
+policy; narrow Rust mechanisms repeat caller ownership and geometry checks and
+commit atomic window/stack changes. Other Wimp SWIs remain on their prior
+route, so this is a partial WP5.6 migration.
+The Console example is the real source
 module at [`../modules/Console.bas64`](../modules/Console.bas64). The original
 Phase 4 capsule comprised seven native foundation modules; the current capsule
-adds `RicochetCommands` for BASIC64-owned `OS_CLI` routing of its own command
-family. The source files are
+adds command/system modules and `Mos`/`FileSwitch`/`Graphics` for bounded BASIC64-owned
+MOS and file policy. FileSwitch owns bounded OS_GBPB reasons 1–10 in
+addition to the existing channel services and OS_File reasons 0–12, 16–18,
+and 255. BASIC64 selects OS_File path-source policy and candidate order; Rust
+provides checked runtime-variable/path-string access and guest-sandbox
+candidate/load mechanisms. File$Path, R4 path-list, and path-variable reasons
+are supported within the documented byte/candidate bounds and String /
+LiteralString subset. Run$Path, macro expansion, wildcard search, and other
+native path behavior remain explicit gaps. Create-existing and other hosted
+FileSwitch also owns hosted OS_FSControl reasons 0, 1, 5–9, 11, 13, 14, 18,
+19, 22, 25, 31, 33, 37, 39, 40, 43–45, and 50. BASIC64 selects register and
+reason policy; Rust supplies checked strings, task-local directory/selection
+state, bounded catalogue snapshots, and canonical-name/file-type mechanisms.
+Reason 11 reports the recognized temporary HostFS selector and previous
+selector while rejecting unsupported special fields atomically. Reason 37
+supports bounded R3 String/LiteralString and R4 ordered path-list sources,
+qualified-path bypass, and final-attempt canonicalization; general GSTrans and
+macros remain unsupported. Reasons 7/8 normalize relative paths against the
+library directory for both catalogue title and entries. Reason 50 changes the shared volume label. Other
+FileSwitch deviations are explicit rather than native compatibility claims.
+The source files are
 [`../modules/System.bas64`](../modules/System.bas64),
 [`../modules/Boot.bas64`](../modules/Boot.bas64),
 [`../modules/Error.bas64`](../modules/Error.bas64),
 [`../modules/ModuleManager.bas64`](../modules/ModuleManager.bas64),
 [`../modules/TaskManager.bas64`](../modules/TaskManager.bas64),
-[`../modules/Memory.bas64`](../modules/Memory.bas64), and Console.
+[`../modules/Memory.bas64`](../modules/Memory.bas64), Console, and
+[`../modules/Mos.bas64`](../modules/Mos.bas64).
 The current capsule also loads
 [`../modules/RicochetCommands.bas64`](../modules/RicochetCommands.bas64).
 System is a source-visible startup facade and owns the bounded
 `OS_SWINumberToString`, `OS_SWINumberFromString`, and `OS_ReadMonotonicTime`
-services; its `StartupPolicy` capability limits configuration read and
-MOS/desktop handoff to three declared protected primitives. `RicochetCommands` parses and presents
+services plus PRM-numbered `OS_ReadVarVal` (`&23`) and `OS_SetVarVal` (`&24`).
+The variable SWIs use `SystemVariableStore`-gated Rust mechanisms over one
+runtime-scoped guest store with checked caller logical buffers and task-local
+opaque wildcard contexts. Only string type 0 and literal string type 4 are
+supported. Type 0 immediately expands exact `<name>` references, quoted
+strings, doubled quotes, and printable `|<`, `|>`, `||`, `|"` escapes; type 4
+is raw. Substitution results are not rescanned. Unsupported/malformed syntax
+and missing variables fail before mutation; no public `OS_GSTrans` contract is
+claimed. The store is bounded to 128 entries,
+32 KiB aggregate data, 32-byte visible-ASCII names, and 256-byte UTF-8 values.
+It is not host environment access or persistent storage. A separate
+`SystemVariableWrite` Task right is checked on the original requestor and
+granted only to the trusted interactive MOS session; the module's provider
+capability does not grant caller mutation authority. `RicochetCommands.bas64`
+owns `*SET`, `*SHOW`, and `*UNSET` policy through these shared SWIs. Its
+`StartupPolicy` capability separately limits configuration read and
+MOS/desktop handoff to its declared protected primitives. `RicochetCommands` parses and presents
 read-only `*INSPECT MODULES`, `MODULE`, `SWI`, and bounded retained-source
 `DEFINITION` queries (`SOURCE` is a read-only alias). Classic module commands
 are `*Modules`, `*RMLoad`, `*RMRun`, `*RMKill`, and conditional `*RMEnsure`;
 known native ROM/RMA commands without a hosted state model are explicit
 unsupported operations. It uses ModuleManager's shared caller-buffer query
 SWIs for inspection, while mutations use the separate `OS_Module` service.
-Other OS_CLI commands still use a capability-gated Rust legacy adapter. Active module/SWI identity is explicitly public metadata;
+OS_CLI command names, display metadata, ordering, Help matching, and BASIC64
+handler selection come from the live module command registry. Rust-backed
+transitional commands have explicit, name-bound bridge descriptors owned by
+`RicochetCommands`; there is no catch-all command fallback. Active module/SWI identity is explicitly public metadata;
 retained definition source requires task-scoped `SourceRead`, and OS_Module
 mutation requires separate `ModuleManagement`. The host explicitly bootstraps
 the interactive MOS task with both rights; ordinary tasks receive neither and
 do not inherit them by task ID or module-provider capability. Boot is a lifecycle-only policy module
 with no host grant and imports System's typed functions. Rust consumes Boot's
 selected request without reinterpreting the saved Language value. Boot depends
-on Console, Error, Memory, ModuleManager, System, and TaskManager, so all six
+on Console, Error, Memory, ModuleManager, Mos, System, and TaskManager, so all seven
 service providers are active before its `Start` hook runs. Console also has its
 own startup hook; System and the narrow management/error/task/memory services
-do not need startup hooks. This narrow System query set is not the broader
-public System service family proposed for later migration.
+do not need startup hooks. The implemented System services remain a bounded
+subset of the broader historical RISC OS System family.
 
 The initial Error, ModuleManager, TaskManager, and Memory services are also
 real source definitions rather than parser fixtures or empty modules. Error
@@ -172,7 +227,8 @@ caller-memory chunks. `Ricochet_ModuleExport` is public metadata, while
 `Ricochet_DefinitionSource` requires `SourceRead` before retained bytes are read
 or returned. Its CLI projection has the same check. `RicochetCommands.bas64` owns
 `*INSPECT` query presentation and the documented classic module command subset;
-other MOS command parsing remains on the legacy Rust adapter.
+remaining transitional MOS behavior is reached only through explicit
+`RicochetCommands` bridge descriptors, not a separate Rust command table.
 Other historical `OS_Module` reasons are structured rejections, particularly reason 18 because
 it returns process pointers; `%` instantiations and native `&FFA` images are
 unsupported. The project queries return manifest identity through checked
@@ -190,6 +246,13 @@ caller-local IDs/bases and checked task memory, with a 16 MiB per-area cap,
 doubly-mapped support. Exact public ownership and compatibility gaps are listed
 in [`ricochet-boot-capsule.md`](ricochet-boot-capsule.md) and
 [`ricochet-compatibility-matrix.md`](ricochet-compatibility-matrix.md).
+
+The named-only `RICOCHET_DESKTOP` and `RICOCHET_DISPLAY` services are routed
+through `DesktopServices.bas64::DESKTOPSERVICE` and
+`DisplayManager.bas64::DISPLAYSERVICE`. The closed dispatcher mapping does not
+invent numeric SWI IDs. Module imports grant only their narrow host mechanisms;
+display apply checks the original caller's `ConfigurationWrite` capability
+independently.
 
 ## Purpose
 
@@ -241,21 +304,37 @@ definitions stay module-local. This is the supported source shape:
 REM @BASIC64 MODE=BASIC64
 REM @SYSTEM_PROFILE 0.1
 REM @MODULE FileSwitch 1.0.0
-REM @IMPORT_MODULE Runtime 1.0.0
-REM @IMPORT_SYMBOL Runtime PROC OpenChannel
 REM @CAPABILITY FileSystem
-REM @IMPORT Host.File.OpenChannel FileSystem
-REM @LIFECYCLE START Start
-REM @LIFECYCLE QUIESCE Quiesce
-REM @LIFECYCLE FINALISE Finalise
-REM @REPLACE QUIESCENT
-REM @STATE OPENCOUNT% UINT32
-REM @EXPORT PROC Open
-REM @PRIVATE PROC ValidateName
-REM @SWI OS_Find &0D Find REGISTERS=R0:U32:INOUT|R1:U32:IN;BLOCKING=FALSE
+REM @CAPABILITY RuntimeErrors
+REM @IMPORT Host.FileChannel.Open FileSystem
+REM @IMPORT Host.FileChannel.Close FileSystem
+REM @IMPORT Host.FileChannel.ReadByte FileSystem
+REM @IMPORT Host.FileChannel.WriteByte FileSystem
+REM @IMPORT Host.FileChannel.ReadPosition FileSystem
+REM @IMPORT Host.FileChannel.SetPosition FileSystem
+REM @IMPORT Host.FileChannel.ReadExtent FileSystem
+REM @IMPORT Host.FileChannel.SetExtent FileSystem
+REM @IMPORT Host.FileChannel.CanonicalNameLength FileSystem
+REM @IMPORT Host.FileChannel.Args7SpareBytes FileSystem
+REM @IMPORT Host.FileChannel.WriteCanonicalName FileSystem
+REM @IMPORT Host.Runtime.UnsupportedServiceReason RuntimeErrors
+REM @SWI OS_Find &0D FindService REGISTERS=R0:U32:INOUT|R1:U32:IN|R2:U32:IN;BLOCKING=FALSE;REENTRANT=FALSE
+REM @SWI OS_BGet &0A ByteGetService REGISTERS=R0:U32:INOUT|R1:U32:IN;CARRY=OUT;BLOCKING=FALSE;REENTRANT=TRUE
+REM @SWI OS_BPut &0B BytePutService REGISTERS=R0:U32:IN|R1:U32:IN;BLOCKING=FALSE;REENTRANT=TRUE
+REM @SWI OS_Args &09 ArgsService REGISTERS=R0:U32:INOUT|R1:U32:IN|R2:U32:INOUT|R5:U32:INOUT;BLOCKING=FALSE;REENTRANT=FALSE
 ```
 
-Supported directives are `@MODULE name major.minor.patch`, `@IMPORT_MODULE name
+The current `modules/FileSwitch.bas64` is the executable bounded example for
+these channel services, GBPB reasons 1–10, and the bounded OS_FSControl subset
+above. Its direct-path channel subset
+supports open/close, byte I/O, Args reasons 0–5 and 7, checked canonical-name
+output, bounded block transfers, bounded directory records, and selected
+FSControl policy. It does not imply support for GBPB reasons 11–12, other FileSwitch families, or BASIC
+`OPENIN`-style statements, which are not currently implemented by the hosted
+BASIC runtime.
+
+Supported directives are `@MODULE name major.minor.patch`, `@COMMAND name
+Commands|FileCommands PROC handler "syntax" "description"`, `@IMPORT_MODULE name
 minimum-version` (with `@DEPENDS name minimum-version` as a spelling alias),
 `@IMPORT_SYMBOL
 module PROC|FN symbol`, `@CAPABILITY name`, `@IMPORT primitive capability`,
@@ -268,6 +347,19 @@ is validated against a declared dependency and provider export; qualified calls
 execute only when that linked import resolves to an active provider export.
 There is no `MODULE`/`END MODULE` block syntax, textual include, or general
 qualified-name resolver outside declared symbol imports in 0.1.
+
+`@COMMAND` publishes an ordered command descriptor together with the module:
+name, category, handler kind/identity, syntax, and Help description. Its PROC
+handler is a private owner-local definition with one typed `STRING` parameter;
+declaring a command does not add that handler to `@EXPORT` or make it
+importable. `BRIDGE` is accepted only for the closed command allowlist in the
+trusted `RicochetCommands` capsule module. The live registry is sorted by
+case-folded module title, then by source declaration order; command execution
+uses the first matching final-dot prefix, while `*HELP prefix.` displays every
+matching descriptor. The nonempty `command.*` manifest rows are backward-
+readable by this runtime and preserve the old canonical bytes when absent, but
+older strict v1 decoders reject the extension, so this is not forward-reader
+compatibility.
 
 `@SWI` register kinds currently include `BYTE`, `U32`, `S32`, `ADDRESS32`, and
 `HANDLE<Type>` with `IN`, `OUT`, or `INOUT` directions. Optional attributes
@@ -510,8 +602,10 @@ DEF FN Echo(window AS HANDLE<WindowHandle>) AS HANDLE<WindowHandle>
 
 The complete checked Console source additionally demonstrates `ADDRESS32`
 memory traversal, six SWI contracts including tagged `OS_ReadLine` options,
-capability imports, and lifecycle hooks. FileSwitch and Wimp remain test
-fragments, not migrated public service modules.
+capability imports, and lifecycle hooks. `modules/FileSwitch.bas64` is now an
+active owner of the bounded four-SWI channel subset documented above. Wimp
+owns the lifecycle trio plus OpenWindow, CloseWindow, GetWindowState, and
+SetExtent; remaining Wimp services stay on their earlier hosted route.
 
 ### AST, interpreter, portable IR, and JIT boundary
 

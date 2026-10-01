@@ -88,37 +88,9 @@ pub(crate) fn run_program_configured(
     dispatcher: &mut SwiDispatcher,
     configuration: &BasicConfiguration,
 ) -> Result<Option<JitExecutionReport>, RuntimeError> {
-    run_program_with_engine_options(
-        program,
-        task,
-        dispatcher,
-        configuration,
-        None,
-        StrictJitOptions::default(),
-    )
-}
-
-/// Run a program with an explicit one-shot engine choice, retaining configured
-/// language, target, and profile defaults not specified by the source.
-pub(crate) fn run_program_with_engine_options(
-    program: &TokenizedBasicProgram,
-    task: &mut Task,
-    dispatcher: &mut SwiDispatcher,
-    configuration: &BasicConfiguration,
-    engine_override: Option<BasicEngine>,
-    strict_options: StrictJitOptions,
-) -> Result<Option<JitExecutionReport>, RuntimeError> {
     let mut parsed = parse_tokenized_program(program)?;
     apply_configuration(&mut parsed, configuration);
-    run_parsed_configured(
-        parsed,
-        task,
-        dispatcher,
-        configuration,
-        engine_override,
-        strict_options,
-        false,
-    )
+    run_parsed_configured(parsed, task, dispatcher, configuration, false)
 }
 
 pub(crate) fn run_program_with_launch_options(
@@ -131,15 +103,7 @@ pub(crate) fn run_program_with_launch_options(
     let mut parsed = parse_tokenized_program(program)?;
     apply_configuration(&mut parsed, configuration);
     apply_launch_options(&mut parsed, launch)?;
-    run_parsed_configured(
-        parsed,
-        task,
-        dispatcher,
-        configuration,
-        None,
-        StrictJitOptions::default(),
-        false,
-    )
+    run_parsed_configured(parsed, task, dispatcher, configuration, false)
 }
 
 pub(crate) fn run_source_configured(
@@ -148,35 +112,9 @@ pub(crate) fn run_source_configured(
     dispatcher: &mut SwiDispatcher,
     configuration: &BasicConfiguration,
 ) -> Result<Option<JitExecutionReport>, RuntimeError> {
-    run_source_with_engine_options(
-        source,
-        task,
-        dispatcher,
-        configuration,
-        None,
-        StrictJitOptions::default(),
-    )
-}
-
-pub(crate) fn run_source_with_engine_options(
-    source: &str,
-    task: &mut Task,
-    dispatcher: &mut SwiDispatcher,
-    configuration: &BasicConfiguration,
-    engine_override: Option<BasicEngine>,
-    strict_options: StrictJitOptions,
-) -> Result<Option<JitExecutionReport>, RuntimeError> {
     let mut parsed = parser::parse_source(source)?;
     apply_configuration(&mut parsed, configuration);
-    run_parsed_configured(
-        parsed,
-        task,
-        dispatcher,
-        configuration,
-        engine_override,
-        strict_options,
-        false,
-    )
+    run_parsed_configured(parsed, task, dispatcher, configuration, false)
 }
 
 pub(crate) fn run_source_with_launch_options(
@@ -189,15 +127,7 @@ pub(crate) fn run_source_with_launch_options(
     let mut parsed = parser::parse_source(source)?;
     apply_configuration(&mut parsed, configuration);
     apply_launch_options(&mut parsed, launch)?;
-    run_parsed_configured(
-        parsed,
-        task,
-        dispatcher,
-        configuration,
-        None,
-        StrictJitOptions::default(),
-        false,
-    )
+    run_parsed_configured(parsed, task, dispatcher, configuration, false)
 }
 
 /// Run an immediate BASIC console line with a modern shell default. A source
@@ -224,15 +154,7 @@ pub(crate) fn run_source_from_basic_console(
         execution_text_encoding(&parsed),
     );
     let run = |dispatcher: &mut SwiDispatcher| {
-        run_parsed_configured(
-            parsed,
-            task,
-            dispatcher,
-            configuration,
-            None,
-            StrictJitOptions::default(),
-            preserve_shell,
-        )
+        run_parsed_configured(parsed, task, dispatcher, configuration, preserve_shell)
     };
     if preserve_shell {
         run(dispatcher)
@@ -321,11 +243,9 @@ fn run_parsed_configured(
     task: &mut Task,
     dispatcher: &mut SwiDispatcher,
     configuration: &BasicConfiguration,
-    engine_override: Option<BasicEngine>,
-    strict_options: StrictJitOptions,
     preserve_shell: bool,
 ) -> Result<Option<JitExecutionReport>, RuntimeError> {
-    match engine_override.unwrap_or(configuration.engine) {
+    match configuration.engine {
         BasicEngine::Interpreter => {
             run_parsed_program(parsed, task, dispatcher, preserve_shell)?;
             Ok(None)
@@ -333,10 +253,14 @@ fn run_parsed_configured(
         BasicEngine::HybridJit => {
             run_parsed_program_jit(parsed, task, dispatcher, preserve_shell).map(Some)
         }
-        BasicEngine::StrictJit => {
-            run_parsed_program_jit_strict(parsed, task, dispatcher, strict_options, preserve_shell)
-                .map(Some)
-        }
+        BasicEngine::StrictJit => run_parsed_program_jit_strict(
+            parsed,
+            task,
+            dispatcher,
+            StrictJitOptions::default(),
+            preserve_shell,
+        )
+        .map(Some),
     }
 }
 
@@ -443,7 +367,7 @@ fn run_parsed_program_jit_strict(
     {
         let _ = (parsed, task, dispatcher, options, preserve_shell);
         Err(RuntimeError::Program(
-            "strict BASICJIT is experimental; use the JIT-enabled executable (`cargo run-jit`)"
+            "the Strict BASIC engine is experimental; use the JIT-enabled executable (`cargo run-jit`)"
                 .into(),
         ))
     }
@@ -466,7 +390,7 @@ fn run_parsed_program_jit(
     {
         let _ = (parsed, task, dispatcher, preserve_shell);
         Err(RuntimeError::Program(
-            "BASICJIT is experimental; use the JIT-enabled executable (`cargo run-jit`)".into(),
+            "the Hybrid BASIC engine is experimental; use the JIT-enabled executable (`cargo run-jit`)".into(),
         ))
     }
 }

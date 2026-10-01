@@ -55,7 +55,8 @@ register ABI. Other unknown addresses and unsupported OSBYTE/OSWORD reasons
 also fail explicitly. This does not expand *FX hardware emulation or compile
 ClockSP5's remaining interpreted code paths.
 
-Try `RUN $.Examples.MosCalls` or `BASICJIT $.Examples.MosCalls` with the
+Try `RUN $.Examples.MosCalls` or configure `BASICEngine Hybrid` and run
+`BASIC $.Examples.MosCalls` with the
 experimental JIT feature enabled. `tests/mos_calls.rs` checks source and
 tokenised calls, pointer forms above 64K, register preservation, shared clock
 state, output, keyboard/CLI dispatch, and invalid buffers/addresses.

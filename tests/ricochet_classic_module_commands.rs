@@ -363,7 +363,7 @@ fn classic_module_commands_and_inspect_share_live_read_only_module_identity() {
     let (empty_result, empty_output) = cli(&mut dispatcher, &mut mos, &display_receiver, "");
     assert!(empty_result.is_ok());
     assert!(empty_output.is_empty());
-    let complete_256_byte_line = "X".repeat(255);
+    let complete_256_byte_line = format!("*HELP{}", " ".repeat(250));
     let (bounded_result, bounded_output) = cli(
         &mut dispatcher,
         &mut mos,

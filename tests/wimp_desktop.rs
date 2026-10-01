@@ -1,5 +1,7 @@
 use std::{
     collections::HashMap,
+    fs,
+    path::PathBuf,
     sync::{
         Arc, mpsc,
         mpsc::{Receiver, RecvTimeoutError},
@@ -221,6 +223,7 @@ const TEST_EXTENT: WorkArea = WorkArea {
 };
 
 struct DesktopAcceptance {
+    _interpreter_config: InterpreterConfigOverride,
     wimp: Arc<WimpServer>,
     display_events: Receiver<DisplayEvent>,
     completions: Receiver<(u64, Result<(), String>)>,
@@ -231,6 +234,7 @@ struct DesktopAcceptance {
 
 impl DesktopAcceptance {
     fn start() -> Self {
+        let interpreter_config = InterpreterConfigOverride::install();
         let (display_sender, display_events) = mpsc::channel();
         let (desktop_updates, _desktop_update_events) = mpsc::channel();
         let wimp = WimpServer::new(desktop_updates);
@@ -272,6 +276,7 @@ impl DesktopAcceptance {
         }
 
         Self {
+            _interpreter_config: interpreter_config,
             wimp,
             display_events,
             completions,
@@ -474,6 +479,41 @@ impl DesktopAcceptance {
         if let DisplayEvent::WriteByte { task_id, byte, .. } = event {
             self.output.entry(task_id).or_default().push(byte);
         }
+    }
+}
+
+struct InterpreterConfigOverride {
+    path: PathBuf,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl InterpreterConfigOverride {
+    fn install() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "ricochet-wimp-desktop-interpreter-{}.cfg",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            "# Ricochet MOS configuration v3\nLanguage=3\nBASICMode=AUTO\nBASICProfile=AUTO\nBASICTarget=AUTO\nBASICEngine=INTERPRETER\nWimpMode=AUTO\n",
+        )
+        .expect("write isolated Wimp interpreter configuration");
+        let previous = std::env::var_os("RICOCHET_CONFIG_PATH");
+        unsafe { std::env::set_var("RICOCHET_CONFIG_PATH", &path) };
+        Self { path, previous }
+    }
+}
+
+impl Drop for InterpreterConfigOverride {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(previous) = &self.previous {
+                std::env::set_var("RICOCHET_CONFIG_PATH", previous);
+            } else {
+                std::env::remove_var("RICOCHET_CONFIG_PATH");
+            }
+        }
+        let _ = fs::remove_file(&self.path);
     }
 }
 

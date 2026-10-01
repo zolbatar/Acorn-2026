@@ -1,0 +1,47 @@
+REM @BASIC64 MODE=BASIC64
+REM @SYSTEM_PROFILE 0.1
+REM @MODULE DesktopServices 1.0.0
+REM @CAPABILITY FileSystem
+REM @CAPABILITY WimpSystemMenu
+REM @IMPORT Host.Desktop.ReadCatalogueEntry FileSystem
+REM @IMPORT Host.Desktop.WriteVolumeName FileSystem
+REM @IMPORT Host.Desktop.ReadModificationTime FileSystem
+REM @IMPORT Host.Desktop.RegisterSystemMenu WimpSystemMenu
+REM @EXPORT PROC DESKTOPSERVICE
+
+ERROR DesktopServiceError
+    Code AS UINT32 READONLY
+    Message AS STRING READONLY
+END ERROR
+
+REM Project-specific named service; no numeric SWI identity is published.
+DEF PROC DESKTOPSERVICE THROWS DesktopServiceError
+    DESKTOP_ACTION% = R0%
+    IF DESKTOP_ACTION% = 1 THEN PROC DesktopCatalogueEntry
+    IF DESKTOP_ACTION% = 2 THEN PROC DesktopVolumeName
+    IF DESKTOP_ACTION% = 3 THEN PROC DesktopModificationTime
+    IF DESKTOP_ACTION% = 4 THEN PRIMITIVE Host.Desktop.RegisterSystemMenu
+    IF DESKTOP_ACTION% < 1 OR DESKTOP_ACTION% > 4 THEN THROW DesktopServiceError, DESKTOP_ACTION%, "desktop service action is unsupported"
+ENDPROC
+
+DEF PROC DesktopCatalogueEntry
+    PRIMITIVE Host.Desktop.ReadCatalogueEntry, R1%, R2%, R3%, R4% TO ENTRY_PRESENT%, ENTRY_DIRECTORY%, ENTRY_FILETYPE%, ENTRY_LENGTH%
+    R0% = 0
+    IF ENTRY_PRESENT% = 0 THEN R1% = 0
+    IF ENTRY_PRESENT% <> 0 THEN
+        IF ENTRY_DIRECTORY% <> 0 THEN R0% = 2
+        IF ENTRY_DIRECTORY% = 0 AND ((ENTRY_FILETYPE% AND &FFF) = &FFB OR (ENTRY_FILETYPE% AND &FFF) = &064) THEN R0% = 1
+        IF ENTRY_DIRECTORY% = 0 AND (ENTRY_FILETYPE% AND &FFF) = &FFF THEN R0% = 3
+        IF ENTRY_DIRECTORY% = 0 AND (ENTRY_FILETYPE% AND &FFF) <> &FFB AND (ENTRY_FILETYPE% AND &FFF) <> &064 AND (ENTRY_FILETYPE% AND &FFF) <> &FFF THEN R0% = 4
+        R1% = ENTRY_FILETYPE%
+        R2% = ENTRY_LENGTH%
+    ENDIF
+ENDPROC
+
+DEF PROC DesktopVolumeName
+    PRIMITIVE Host.Desktop.WriteVolumeName, R1%, R2% TO R0%
+ENDPROC
+
+DEF PROC DesktopModificationTime
+    PRIMITIVE Host.Desktop.ReadModificationTime, R1%, R2% TO R0%, R1%
+ENDPROC

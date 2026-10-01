@@ -205,6 +205,18 @@ impl HostFileSystem {
         let mut host_path = root.clone();
         let mut canonical_components = Vec::new();
         for (index, component) in components.iter().enumerate() {
+            // Keep resolving the remaining guest components lexically after a
+            // missing parent. This is required by OS_FSControl 37, which
+            // returns the final attempted canonical name when search finds no
+            // object; it must not reinterpret a normal search miss as I/O.
+            if !host_path.exists() {
+                host_path.push(component);
+                canonical_components.push(component.clone());
+                continue;
+            }
+            if !host_path.is_dir() {
+                return Err(fs_error(format!("'{}' is not a directory", component)));
+            }
             let found = self.find_child(&host_path, component)?;
             let Some(found) = found else {
                 let candidate = host_path.join(component);
@@ -327,13 +339,30 @@ impl HostFileSystem {
         directory: &str,
         wildcard: &str,
     ) -> Result<Vec<GuestObject>, RuntimeError> {
+        self.enumerate_bounded(context, directory, wildcard, usize::MAX)
+    }
+
+    pub fn enumerate_bounded(
+        &self,
+        context: &FileSystemContext,
+        directory: &str,
+        wildcard: &str,
+        maximum_entries: usize,
+    ) -> Result<Vec<GuestObject>, RuntimeError> {
         let resolved = self.canonical_guest_path(context, directory)?;
         if !resolved.is_directory {
             return Err(fs_error(format!("'{}' is not a directory", directory)));
         }
         let mut objects = Vec::new();
         let mut sidecars = BTreeMap::new();
+        let mut scanned_entries = 0usize;
         for entry in fs::read_dir(&resolved.host_path)? {
+            scanned_entries = scanned_entries.saturating_add(1);
+            if scanned_entries > maximum_entries {
+                return Err(fs_error(format!(
+                    "directory exceeds the hosted {maximum_entries}-entry catalogue bound"
+                )));
+            }
             let entry = entry?;
             let file_name = entry.file_name().to_string_lossy().into_owned();
             if file_name == VOLUME_DESCRIPTOR || file_name == LEGACY_VOLUME_DESCRIPTOR {

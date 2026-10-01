@@ -1,4 +1,4 @@
-//! Whole-program native compiler for strict BASICJIT execution.
+//! Whole-program native compiler for the configured Strict engine.
 //!
 //! Source and tokenized programs enter through `ParsedProgram`. Each BASIC
 //! instruction is lowered to Cranelift control flow before execution. Numeric
@@ -2672,12 +2672,9 @@ fn contains_end_procedure(statement: &Statement) -> bool {
 
 fn compile_error(line: u16, message: impl AsRef<str>) -> String {
     if line == 0 {
-        format!("BASICJIT strict compile: {}", message.as_ref())
+        format!("Strict JIT compile: {}", message.as_ref())
     } else {
-        format!(
-            "BASICJIT strict compile at line {line}: {}",
-            message.as_ref()
-        )
+        format!("Strict JIT compile at line {line}: {}", message.as_ref())
     }
 }
 

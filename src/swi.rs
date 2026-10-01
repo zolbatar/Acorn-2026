@@ -1,12 +1,14 @@
+use crate::system_variables::{
+    MAX_NAME_BYTES, MAX_VALUE_BYTES, SystemVariable, SystemVariableStore, SystemVariableType,
+    buffer_error, limit_error, name_error, selector_matches_name, validate_selector,
+};
 use crate::{
     basic_compat::{BasicLaunchOptions, system_profile::SystemModule},
     boot::{
         BootCapsule, BootFailure, BootStage, RUNTIME_ABI_VERSION, RecoveryAction,
         embedded_capsule_bytes, parse_recovery_action,
     },
-    configure::{
-        BasicConfiguration, BasicEngine, BasicLanguageMode, ConfigureStore, StartupLanguage,
-    },
+    configure::{BasicConfiguration, BasicLanguageMode, ConfigureStore, StartupLanguage},
     display::{DesktopResolution, DisplayColour, DisplaySettings},
     error::RuntimeError,
     filesystem::{
@@ -17,11 +19,12 @@ use crate::{
         TextRenderingProfile,
     },
     host::HostConsole,
-    memory::{GUEST_MEMORY_BASE, Task},
+    memory::{ExecInputRead, GUEST_MEMORY_BASE, SystemVariableReadCursor, Task},
     ricochet::{
-        CapabilityName, DefinitionId, DependencyFingerprint, DerivedTargetCache, InvocationBackend,
-        LogicalMemoryContract, ModuleId, ModuleManagementAuthority, ModuleRegistry, ModuleState,
-        RegisterKind, ResourceRight,
+        ActiveCommand, ArgumentDirection, CapabilityName, CommandHandler, DefinitionId,
+        DependencyFingerprint, DerivedTargetCache, InvocationBackend, LogicalMemoryContract,
+        ModuleId, ModuleManagementAuthority, ModuleRegistry, ModuleState, RegisterContract,
+        RegisterKind, ResourceRight, SwiContract, same_replacement_manifest,
     },
 };
 use std::{
@@ -51,17 +54,18 @@ fn same_export_contracts(
 }
 
 use crate::wimp::{
-    WIMP_CLOSE_DOWN, WIMP_CLOSE_WINDOW, WIMP_CREATE_ICON, WIMP_CREATE_ICON_EX, WIMP_CREATE_MENU,
-    WIMP_CREATE_WINDOW, WIMP_DELETE_ICON, WIMP_FORCE_REDRAW, WIMP_GET_POINTER_INFO,
-    WIMP_GET_RECTANGLE, WIMP_GET_WINDOW_STATE, WIMP_INITIALISE, WIMP_OPEN_WINDOW, WIMP_POLL,
-    WIMP_REDRAW_WINDOW, WIMP_SET_EXTENT, WIMP_SET_ICON_STATE, WIMP_START_TASK, WIMP_UPDATE_WINDOW,
-    WimpServer, WorkArea,
+    DesktopTaskKind, WIMP_CLOSE_DOWN, WIMP_CLOSE_WINDOW, WIMP_CREATE_ICON, WIMP_CREATE_ICON_EX,
+    WIMP_CREATE_MENU, WIMP_CREATE_WINDOW, WIMP_DELETE_ICON, WIMP_FORCE_REDRAW,
+    WIMP_GET_POINTER_INFO, WIMP_GET_RECTANGLE, WIMP_GET_WINDOW_STATE, WIMP_INITIALISE,
+    WIMP_OPEN_WINDOW, WIMP_POLL, WIMP_REDRAW_WINDOW, WIMP_SET_EXTENT, WIMP_SET_ICON_STATE,
+    WIMP_START_TASK, WIMP_UPDATE_WINDOW, WimpServer, WorkArea,
 };
 
 const DISPLAY_BATCH_FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
 const INKEY_POLL_INTERVAL: Duration = Duration::from_millis(8);
 const MAX_EXTENDED_MODE_PIXELS: u64 = 4_194_304;
 const MAX_TASK_GRAPHICS_PIXELS: u64 = 8_388_608;
+const MAX_TASK_DEFAULT_GRAPHICS_CONTEXTS: usize = 64;
 
 pub const OS_WRITE_C: u32 = 0x00;
 pub const OS_WRITE_S: u32 = 0x01;
@@ -71,13 +75,22 @@ pub const OS_READ_C: u32 = 0x04;
 pub const OS_CLI: u32 = 0x05;
 pub const OS_BYTE: u32 = 0x06;
 pub const OS_WORD: u32 = 0x07;
+
+fn clock_from_chunks(context: &SwiContext) -> u64 {
+    u64::from(context.registers[R0] & 0xFFFF)
+        | (u64::from(context.registers[R1] & 0xFFFF) << 16)
+        | (u64::from(context.registers[R2] & 0xFF) << 32)
+}
 pub const OS_FILE: u32 = 0x08;
+pub const OS_FS_CONTROL: u32 = 0x29;
 pub const OS_ARGS: u32 = 0x09;
 pub const OS_BGET: u32 = 0x0A;
 pub const OS_BPUT: u32 = 0x0B;
 pub const OS_GBPB: u32 = 0x0C;
 pub const OS_FIND: u32 = 0x0D;
 pub const OS_READ_LINE: u32 = 0x0E;
+pub const OS_READ_VAR_VAL: u32 = 0x23;
+pub const OS_SET_VAR_VAL: u32 = 0x24;
 pub const OS_SWI_NUMBER_TO_STRING: u32 = 0x38;
 pub const OS_SWI_NUMBER_FROM_STRING: u32 = 0x39;
 pub const OS_READ_MONOTONIC_TIME: u32 = 0x42;
@@ -141,6 +154,13 @@ pub enum SwiDispatchRoute {
         generation: u64,
         backend: InvocationBackend,
     },
+    ModuleOwnedNamed {
+        name: String,
+        module: String,
+        definition: String,
+        definition_id: u64,
+        source_hash: String,
+    },
     TransitionalRust {
         number: u32,
     },
@@ -157,11 +177,15 @@ const R4: usize = 4;
 const R5: usize = 5;
 const R6: usize = 6;
 const R7: usize = 7;
+#[cfg(test)]
 const R8: usize = 8;
 const SWI_X_BIT: u32 = 1 << 17;
 const SWI_UNKNOWN_ERROR_CODE: u32 = 1;
+#[cfg(test)]
 const RICOCHET_DISPLAY_ABI_VERSION: u32 = 1;
+#[cfg(test)]
 const RICOCHET_DISPLAY_QUERY: u32 = 0;
+#[cfg(test)]
 const RICOCHET_DISPLAY_APPLY: u32 = 1;
 const SYSTEM_SWI_NAME_MAX_BYTES: usize = 128;
 const SYSTEM_SWI_NAME_MAX_BYTES_U32: u32 = 128;
@@ -171,6 +195,15 @@ const GUEST_ADDRESS_MASK: u32 = 0x3FFF_FFFF;
 const READ_LINE_ECHO_ONLY_BUFFERED: u32 = 1 << 31;
 const READ_LINE_ECHO_R4: u32 = 1 << 30;
 const MAX_CLI_BYTES: usize = 256;
+const MAX_OBEY_SCRIPT_BYTES: usize = 64 * 1024;
+// BASIC64 command handlers use recursive interpreter calls for nested OBEY.
+// Keep the hosted bound conservative to avoid exhausting the native stack.
+const MAX_OBEY_NESTING: usize = 8;
+const MAX_OBEY_LINES: usize = 4096;
+const MAX_OBEY_LINE_BYTES: usize = MAX_CLI_BYTES - 1;
+const MAX_EXEC_SOURCE_BYTES: usize = 64 * 1024;
+const MAX_EXEC_LINES: usize = 4096;
+const MAX_EXEC_LINE_BYTES: usize = MAX_CLI_BYTES - 1;
 const MAX_STRING_BYTES: usize = 4096;
 const CONFIG_SERVICE_OK: u32 = 0;
 const CONFIG_SERVICE_NOT_FOUND: u32 = 1;
@@ -180,8 +213,34 @@ const CONFIG_SERVICE_DENIED: u32 = 4;
 const CONFIG_VALUE_BUFFER_MAX: usize = 512;
 const CONFIG_ERROR_BUFFER_MAX: usize = 512;
 const OUTPUT_BUFFER: u32 = GUEST_MEMORY_BASE + 0x1000;
+#[cfg(test)]
 const CLI_STRING_BUFFER: u32 = GUEST_MEMORY_BASE + 0x3000;
-const HELP_TEXT: &[u8] = b"Ricochet MOS commands:\n\r  Commands can be abbreviated with a final dot (for example, *CA. and *CONF.); *. is a shortcut for *CAT.\n\r  *CAT [dir]             Catalogue a directory.\n\r  *DIR [dir]             Select the current directory.\n\r  *CDIR <dir>            Create a directory.\n\r  *DELETE <file>         Delete a file.\n\r  *RENAME <old> <new>    Rename a file or directory.\n\r  *FILETYPE <file> <id>  Set a RISC OS file type.\n\r  *TYPE <file>           Display a text file.\n\r  *DISC [name]           Read or set the volume name.\n\r  *HOSTFS                Select the HostFS filing system.\n\r  *CONFIGURE             Set preferences; use *CONFIGURE for its BASIC64-owned syntax.\n\r  *STATUS                Show saved configuration; use *STATUS for filters.\n\r  *BASIC <file>          Load and run BASIC with saved preferences.\n\r  *BASIC64 [options] <file> Run with native BASIC64 and modern text defaults.\n\r    Options: --mode CLASSIC|BASIC64|HYBRID --text CLASSIC|MODERN --override\n\r  DESKTOP                Start the hosted Wimp desktop.\n\r  RUN <file>             Run a BASIC source or tokenised file.\n\r  BASICLOAD <file>       Load a tokenised BASIC program.\n\r  BASICRUN               Run the loaded program.\n\r  BASICJIT [file]        Run with experimental native hot regions.\n\r  BASICJIT STRICT [file] Compile and run supported code without fallback.\n\r  HELP                   Show this help.\n\r  QUIT                   Exit the runtime.";
+
+/// Return the one- or two-byte physical line terminator at `offset`.
+/// CRLF is one boundary everywhere in the Exec source contract.
+fn exec_line_terminator_len(bytes: &[u8], offset: usize) -> Option<usize> {
+    match bytes.get(offset) {
+        Some(b'\r') if bytes.get(offset + 1) == Some(&b'\n') => Some(2),
+        Some(b'\r' | b'\n') => Some(1),
+        _ => None,
+    }
+}
+
+/// Return the 1-based physical line containing a byte offset in an Exec source.
+fn exec_source_line_at(bytes: &[u8], byte_offset: usize) -> u32 {
+    let mut offset = 0;
+    let mut line = 1_u32;
+    let end = byte_offset.min(bytes.len());
+    while offset < end {
+        if let Some(terminator_len) = exec_line_terminator_len(bytes, offset) {
+            line = line.saturating_add(1);
+            offset = offset.saturating_add(terminator_len);
+        } else {
+            offset += 1;
+        }
+    }
+    line
+}
 
 fn validate_boot_grants(
     module_name: &str,
@@ -195,10 +254,30 @@ fn validate_boot_grants(
             "GraphicsVduStream",
         ]
         .as_slice()
+    } else if module_name.eq_ignore_ascii_case("Mos") {
+        ["MosInput", "MosClock", "TaskMemory", "RuntimeErrors"].as_slice()
+    } else if module_name.eq_ignore_ascii_case("Graphics") {
+        ["GraphicsRaster", "RuntimeErrors"].as_slice()
+    } else if module_name.eq_ignore_ascii_case("ColourTrans") {
+        ["GraphicsRaster"].as_slice()
+    } else if module_name.eq_ignore_ascii_case("DesktopServices") {
+        ["FileSystem", "WimpSystemMenu"].as_slice()
+    } else if module_name.eq_ignore_ascii_case("DisplayManager") {
+        ["DisplaySettings"].as_slice()
+    } else if module_name.eq_ignore_ascii_case("Wimp") {
+        ["RuntimeErrors", "WimpTaskLifecycle", "WimpWindowState"].as_slice()
+    } else if module_name.eq_ignore_ascii_case("FileSwitch") {
+        [
+            "FileSystem",
+            "RuntimeErrors",
+            "SystemVariableStore",
+            "TaskMemory",
+        ]
+        .as_slice()
     } else if module_name.eq_ignore_ascii_case("Boot") {
         [].as_slice()
     } else if module_name.eq_ignore_ascii_case("System") {
-        ["StartupPolicy", "SystemQueries"].as_slice()
+        ["StartupPolicy", "SystemQueries", "SystemVariableStore"].as_slice()
     } else if module_name.eq_ignore_ascii_case("Error") {
         ["ErrorDispatch"].as_slice()
     } else if module_name.eq_ignore_ascii_case("Memory") {
@@ -207,9 +286,11 @@ fn validate_boot_grants(
         ["ModuleIntrospection", "ModuleManagement", "RuntimeErrors"].as_slice()
     } else if module_name.eq_ignore_ascii_case("RicochetCommands") {
         [
+            "CommandRegistry",
             "ConfigurationStoreRead",
             "ConfigurationStoreWrite",
-            "MosCommandBridge",
+            "CommandScripts",
+            "ExecInput",
             "RuntimeErrors",
             "TaskMemory",
         ]
@@ -271,23 +352,6 @@ fn write_display_query(wimp: &WimpServer, context: &mut SwiContext) {
     context.registers[R7] = host_height;
 }
 
-fn hsv_to_rgb(hue: f64, saturation: f64, value: f64) -> (u8, u8, u8) {
-    let hue = hue.rem_euclid(360.0) / 60.0;
-    let chroma = value * saturation.clamp(0.0, 1.0);
-    let secondary = chroma * (1.0 - (hue.rem_euclid(2.0) - 1.0).abs());
-    let (red, green, blue) = match hue as u8 {
-        0 => (chroma, secondary, 0.0),
-        1 => (secondary, chroma, 0.0),
-        2 => (0.0, chroma, secondary),
-        3 => (0.0, secondary, chroma),
-        4 => (secondary, 0.0, chroma),
-        _ => (chroma, 0.0, secondary),
-    };
-    let match_value = value - chroma;
-    let component = |channel: f64| ((channel + match_value) * 255.0).round() as u8;
-    (component(red), component(green), component(blue))
-}
-
 fn normalize_swi_error(error: RuntimeError) -> RuntimeError {
     match error {
         RuntimeError::InvalidSwi(number) => RuntimeError::Structured {
@@ -301,6 +365,66 @@ fn normalize_swi_error(error: RuntimeError) -> RuntimeError {
             message,
         },
         error => error,
+    }
+}
+
+fn named_colourtrans_contract(name: &str) -> SwiContract {
+    let registers = match name {
+        "COLOURTRANS_CONVERTHSVTORGB" => vec![
+            RegisterContract {
+                register: R0 as u8,
+                kind: RegisterKind::Signed { bits: 32 },
+                direction: ArgumentDirection::InOut,
+            },
+            RegisterContract {
+                register: R1 as u8,
+                kind: RegisterKind::Unsigned { bits: 32 },
+                direction: ArgumentDirection::InOut,
+            },
+            RegisterContract {
+                register: R2 as u8,
+                kind: RegisterKind::Unsigned { bits: 32 },
+                direction: ArgumentDirection::InOut,
+            },
+        ],
+        "COLOURTRANS_SETGCOL" => vec![RegisterContract {
+            register: R0 as u8,
+            kind: RegisterKind::Unsigned { bits: 32 },
+            direction: ArgumentDirection::In,
+        }],
+        _ => Vec::new(),
+    };
+    SwiContract {
+        registers,
+        logical_memory: Vec::new(),
+        program_counter: None,
+        carry: None,
+        may_block: false,
+        may_reenter: false,
+        error_transport: "RuntimeResult".into(),
+    }
+}
+
+fn named_project_service_contract(name: &str) -> SwiContract {
+    let count = match name {
+        "RICOCHET_DESKTOP" => 5,
+        "RICOCHET_DISPLAY" => 9,
+        _ => 0,
+    };
+    SwiContract {
+        registers: (0..count)
+            .map(|register| RegisterContract {
+                register: register as u8,
+                kind: RegisterKind::Unsigned { bits: 32 },
+                direction: ArgumentDirection::InOut,
+            })
+            .collect(),
+        logical_memory: Vec::new(),
+        program_counter: None,
+        carry: None,
+        may_block: false,
+        may_reenter: false,
+        error_transport: "RuntimeResult".into(),
     }
 }
 
@@ -407,6 +531,32 @@ fn read_control_terminated_bytes(
     ))
 }
 
+fn read_system_variable_selector(
+    memory: &crate::memory::GuestMemory,
+    address: u32,
+) -> Result<String, RuntimeError> {
+    let bytes = memory
+        .read_c_string(address, MAX_NAME_BYTES + 2)
+        .map_err(|error| match error {
+            crate::memory::MemoryError::MissingNullTerminator(_) => {
+                name_error("variable name/pattern is too long or not NUL-terminated")
+            }
+            other => RuntimeError::from(other),
+        })?;
+    let selector = String::from_utf8(bytes)
+        .map_err(|_| name_error("variable names/patterns must be visible ASCII"))?;
+    validate_selector(&selector)?;
+    Ok(selector)
+}
+
+fn is_system_variable_not_found(error: &RuntimeError) -> bool {
+    matches!(
+        error,
+        RuntimeError::Structured { type_name, code: 2, .. }
+            if type_name == "SystemVariableNotFound"
+    )
+}
+
 fn error_block_contents(error: &RuntimeError) -> (u32, String) {
     match error {
         RuntimeError::Structured {
@@ -481,12 +631,33 @@ struct ManagedResourceHandle {
     bytes: Vec<u8>,
 }
 
+struct ObeyScriptFrame {
+    handle: u32,
+    source_path: String,
+    obey_directory: String,
+    arguments: String,
+    bytes: Vec<u8>,
+    buffer_number: u32,
+    buffer_base: u32,
+    offset: usize,
+    next_line: u32,
+    current_line: Option<u32>,
+}
+
+#[derive(Default)]
+struct ObeyScriptSession {
+    frames: Vec<ObeyScriptFrame>,
+    total_bytes: usize,
+    total_lines: usize,
+}
+
 pub struct SwiDispatcher {
     mos: mos::MosState,
     configure: ConfigureStore,
     console: HostConsole,
     graphics: GraphicsService,
     modern_shell_console: bool,
+    task_default_graphics: HashMap<u64, GraphicsService>,
     window_graphics: HashMap<u32, GraphicsService>,
     active_graphics_window: Option<u32>,
     file_system: HostFileSystem,
@@ -500,6 +671,8 @@ pub struct SwiDispatcher {
     last_display_batch_publish: Option<Instant>,
     last_inkey_poll: Instant,
     active_module: Option<ModuleId>,
+    active_command_context: Option<CommandExecutionContext>,
+    suppress_command_key_polling: bool,
     module_registry: ModuleRegistry,
     module_management_authority: ModuleManagementAuthority,
     module_programs: HashMap<DefinitionId, Arc<SystemModule>>,
@@ -512,12 +685,39 @@ pub struct SwiDispatcher {
     transitional_dispatch_count: u64,
     startup_target: Option<BootStartupTarget>,
     boot_failure: Option<BootFailure>,
+    system_variables: SystemVariableStore,
+    obey_scripts: HashMap<u64, ObeyScriptSession>,
+    next_obey_handle: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BootStartupTarget {
     MosPrompt,
     Desktop,
+}
+
+/// Typed caller-side provenance for one command dispatch. The current source
+/// is interactive OS_CLI; `source_path`/`source_line` reserve explicit slots
+/// for future Obey/Exec routing without implementing those facilities here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandExecutionContext {
+    pub caller_task: u64,
+    pub command: String,
+    pub module: String,
+    pub module_version: crate::ricochet::SemanticVersion,
+    pub module_source_hash: String,
+    pub definition_id: Option<u64>,
+    pub raw_arguments: String,
+    pub origin: CommandInvocationOrigin,
+    pub source_path: Option<String>,
+    pub source_line: Option<u32>,
+    pub depth: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandInvocationOrigin {
+    InteractiveCli,
+    NestedCli,
 }
 
 /// Trusted host-side control plane for loading and replacing BASIC64 system
@@ -552,6 +752,121 @@ impl Basic64ModuleManager<'_> {
 impl SwiDispatcher {
     pub fn new(console: HostConsole) -> Self {
         Self::with_display_events(console, None, 1, None)
+    }
+
+    fn invoke_registered_command(
+        &mut self,
+        active: ActiveCommand,
+        arguments: String,
+        task: &mut Task,
+        _context: &mut SwiContext,
+    ) -> Result<(), RuntimeError> {
+        let previous = self.active_command_context.take();
+        let depth = previous
+            .as_ref()
+            .map_or(0, |parent| parent.depth.saturating_add(1));
+        if depth >= 64 {
+            self.active_command_context = previous;
+            return Err(RuntimeError::Program(
+                "command nesting exceeds the hosted limit of 64".into(),
+            ));
+        }
+        let origin = if previous.is_some() {
+            CommandInvocationOrigin::NestedCli
+        } else {
+            CommandInvocationOrigin::InteractiveCli
+        };
+        let definition_id = active
+            .definition
+            .as_ref()
+            .map(|definition| definition.id.diagnostic_value());
+        let command_name = active.command.name.clone();
+        let previous_key_poll_suppression = self.suppress_command_key_polling;
+        let script_source = self
+            .obey_scripts
+            .get(&task.id)
+            .and_then(|session| session.frames.last())
+            .and_then(|frame| {
+                frame
+                    .current_line
+                    .map(|line| (frame.source_path.clone(), line))
+            });
+        let exec_source = task
+            .exec_input_provenance()
+            .map(|(path, line)| (path.to_owned(), line));
+        // BASIC64 command-policy procedures can run for many interpreter
+        // steps (notably *HELP), but must not opportunistically consume the
+        // user's next terminal character while formatting a response. A
+        // Rust BRIDGE may launch an interactive BASIC program, so that path
+        // explicitly restores normal key polling for its duration.
+        self.suppress_command_key_polling =
+            matches!(&active.command.handler, CommandHandler::Basic64Proc(_));
+        self.active_command_context = Some(CommandExecutionContext {
+            caller_task: task.id,
+            command: active.command.name.clone(),
+            module: active.module_name.clone(),
+            module_version: active.module_version,
+            module_source_hash: active.source_hash.clone(),
+            definition_id,
+            raw_arguments: arguments.clone(),
+            origin,
+            source_path: script_source
+                .as_ref()
+                .map(|(path, _)| path.clone())
+                .or_else(|| exec_source.as_ref().map(|(path, _)| path.clone()))
+                .or_else(|| {
+                    previous
+                        .as_ref()
+                        .and_then(|parent| parent.source_path.clone())
+                }),
+            source_line: script_source
+                .as_ref()
+                .map(|(_, line)| *line)
+                .or_else(|| exec_source.as_ref().map(|(_, line)| *line))
+                .or_else(|| previous.as_ref().and_then(|parent| parent.source_line)),
+            depth,
+        });
+
+        let mut result = match active.command.handler {
+            CommandHandler::Basic64Proc(handler) => match active.definition {
+                Some(definition) => match self.module_programs.get(&definition.id).cloned() {
+                    Some(program) => self.with_module_execution(active.module, |dispatcher| {
+                        program.invoke_command_handler(
+                            active.module,
+                            &handler,
+                            command_name.clone(),
+                            arguments,
+                            task,
+                            dispatcher,
+                        )
+                    }),
+                    None => Err(RuntimeError::Program(format!(
+                        "command handler source for {} is not retained",
+                        active.command.name
+                    ))),
+                },
+                None => Err(RuntimeError::Program(format!(
+                    "active command {} has no resolved BASIC64 definition",
+                    active.command.name
+                ))),
+            },
+            CommandHandler::RustBridge => {
+                self.execute_cli_command(task, &active.command.name, &arguments)
+            }
+        };
+        if script_source.is_none()
+            && let (Err(error), Some((path, line))) = (&result, &exec_source)
+            && !matches!(
+                error,
+                RuntimeError::Structured { type_name, .. }
+                    if type_name == "ObeySourceError" || type_name == "ExecInputSourceError"
+            )
+        {
+            result = Err(exec_input_source_error(path, *line, error.to_string()));
+        }
+        self.active_command_context = previous;
+        self.suppress_command_key_polling = previous_key_poll_suppression;
+        result
     }
 
     pub(crate) fn call_module_primitive(
@@ -842,6 +1157,12 @@ impl SwiDispatcher {
             .module_registry
             .module_named(module_name)
             .ok_or_else(|| RuntimeError::Program(format!("unknown module {module_name}")))?;
+        if record.manifest.name.eq_ignore_ascii_case("Mos") {
+            return Err(RuntimeError::Program(format!(
+                "MOS SWI owner {} cannot be retired",
+                record.manifest.name
+            )));
+        }
         if record.state != ModuleState::Quiescing {
             return Err(RuntimeError::Program(format!(
                 "module {module_name} must be quiesced before Finalise"
@@ -1052,6 +1373,7 @@ impl SwiDispatcher {
             console,
             graphics: GraphicsService::default(),
             modern_shell_console: false,
+            task_default_graphics: HashMap::new(),
             window_graphics: HashMap::new(),
             active_graphics_window: None,
             file_system: HostFileSystem::demo_default(),
@@ -1065,6 +1387,8 @@ impl SwiDispatcher {
             last_display_batch_publish: None,
             last_inkey_poll: Instant::now(),
             active_module: None,
+            active_command_context: None,
+            suppress_command_key_polling: false,
             module_registry,
             module_management_authority,
             module_programs: HashMap::new(),
@@ -1077,6 +1401,9 @@ impl SwiDispatcher {
             transitional_dispatch_count: 0,
             startup_target: None,
             boot_failure: None,
+            system_variables: SystemVariableStore::default(),
+            obey_scripts: HashMap::new(),
+            next_obey_handle: 1,
         };
         if let Some(path) = std::env::var_os("RICOCHET_BOOT_CAPSULE")
             .or_else(|| std::env::var_os("ACORN_BOOT_CAPSULE"))
@@ -1126,6 +1453,8 @@ impl SwiDispatcher {
         let byte = RegisterKind::Unsigned { bits: 8 };
         let boolean = RegisterKind::Unsigned { bits: 1 };
         let status = RegisterKind::Unsigned { bits: 32 };
+        let address = RegisterKind::LogicalAddress { bits: 32 };
+        let s32 = RegisterKind::Signed { bits: 32 };
         self.module_registry
             .primitives
             .register(
@@ -1164,6 +1493,284 @@ impl SwiDispatcher {
         self.module_registry
             .primitives
             .register(
+                "Host.Graphics.Plot",
+                CapabilityName::new("GraphicsRaster").expect("static capability is valid"),
+                vec![status.clone(), status.clone(), status.clone()],
+                Vec::new(),
+                false,
+                true,
+                Vec::new(),
+                "GraphicsError",
+            )
+            .expect("embedded Graphics primitive names are unique");
+        self.module_registry
+            .primitives
+            .register(
+                "Host.Graphics.SetPackedRgb",
+                CapabilityName::new("GraphicsRaster").expect("static capability is valid"),
+                vec![status.clone()],
+                Vec::new(),
+                false,
+                true,
+                Vec::new(),
+                "RuntimeResult",
+            )
+            .expect("embedded ColourTrans primitive names are unique");
+        self.module_registry
+            .primitives
+            .register(
+                "Host.Graphics.ReadPoint",
+                CapabilityName::new("GraphicsRaster").expect("static capability is valid"),
+                vec![status.clone(), status.clone()],
+                vec![
+                    status.clone(),
+                    status.clone(),
+                    status.clone(),
+                    status.clone(),
+                ],
+                false,
+                true,
+                Vec::new(),
+                "GraphicsError",
+            )
+            .expect("embedded Graphics primitive names are unique");
+        let desktop_file_system =
+            CapabilityName::new("FileSystem").expect("static capability is valid");
+        let desktop_menu =
+            CapabilityName::new("WimpSystemMenu").expect("static capability is valid");
+        for (name, capability, arguments, results, memory_rules, error_type) in [
+            (
+                "Host.Desktop.ReadCatalogueEntry",
+                desktop_file_system.clone(),
+                vec![
+                    status.clone(),
+                    status.clone(),
+                    status.clone(),
+                    status.clone(),
+                ],
+                vec![
+                    status.clone(),
+                    status.clone(),
+                    status.clone(),
+                    status.clone(),
+                ],
+                vec![
+                    LogicalMemoryContract::Read {
+                        register: 0,
+                        max_bytes: Some(MAX_STRING_BYTES as u32),
+                    },
+                    LogicalMemoryContract::Write {
+                        register: 2,
+                        max_bytes: Some(MAX_STRING_BYTES as u32),
+                    },
+                ],
+                "DesktopCatalogueOrCallerBufferError",
+            ),
+            (
+                "Host.Desktop.WriteVolumeName",
+                desktop_file_system.clone(),
+                vec![status.clone(), status.clone()],
+                vec![status.clone()],
+                vec![LogicalMemoryContract::Write {
+                    register: 0,
+                    max_bytes: Some(MAX_STRING_BYTES as u32),
+                }],
+                "DesktopVolumeNameOrCallerBufferError",
+            ),
+            (
+                "Host.Desktop.ReadModificationTime",
+                desktop_file_system,
+                vec![status.clone(), status.clone()],
+                vec![status.clone(), status.clone()],
+                vec![LogicalMemoryContract::Read {
+                    register: 0,
+                    max_bytes: Some(MAX_STRING_BYTES as u32),
+                }],
+                "DesktopCatalogueError",
+            ),
+            (
+                "Host.Desktop.RegisterSystemMenu",
+                desktop_menu,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                "DesktopMenuRegistrationError",
+            ),
+            (
+                "Host.Display.Query",
+                CapabilityName::new("DisplaySettings").expect("static capability is valid"),
+                Vec::new(),
+                vec![status.clone(); 6],
+                Vec::new(),
+                "DisplayQueryError",
+            ),
+            (
+                "Host.Display.Apply",
+                CapabilityName::new("DisplaySettings").expect("static capability is valid"),
+                vec![status.clone(), status.clone()],
+                vec![status.clone(); 7],
+                Vec::new(),
+                "DisplayApplyOrAuthorizationError",
+            ),
+            (
+                "Host.Display.RequireConfigurationWrite",
+                CapabilityName::new("DisplaySettings").expect("static capability is valid"),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                "DisplayConfigurationAuthorizationError",
+            ),
+        ] {
+            self.module_registry
+                .primitives
+                .register(
+                    name,
+                    capability,
+                    arguments,
+                    results,
+                    false,
+                    true,
+                    memory_rules,
+                    error_type,
+                )
+                .expect("embedded Desktop and Display primitives are unique");
+        }
+        let wimp_lifecycle = CapabilityName::new("WimpTaskLifecycle")
+            .expect("static Wimp lifecycle capability is valid");
+        let wimp_windows =
+            CapabilityName::new("WimpWindowState").expect("static Wimp window capability is valid");
+        for (name, arguments, results, error_type) in [
+            (
+                "Host.Wimp.OpenWindow",
+                vec![
+                    status.clone(),
+                    s32.clone(),
+                    s32.clone(),
+                    s32.clone(),
+                    s32.clone(),
+                    s32.clone(),
+                    s32.clone(),
+                    s32.clone(),
+                ],
+                Vec::new(),
+                "WimpWindowError",
+            ),
+            (
+                "Host.Wimp.CloseWindow",
+                vec![status.clone()],
+                Vec::new(),
+                "WimpWindowError",
+            ),
+            (
+                "Host.Wimp.ReadWindowState",
+                vec![status.clone()],
+                vec![
+                    s32.clone(),
+                    s32.clone(),
+                    s32.clone(),
+                    s32.clone(),
+                    s32.clone(),
+                    s32.clone(),
+                    s32.clone(),
+                    s32.clone(),
+                ],
+                "WimpWindowError",
+            ),
+            (
+                "Host.Wimp.SetExtent",
+                vec![
+                    status.clone(),
+                    s32.clone(),
+                    s32.clone(),
+                    s32.clone(),
+                    s32.clone(),
+                ],
+                Vec::new(),
+                "WimpWindowError",
+            ),
+        ] {
+            self.module_registry
+                .primitives
+                .register(
+                    name,
+                    wimp_windows.clone(),
+                    arguments,
+                    results,
+                    false,
+                    true,
+                    Vec::new(),
+                    error_type,
+                )
+                .expect("embedded Wimp window primitive names are unique");
+        }
+        for (name, arguments, results, memory_rules, error_type) in [
+            (
+                "Host.Wimp.ValidateInitialiseInputs",
+                vec![status.clone(), address.clone(), address.clone()],
+                Vec::new(),
+                Vec::new(),
+                "CheckedWimpInitialiseInputError",
+            ),
+            (
+                "Host.Wimp.RegisterTask",
+                Vec::new(),
+                vec![status.clone(), status.clone()],
+                Vec::new(),
+                "WimpTaskRegistrationError",
+            ),
+            (
+                "Host.Wimp.CloseTask",
+                vec![status.clone()],
+                Vec::new(),
+                Vec::new(),
+                "WimpTaskOwnershipError",
+            ),
+            (
+                "Host.Wimp.ReadStartTaskByte",
+                vec![address.clone(), status.clone()],
+                vec![byte.clone()],
+                Vec::new(),
+                "CheckedWimpStartTaskCommandError",
+            ),
+            (
+                "Host.Wimp.QueueCommandsTask",
+                Vec::new(),
+                vec![status.clone()],
+                Vec::new(),
+                "WimpTaskLaunchError",
+            ),
+            (
+                "Host.Wimp.QueueBasicWindowTask",
+                Vec::new(),
+                vec![status.clone()],
+                Vec::new(),
+                "WimpTaskLaunchError",
+            ),
+            (
+                "Host.Wimp.QueueBasicFileTask",
+                vec![address.clone(), status.clone(), status.clone()],
+                vec![status.clone()],
+                Vec::new(),
+                "CheckedWimpTaskPathOrLaunchError",
+            ),
+        ] {
+            self.module_registry
+                .primitives
+                .register(
+                    name,
+                    wimp_lifecycle.clone(),
+                    arguments,
+                    results,
+                    false,
+                    true,
+                    memory_rules,
+                    error_type,
+                )
+                .expect("embedded Wimp lifecycle primitive names are unique");
+        }
+        self.module_registry
+            .primitives
+            .register(
                 "Host.Console.ReadByteStatus",
                 CapabilityName::new("ConsoleInput").expect("static capability is valid"),
                 Vec::new(),
@@ -1174,6 +1781,699 @@ impl SwiDispatcher {
                 "RuntimeResult<ByteOrEndOfInput>",
             )
             .expect("embedded Console primitive names are unique");
+        self.module_registry
+            .primitives
+            .register(
+                "Host.MosInput.InsertKey",
+                CapabilityName::new("MosInput").expect("static capability is valid"),
+                vec![byte.clone()],
+                vec![boolean.clone()],
+                false,
+                true,
+                Vec::new(),
+                "KeyboardBufferFull",
+            )
+            .expect("embedded MOS input primitive names are unique");
+        self.module_registry
+            .primitives
+            .register(
+                "Host.MosInput.FlushKeyboard",
+                CapabilityName::new("MosInput").expect("static capability is valid"),
+                Vec::new(),
+                Vec::new(),
+                false,
+                true,
+                Vec::new(),
+                "KeyboardInputError",
+            )
+            .expect("embedded MOS input primitive names are unique");
+        self.module_registry
+            .primitives
+            .register(
+                "Host.MosInput.ReadTimed",
+                CapabilityName::new("MosInput").expect("static capability is valid"),
+                vec![RegisterKind::Unsigned { bits: 16 }],
+                vec![byte.clone(), byte.clone()],
+                true,
+                false,
+                Vec::new(),
+                "TimedKeyboardInputError",
+            )
+            .expect("embedded MOS input primitive names are unique");
+        for (name, capability, inputs, outputs) in [
+            (
+                "Host.Clock.ReadSystemChunks",
+                "MosClock",
+                Vec::new(),
+                vec![
+                    RegisterKind::Unsigned { bits: 16 },
+                    RegisterKind::Unsigned { bits: 16 },
+                    byte.clone(),
+                ],
+            ),
+            (
+                "Host.Clock.WriteSystemChunks",
+                "MosClock",
+                vec![
+                    RegisterKind::Unsigned { bits: 16 },
+                    RegisterKind::Unsigned { bits: 16 },
+                    byte.clone(),
+                ],
+                Vec::new(),
+            ),
+            (
+                "Host.Clock.ReadIntervalChunks",
+                "MosClock",
+                Vec::new(),
+                vec![
+                    RegisterKind::Unsigned { bits: 16 },
+                    RegisterKind::Unsigned { bits: 16 },
+                    byte.clone(),
+                ],
+            ),
+            (
+                "Host.Clock.WriteIntervalChunks",
+                "MosClock",
+                vec![
+                    RegisterKind::Unsigned { bits: 16 },
+                    RegisterKind::Unsigned { bits: 16 },
+                    byte.clone(),
+                ],
+                Vec::new(),
+            ),
+        ] {
+            self.module_registry
+                .primitives
+                .register(
+                    name,
+                    CapabilityName::new(capability).expect("static capability is valid"),
+                    inputs,
+                    outputs,
+                    false,
+                    true,
+                    Vec::new(),
+                    "ClockServiceError",
+                )
+                .expect("embedded MOS clock primitive names are unique");
+        }
+        self.module_registry
+            .primitives
+            .register(
+                "Host.Memory.ReadFiveBytes",
+                CapabilityName::new("TaskMemory").expect("static capability is valid"),
+                vec![address.clone()],
+                vec![byte.clone(); 5],
+                false,
+                true,
+                vec![LogicalMemoryContract::Read {
+                    register: 0,
+                    max_bytes: Some(5),
+                }],
+                "CheckedCallerMemoryError",
+            )
+            .expect("embedded MOS memory primitive names are unique");
+        self.module_registry
+            .primitives
+            .register(
+                "Host.Memory.WriteFiveBytes",
+                CapabilityName::new("TaskMemory").expect("static capability is valid"),
+                vec![
+                    address.clone(),
+                    byte.clone(),
+                    byte.clone(),
+                    byte.clone(),
+                    byte.clone(),
+                    byte.clone(),
+                ],
+                Vec::new(),
+                false,
+                true,
+                vec![LogicalMemoryContract::Write {
+                    register: 0,
+                    max_bytes: Some(5),
+                }],
+                "CheckedCallerMemoryError",
+            )
+            .expect("embedded MOS memory primitive names are unique");
+        let file_u32 = RegisterKind::Unsigned { bits: 32 };
+        let file_s32 = RegisterKind::Signed { bits: 32 };
+        let file_system = CapabilityName::new("FileSystem").expect("static capability is valid");
+        for (name, arguments, results, memory_rules, failure) in [
+            (
+                "Host.FileChannel.Open",
+                vec![file_u32.clone(), file_u32.clone()],
+                vec![file_u32.clone(), file_u32.clone()],
+                vec![LogicalMemoryContract::Read {
+                    register: 0,
+                    max_bytes: Some(MAX_STRING_BYTES as u32),
+                }],
+                "CheckedGuestPathOrOpenError",
+            ),
+            (
+                "Host.FileChannel.Close",
+                vec![file_u32.clone()],
+                Vec::new(),
+                Vec::new(),
+                "TaskOwnedFileHandleError",
+            ),
+            (
+                "Host.FileChannel.ReadByte",
+                vec![file_u32.clone()],
+                vec![byte.clone(), boolean.clone()],
+                Vec::new(),
+                "TaskOwnedFileReadError",
+            ),
+            (
+                "Host.FileChannel.WriteByte",
+                vec![file_u32.clone(), byte.clone()],
+                Vec::new(),
+                Vec::new(),
+                "TaskOwnedFileWriteError",
+            ),
+            (
+                "Host.FileChannel.ReadPosition",
+                vec![file_u32.clone()],
+                vec![file_s32.clone()],
+                Vec::new(),
+                "TaskOwnedFilePositionError",
+            ),
+            (
+                "Host.FileChannel.SetPosition",
+                vec![file_u32.clone(), file_u32.clone()],
+                Vec::new(),
+                Vec::new(),
+                "TaskOwnedFilePositionError",
+            ),
+            (
+                "Host.FileChannel.ReadExtent",
+                vec![file_u32.clone()],
+                vec![file_s32.clone()],
+                Vec::new(),
+                "TaskOwnedFileExtentError",
+            ),
+            (
+                "Host.FileChannel.SetExtent",
+                vec![file_u32.clone(), file_u32.clone()],
+                Vec::new(),
+                Vec::new(),
+                "TaskOwnedFileExtentError",
+            ),
+            (
+                "Host.FileChannel.CanonicalNameLength",
+                vec![file_u32.clone()],
+                vec![file_u32.clone()],
+                Vec::new(),
+                "TaskOwnedFileNameError",
+            ),
+            (
+                "Host.FileChannel.Args7SpareBytes",
+                vec![file_u32.clone(), file_u32.clone()],
+                vec![RegisterKind::Signed { bits: 32 }],
+                Vec::new(),
+                "FileSwitchArgsArithmeticError",
+            ),
+            (
+                "Host.FileChannel.WriteCanonicalName",
+                vec![file_u32.clone(), file_u32.clone()],
+                Vec::new(),
+                vec![LogicalMemoryContract::Write {
+                    register: 1,
+                    max_bytes: Some(MAX_STRING_BYTES as u32),
+                }],
+                "CheckedCallerMemoryOrFileNameError",
+            ),
+            (
+                "Host.FileChannel.ValidateTransferSpan",
+                vec![file_s32.clone(), file_s32.clone()],
+                Vec::new(),
+                Vec::new(),
+                "CheckedCallerMemoryOrTransferBoundError",
+            ),
+            (
+                "Host.FileChannel.ValidateDirectoryInfoAddress",
+                vec![file_s32.clone()],
+                Vec::new(),
+                Vec::new(),
+                "CheckedCallerMemoryAlignmentError",
+            ),
+            (
+                "Host.FileChannel.ValidateTransferRange",
+                vec![
+                    file_u32.clone(),
+                    file_s32.clone(),
+                    file_s32.clone(),
+                    boolean.clone(),
+                ],
+                vec![boolean.clone(), file_s32.clone()],
+                Vec::new(),
+                "TaskOwnedFileTransferError",
+            ),
+            (
+                "Host.FileChannel.ValidateTransferRangeRaw",
+                vec![
+                    file_u32.clone(),
+                    file_u32.clone(),
+                    file_s32.clone(),
+                    boolean.clone(),
+                ],
+                vec![boolean.clone(), file_s32.clone()],
+                Vec::new(),
+                "TaskOwnedFileTransferError",
+            ),
+            (
+                "Host.FileChannel.ReadTransfer",
+                vec![file_u32.clone(), file_s32.clone(), file_s32.clone()],
+                vec![file_u32.clone()],
+                Vec::new(),
+                "TaskOwnedFileReadOrMemoryError",
+            ),
+            (
+                "Host.FileChannel.WriteTransfer",
+                vec![file_u32.clone(), file_s32.clone(), file_s32.clone()],
+                Vec::new(),
+                Vec::new(),
+                "TaskOwnedFileWriteOrMemoryError",
+            ),
+            (
+                "Host.FileChannel.FixedNameLength",
+                vec![byte.clone()],
+                vec![file_u32.clone()],
+                Vec::new(),
+                "TaskFileNameError",
+            ),
+            (
+                "Host.FileChannel.FixedNameByte",
+                vec![byte.clone(), file_u32.clone()],
+                vec![byte.clone()],
+                Vec::new(),
+                "TaskFileNameError",
+            ),
+            (
+                "Host.FileChannel.OpenDirectorySnapshot",
+                vec![file_s32.clone(), file_s32.clone()],
+                vec![file_u32.clone(), file_u32.clone()],
+                Vec::new(),
+                "CheckedGuestPathOrCatalogueError",
+            ),
+            (
+                "Host.FileChannel.ReadDirectoryEntry",
+                vec![file_u32.clone(), file_u32.clone()],
+                vec![file_u32.clone(); 2],
+                Vec::new(),
+                "TaskDirectorySnapshotError",
+            ),
+            (
+                "Host.FileChannel.NormalizeDirectoryStart",
+                vec![file_u32.clone(), file_s32.clone()],
+                vec![file_u32.clone()],
+                Vec::new(),
+                "TaskDirectorySnapshotError",
+            ),
+            (
+                "Host.FileChannel.ReadDirectoryFieldByte",
+                vec![
+                    file_u32.clone(),
+                    file_u32.clone(),
+                    byte.clone(),
+                    byte.clone(),
+                ],
+                vec![byte.clone()],
+                Vec::new(),
+                "TaskDirectorySnapshotError",
+            ),
+            (
+                "Host.FileChannel.ReadDirectoryNameByte",
+                vec![file_u32.clone(), file_u32.clone(), file_u32.clone()],
+                vec![byte.clone()],
+                Vec::new(),
+                "TaskDirectorySnapshotError",
+            ),
+            (
+                "Host.FileChannel.WriteCallerByte",
+                vec![file_s32.clone(), byte.clone()],
+                Vec::new(),
+                Vec::new(),
+                "CheckedCallerMemoryError",
+            ),
+        ] {
+            self.module_registry
+                .primitives
+                .register(
+                    name,
+                    file_system.clone(),
+                    arguments,
+                    results,
+                    false,
+                    true,
+                    memory_rules,
+                    failure,
+                )
+                .expect("embedded FileSwitch primitive names are unique");
+        }
+        let file_path_contract = |register| LogicalMemoryContract::Read {
+            register,
+            max_bytes: Some(MAX_STRING_BYTES as u32),
+        };
+        for (name, arguments, results, memory_rules, failure) in [
+            (
+                "Host.FileObject.Catalogue",
+                vec![file_u32.clone()],
+                vec![file_u32.clone(); 5],
+                vec![file_path_contract(0)],
+                "CheckedGuestPathOrFileCatalogueError",
+            ),
+            (
+                "Host.FileObject.SaveBlock",
+                vec![file_u32.clone(); 7],
+                Vec::new(),
+                vec![file_path_contract(0)],
+                "CheckedGuestPathMemoryOrFileSaveError",
+            ),
+            (
+                "Host.FileObject.LoadBlock",
+                vec![file_u32.clone(), file_u32.clone(), file_u32.clone()],
+                vec![file_u32.clone(); 4],
+                vec![file_path_contract(0)],
+                "CheckedGuestPathMemoryOrFileLoadError",
+            ),
+            (
+                "Host.FileObject.SetMetadata",
+                vec![file_u32.clone(); 6],
+                Vec::new(),
+                vec![file_path_contract(0)],
+                "CheckedGuestPathOrFileMetadataError",
+            ),
+            (
+                "Host.FileObject.CreateEmpty",
+                vec![file_u32.clone(); 5],
+                Vec::new(),
+                vec![file_path_contract(0)],
+                "CheckedGuestPathOrFileCreateError",
+            ),
+            (
+                "Host.FileObject.CreateDirectory",
+                vec![file_u32.clone()],
+                Vec::new(),
+                vec![file_path_contract(0)],
+                "CheckedGuestPathOrDirectoryCreateError",
+            ),
+            (
+                "Host.FileObject.DeleteFile",
+                vec![file_u32.clone()],
+                Vec::new(),
+                vec![file_path_contract(0)],
+                "CheckedGuestPathOrFileDeleteError",
+            ),
+            (
+                "Host.FileObject.DeleteDirectory",
+                vec![file_u32.clone()],
+                Vec::new(),
+                vec![file_path_contract(0)],
+                "CheckedGuestPathOrDirectoryDeleteError",
+            ),
+            (
+                "Host.FileObject.InvalidSaveRange",
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                "InvalidOSFileSaveRange",
+            ),
+            (
+                "Host.FileObject.CatalogueCandidate",
+                vec![file_u32.clone(); 4],
+                vec![file_u32.clone(); 6],
+                vec![LogicalMemoryContract::Read {
+                    register: 1,
+                    max_bytes: Some(MAX_STRING_BYTES as u32),
+                }],
+                "CheckedGuestPathOrFileCatalogueError",
+            ),
+            (
+                "Host.FileObject.LoadCandidate",
+                vec![file_u32.clone(); 6],
+                vec![file_u32.clone(); 4],
+                vec![LogicalMemoryContract::Read {
+                    register: 1,
+                    max_bytes: Some(MAX_STRING_BYTES as u32),
+                }],
+                "CheckedGuestPathMemoryOrFileLoadError",
+            ),
+            (
+                "Host.FileObject.SearchPathNotFound",
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                "FileSearchPathNotFound",
+            ),
+        ] {
+            self.module_registry
+                .primitives
+                .register(
+                    name,
+                    file_system.clone(),
+                    arguments,
+                    results,
+                    false,
+                    true,
+                    memory_rules,
+                    failure,
+                )
+                .expect("embedded FileSwitch object primitives are unique");
+        }
+        let fs_read_path = |register| LogicalMemoryContract::Read {
+            register,
+            max_bytes: Some(MAX_STRING_BYTES as u32),
+        };
+        let fs_address = RegisterKind::LogicalAddress { bits: 32 };
+        for (name, arguments, results, memory_rules, failure) in [
+            (
+                "Host.FileSwitch.SetDirectory",
+                vec![file_u32.clone(), file_u32.clone()],
+                Vec::new(),
+                vec![fs_read_path(1)],
+                "FileSwitchDirectoryError",
+            ),
+            (
+                "Host.FileSwitch.UnsetDirectory",
+                vec![file_u32.clone()],
+                Vec::new(),
+                Vec::new(),
+                "FileSwitchDirectoryError",
+            ),
+            (
+                "Host.FileSwitch.SwapDirectories",
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                "FileSwitchDirectoryError",
+            ),
+            (
+                "Host.FileSwitch.SetTemporaryFromPrefix",
+                vec![file_u32.clone()],
+                vec![file_u32.clone(), file_u32.clone(), file_u32.clone()],
+                vec![fs_read_path(0)],
+                "FileSwitchSelectionError",
+            ),
+            (
+                "Host.FileSwitch.ReadPathVariable",
+                vec![file_u32.clone(), fs_address.clone()],
+                vec![boolean.clone(), file_u32.clone()],
+                vec![
+                    fs_read_path(0),
+                    LogicalMemoryContract::Write {
+                        register: 1,
+                        max_bytes: Some(256),
+                    },
+                ],
+                "CheckedPathVariableOrCallerMemoryError",
+            ),
+            (
+                "Host.FileSwitch.ReadPathSpecification",
+                vec![file_u32.clone(), fs_address.clone()],
+                vec![file_u32.clone()],
+                vec![
+                    fs_read_path(0),
+                    LogicalMemoryContract::Write {
+                        register: 1,
+                        max_bytes: Some(256),
+                    },
+                ],
+                "CheckedPathSpecificationOrCallerMemoryError",
+            ),
+            (
+                "Host.FileSwitch.ReadPathName",
+                vec![file_u32.clone(), fs_address.clone()],
+                vec![file_u32.clone()],
+                vec![
+                    fs_read_path(0),
+                    LogicalMemoryContract::Write {
+                        register: 1,
+                        max_bytes: Some(MAX_STRING_BYTES as u32),
+                    },
+                ],
+                "CheckedGuestPathOrCallerMemoryError",
+            ),
+            (
+                "Host.FileSwitch.CanonicalPathExists",
+                vec![fs_address.clone()],
+                vec![boolean.clone()],
+                vec![fs_read_path(0)],
+                "CheckedGuestPathError",
+            ),
+            (
+                "Host.FileSwitch.RestoreTemporary",
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                "FileSwitchSelectionError",
+            ),
+            (
+                "Host.FileSwitch.ProbeFileSystemNumber",
+                vec![file_u32.clone()],
+                vec![file_u32.clone(), file_u32.clone()],
+                Vec::new(),
+                "FileSwitchSelectionError",
+            ),
+            (
+                "Host.FileSwitch.ProbeFileSystemName",
+                vec![file_u32.clone(), byte.clone()],
+                vec![file_u32.clone(), file_u32.clone(), file_u32.clone()],
+                vec![fs_read_path(0)],
+                "FileSwitchSelectionError",
+            ),
+            (
+                "Host.FileSwitch.SelectFileSystem",
+                vec![file_u32.clone()],
+                Vec::new(),
+                Vec::new(),
+                "FileSwitchSelectionError",
+            ),
+            (
+                "Host.FileSwitch.ClearFileSystemSelection",
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                "FileSwitchSelectionError",
+            ),
+            (
+                "Host.FileSwitch.CloseAllChannels",
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                "TaskOwnedFileHandleError",
+            ),
+            (
+                "Host.FileSwitch.RenameObject",
+                vec![file_u32.clone(), file_u32.clone()],
+                Vec::new(),
+                vec![fs_read_path(0), fs_read_path(1)],
+                "CheckedGuestPathOrRenameError",
+            ),
+            (
+                "Host.FileSwitch.SetVolumeName",
+                vec![file_u32.clone(), file_u32.clone()],
+                Vec::new(),
+                vec![fs_read_path(0), fs_read_path(1)],
+                "CheckedGuestPathOrVolumeNameError",
+            ),
+            (
+                "Host.FileSwitch.FileTypeText",
+                vec![file_u32.clone()],
+                vec![file_u32.clone(), file_u32.clone()],
+                Vec::new(),
+                "FileSwitchTypeError",
+            ),
+            (
+                "Host.FileSwitch.ParseFileType",
+                vec![file_u32.clone()],
+                vec![file_u32.clone()],
+                vec![fs_read_path(0)],
+                "FileSwitchTypeError",
+            ),
+            (
+                "Host.FileSwitch.FileSystemNameLength",
+                vec![file_u32.clone()],
+                vec![file_u32.clone()],
+                Vec::new(),
+                "FileSwitchNameError",
+            ),
+            (
+                "Host.FileSwitch.FileSystemNameByte",
+                vec![file_u32.clone(), file_u32.clone()],
+                vec![byte.clone()],
+                Vec::new(),
+                "FileSwitchNameError",
+            ),
+            (
+                "Host.FileSwitch.VolumeNameWriteLength",
+                vec![file_u32.clone(), file_u32.clone()],
+                vec![file_u32.clone()],
+                Vec::new(),
+                "FileSwitchNameError",
+            ),
+            (
+                "Host.FileSwitch.CanonicalPathLength",
+                vec![fs_address.clone()],
+                vec![file_u32.clone()],
+                vec![fs_read_path(0)],
+                "CheckedGuestPathError",
+            ),
+            (
+                "Host.FileSwitch.CanonicalPathByte",
+                vec![fs_address.clone(), file_u32.clone()],
+                vec![byte.clone()],
+                vec![fs_read_path(0)],
+                "CheckedGuestPathError",
+            ),
+            (
+                "Host.FileSwitch.CanonicalCapacityFits",
+                vec![file_s32.clone(), file_u32.clone()],
+                vec![boolean.clone()],
+                Vec::new(),
+                "FileSwitchArgsArithmeticError",
+            ),
+            (
+                "Host.FileSwitch.CanonicalSpareBytes",
+                vec![file_s32.clone(), file_u32.clone()],
+                vec![file_s32.clone()],
+                Vec::new(),
+                "FileSwitchArgsArithmeticError",
+            ),
+            (
+                "Host.FileSwitch.WriteCanonicalPath",
+                vec![fs_address.clone(), file_u32.clone(), file_u32.clone()],
+                Vec::new(),
+                vec![
+                    fs_read_path(0),
+                    LogicalMemoryContract::Write {
+                        register: 1,
+                        max_bytes: Some(MAX_STRING_BYTES as u32),
+                    },
+                ],
+                "CheckedCallerMemoryOrFileNameError",
+            ),
+            (
+                "Host.FileSwitch.OpenCatalogueSnapshot",
+                vec![fs_address.clone(), fs_address.clone()],
+                vec![file_u32.clone(), file_u32.clone()],
+                vec![fs_read_path(0), fs_read_path(1)],
+                "CheckedGuestPathOrCatalogueError",
+            ),
+        ] {
+            self.module_registry
+                .primitives
+                .register(
+                    name,
+                    file_system.clone(),
+                    arguments,
+                    results,
+                    false,
+                    true,
+                    memory_rules,
+                    failure,
+                )
+                .expect("embedded FileSwitch policy primitives are unique");
+        }
         self.module_registry
             .primitives
             .register(
@@ -1379,6 +2679,59 @@ impl SwiDispatcher {
                 "MonotonicCentiseconds",
             )
             .expect("embedded System primitive names are unique");
+        let variable_address = RegisterKind::LogicalAddress { bits: 32 };
+        let variable_length = RegisterKind::Signed { bits: 32 };
+        let variable_type = RegisterKind::Unsigned { bits: 32 };
+        self.module_registry
+            .primitives
+            .register(
+                "Host.SystemVariables.Read",
+                CapabilityName::new("SystemVariableStore").expect("static capability is valid"),
+                vec![
+                    variable_address.clone(),
+                    variable_address.clone(),
+                    variable_length.clone(),
+                    variable_type.clone(),
+                    variable_type.clone(),
+                ],
+                vec![
+                    variable_address.clone(),
+                    variable_address.clone(),
+                    variable_length,
+                    variable_type.clone(),
+                    variable_type,
+                ],
+                false,
+                true,
+                Vec::new(),
+                "CheckedCallerBuffersOrSystemVariableError",
+            )
+            .expect("embedded system-variable primitive names are unique");
+        self.module_registry
+            .primitives
+            .register(
+                "Host.SystemVariables.Write",
+                CapabilityName::new("SystemVariableStore").expect("static capability is valid"),
+                vec![
+                    RegisterKind::LogicalAddress { bits: 32 },
+                    RegisterKind::LogicalAddress { bits: 32 },
+                    RegisterKind::Signed { bits: 32 },
+                    RegisterKind::Unsigned { bits: 32 },
+                    RegisterKind::Unsigned { bits: 32 },
+                ],
+                vec![
+                    RegisterKind::LogicalAddress { bits: 32 },
+                    RegisterKind::LogicalAddress { bits: 32 },
+                    RegisterKind::Signed { bits: 32 },
+                    RegisterKind::Unsigned { bits: 32 },
+                    RegisterKind::Unsigned { bits: 32 },
+                ],
+                false,
+                false,
+                Vec::new(),
+                "TaskAuthorizationDeniedOrCheckedCallerBufferOrSystemVariableError",
+            )
+            .expect("embedded system-variable primitive names are unique");
         self.module_registry
             .primitives
             .register(
@@ -1527,7 +2880,12 @@ impl SwiDispatcher {
                     RegisterKind::LogicalAddress { bits: 32 },
                     RegisterKind::Unsigned { bits: 32 },
                 ],
-                vec![RegisterKind::Unsigned { bits: 32 }; 4],
+                vec![
+                    RegisterKind::Unsigned { bits: 32 },
+                    RegisterKind::Unsigned { bits: 32 },
+                    RegisterKind::Unsigned { bits: 32 },
+                    RegisterKind::Unsigned { bits: 32 },
+                ],
                 false,
                 true,
                 vec![
@@ -1642,19 +3000,130 @@ impl SwiDispatcher {
         self.module_registry
             .primitives
             .register(
-                "Host.MOS.ExecuteLegacy",
-                CapabilityName::new("MosCommandBridge").expect("static capability is valid"),
-                vec![RegisterKind::LogicalAddress { bits: 32 }],
+                "Host.CommandRegistry.ReadEntry",
+                CapabilityName::new("CommandRegistry").expect("static capability is valid"),
+                vec![
+                    RegisterKind::Unsigned { bits: 32 },
+                    RegisterKind::LogicalAddress { bits: 32 },
+                    RegisterKind::Unsigned { bits: 32 },
+                ],
+                vec![RegisterKind::Unsigned { bits: 32 }; 2],
+                false,
+                true,
+                vec![LogicalMemoryContract::Write {
+                    register: 1,
+                    max_bytes: Some(1024),
+                }],
+                "CommandRegistryBufferError",
+            )
+            .expect("embedded command-registry primitive names are unique");
+        self.module_registry
+            .primitives
+            .register(
+                "Host.CommandRegistry.Invoke",
+                CapabilityName::new("CommandRegistry").expect("static capability is valid"),
+                vec![RegisterKind::LogicalAddress { bits: 32 }; 5],
                 Vec::new(),
                 true,
+                false,
+                vec![
+                    LogicalMemoryContract::Read {
+                        register: 0,
+                        max_bytes: Some(33),
+                    },
+                    LogicalMemoryContract::Read {
+                        register: 1,
+                        max_bytes: Some(65),
+                    },
+                    LogicalMemoryContract::Read {
+                        register: 2,
+                        max_bytes: Some(17),
+                    },
+                    LogicalMemoryContract::Read {
+                        register: 3,
+                        max_bytes: Some(65),
+                    },
+                    LogicalMemoryContract::Read {
+                        register: 4,
+                        max_bytes: Some(MAX_CLI_BYTES as u32),
+                    },
+                ],
+                "CommandNotFoundOrHandlerError",
+            )
+            .expect("embedded command-registry primitive names are unique");
+        self.module_registry
+            .primitives
+            .register(
+                "Host.CommandScripts.Open",
+                CapabilityName::new("CommandScripts").expect("static capability is valid"),
+                vec![
+                    RegisterKind::LogicalAddress { bits: 32 },
+                    RegisterKind::LogicalAddress { bits: 32 },
+                ],
+                vec![RegisterKind::Unsigned { bits: 32 }],
+                false,
+                false,
+                vec![
+                    LogicalMemoryContract::Read {
+                        register: 0,
+                        max_bytes: Some(MAX_CLI_BYTES as u32),
+                    },
+                    LogicalMemoryContract::Read {
+                        register: 1,
+                        max_bytes: Some(MAX_CLI_BYTES as u32),
+                    },
+                ],
+                "ObeyFileOrBoundedScriptError",
+            )
+            .expect("embedded command-script primitive names are unique");
+        self.module_registry
+            .primitives
+            .register(
+                "Host.CommandScripts.ReadLine",
+                CapabilityName::new("CommandScripts").expect("static capability is valid"),
+                vec![RegisterKind::Unsigned { bits: 32 }],
+                vec![
+                    RegisterKind::Unsigned { bits: 32 },
+                    RegisterKind::Unsigned { bits: 32 },
+                    RegisterKind::Unsigned { bits: 32 },
+                    RegisterKind::LogicalAddress { bits: 32 },
+                    RegisterKind::LogicalAddress { bits: 32 },
+                ],
+                false,
+                false,
+                Vec::new(),
+                "ObeyLineOrBoundedScriptError",
+            )
+            .expect("embedded command-script primitive names are unique");
+        self.module_registry
+            .primitives
+            .register(
+                "Host.CommandScripts.Close",
+                CapabilityName::new("CommandScripts").expect("static capability is valid"),
+                vec![RegisterKind::Unsigned { bits: 32 }],
+                Vec::new(),
+                false,
+                false,
+                Vec::new(),
+                "ObeyContextError",
+            )
+            .expect("embedded command-script primitive names are unique");
+        self.module_registry
+            .primitives
+            .register(
+                "Host.ExecInput.Replace",
+                CapabilityName::new("ExecInput").expect("static capability is valid"),
+                vec![RegisterKind::LogicalAddress { bits: 32 }],
+                Vec::new(),
+                false,
                 false,
                 vec![LogicalMemoryContract::Read {
                     register: 0,
                     max_bytes: Some(MAX_CLI_BYTES as u32),
                 }],
-                "LegacyMosCommandError",
+                "ExecPathOrBoundedInputError",
             )
-            .expect("embedded MOS command primitive names are unique");
+            .expect("embedded Exec input primitive names are unique");
         self.module_registry
             .primitives
             .register(
@@ -1819,6 +3288,7 @@ impl SwiDispatcher {
             "RicochetCommands",
             "Memory",
             "Boot",
+            "Mos",
         ] {
             if !capsule
                 .modules
@@ -2037,6 +3507,39 @@ impl SwiDispatcher {
         self.quit_requested
     }
 
+    fn obey_source(&self, task_id: u64) -> Option<(String, u32)> {
+        self.obey_scripts
+            .get(&task_id)
+            .and_then(|session| session.frames.last())
+            .and_then(|frame| {
+                frame
+                    .current_line
+                    .map(|line| (frame.source_path.clone(), line))
+            })
+    }
+
+    fn obey_directory(&self, task_id: u64) -> Option<&str> {
+        self.obey_scripts
+            .get(&task_id)
+            .and_then(|session| session.frames.last())
+            .map(|frame| frame.obey_directory.as_str())
+    }
+
+    fn unwind_obey_scripts(&mut self, task: &mut Task, depth: usize) {
+        let Some(session) = self.obey_scripts.get_mut(&task.id) else {
+            return;
+        };
+        let keep_depth = depth.min(session.frames.len());
+        let frames = session.frames.drain(keep_depth..).collect::<Vec<_>>();
+        for frame in frames {
+            let _ = task.memory.remove_dynamic_area(frame.buffer_number);
+        }
+        session.total_bytes = session.frames.iter().map(|frame| frame.bytes.len()).sum();
+        if session.frames.is_empty() {
+            self.obey_scripts.remove(&task.id);
+        }
+    }
+
     pub fn desktop_requested(&self) -> bool {
         self.desktop_requested
     }
@@ -2070,6 +3573,12 @@ impl SwiDispatcher {
         } else {
             self.graphics.mode_pixel_count()
         };
+        total = total.saturating_add(
+            self.task_default_graphics
+                .values()
+                .map(GraphicsService::mode_pixel_count)
+                .sum::<u64>(),
+        );
         for (handle, graphics) in &self.window_graphics {
             total = total.saturating_add(if Some(*handle) == target_window {
                 replacement_pixels
@@ -2405,6 +3914,9 @@ impl SwiDispatcher {
             text_profile,
             encoding,
         )?;
+        for graphics in self.task_default_graphics.values_mut() {
+            graphics.set_display_profiles(graphics_profile, text_profile, encoding)?;
+        }
         let snapshot = self.current_graphics().snapshot().clone();
         if snapshot != previous {
             self.publish_snapshot(snapshot);
@@ -2528,7 +4040,10 @@ impl SwiDispatcher {
         result
     }
 
-    pub(crate) fn poll_key(&mut self) -> Option<u8> {
+    pub(crate) fn poll_key(&mut self, task: &Task) -> Option<u8> {
+        if self.suppress_command_key_polling || task.has_exec_input() {
+            return None;
+        }
         if self.last_inkey_poll.elapsed() < INKEY_POLL_INTERVAL {
             return None;
         }
@@ -2645,6 +4160,16 @@ impl SwiDispatcher {
                 definition.id
             ))));
         };
+        let previous_key_poll_suppression = self.suppress_command_key_polling;
+        if number == OS_CLI || number == OS_READ_LINE {
+            // OS_CLI owns command parsing/dispatch, and OS_ReadLine may block
+            // while consuming the same input queue. Keep either complete
+            // module-owned call frame isolated from opportunistic INKEY
+            // polling so a long line cannot lose characters to the scheduler.
+            // A Rust BRIDGE can explicitly re-enable polling while it runs an
+            // interactive guest program.
+            self.suppress_command_key_polling = true;
+        }
         let result = module.invoke(
             ownership.module,
             &definition,
@@ -2653,6 +4178,10 @@ impl SwiDispatcher {
             self,
             context,
         );
+        self.suppress_command_key_polling = previous_key_poll_suppression;
+        if number == WIMP_CLOSE_DOWN && result.is_ok() {
+            self.release_closed_wimp_graphics();
+        }
         self.last_dispatch_route = Some(SwiDispatchRoute::ModuleOwned {
             number,
             name: ownership.name,
@@ -2664,6 +4193,25 @@ impl SwiDispatcher {
         drop(definition);
         self.collect_retired_module_programs();
         Some(result)
+    }
+
+    fn release_closed_wimp_graphics(&mut self) {
+        let Some(wimp) = &self.wimp else {
+            return;
+        };
+        let live_handles = wimp
+            .desktop_windows()
+            .into_iter()
+            .map(|window| window.handle)
+            .collect::<std::collections::HashSet<_>>();
+        self.window_graphics
+            .retain(|handle, _| live_handles.contains(handle));
+        if self
+            .active_graphics_window
+            .is_some_and(|handle| !live_handles.contains(&handle))
+        {
+            self.active_graphics_window = None;
+        }
     }
 
     fn record_transitional_numeric_dispatch(&mut self, number: u32) {
@@ -2735,12 +4283,1670 @@ impl SwiDispatcher {
             }
         }
         match name.to_ascii_uppercase().as_str() {
-            "HOST.GRAPHICS.ACCEPTBYTE" => self.vdu_accept_byte(context),
+            "HOST.WIMP.OPENWINDOW" => {
+                let wimp = self.wimp.as_ref().ok_or_else(|| {
+                    RuntimeError::Program("Wimp window service is unavailable".into())
+                })?;
+                wimp.open_window_values(
+                    task,
+                    context.registers[R0],
+                    WorkArea {
+                        min_x: context.registers[R1] as i32,
+                        min_y: context.registers[R2] as i32,
+                        max_x: context.registers[R3] as i32,
+                        max_y: context.registers[R4] as i32,
+                    },
+                    context.registers[R5] as i32,
+                    context.registers[R6] as i32,
+                    context.registers[R7] as i32,
+                )
+            }
+            "HOST.WIMP.CLOSEWINDOW" => {
+                let wimp = self.wimp.as_ref().ok_or_else(|| {
+                    RuntimeError::Program("Wimp window service is unavailable".into())
+                })?;
+                wimp.close_window_handle(task, context.registers[R0])
+            }
+            "HOST.WIMP.READWINDOWSTATE" => {
+                let wimp = self.wimp.as_ref().ok_or_else(|| {
+                    RuntimeError::Program("Wimp window service is unavailable".into())
+                })?;
+                let values = wimp.window_state_values(task, context.registers[R0])?;
+                context.registers[R0] = values[1];
+                context.registers[R1] = values[2];
+                context.registers[R2] = values[3];
+                context.registers[R3] = values[4];
+                context.registers[R4] = values[5];
+                context.registers[R5] = values[6];
+                context.registers[R6] = values[7];
+                context.registers[R7] = values[8];
+                Ok(())
+            }
+            "HOST.WIMP.SETEXTENT" => {
+                let wimp = self.wimp.as_ref().ok_or_else(|| {
+                    RuntimeError::Program("Wimp window service is unavailable".into())
+                })?;
+                wimp.set_extent_values(
+                    task,
+                    context.registers[R0],
+                    WorkArea {
+                        min_x: context.registers[R1] as i32,
+                        min_y: context.registers[R2] as i32,
+                        max_x: context.registers[R3] as i32,
+                        max_y: context.registers[R4] as i32,
+                    },
+                )
+            }
+            "HOST.WIMP.VALIDATEINITIALISEINPUTS" => {
+                let wimp = self.wimp.as_ref().ok_or_else(|| {
+                    RuntimeError::Program(
+                        "Wimp task lifecycle requires the hosted Wimp service".into(),
+                    )
+                })?;
+                wimp.validate_initialise_inputs(
+                    task,
+                    context.registers[R0],
+                    context.registers[R1],
+                    context.registers[R2],
+                )
+            }
+            "HOST.WIMP.REGISTERTASK" => {
+                let wimp = self.wimp.as_ref().ok_or_else(|| {
+                    RuntimeError::Program(
+                        "Wimp task lifecycle requires the hosted Wimp service".into(),
+                    )
+                })?;
+                let (version, handle) = wimp.register_task(task)?;
+                context.registers[R0] = version;
+                context.registers[R1] = handle;
+                Ok(())
+            }
+            "HOST.WIMP.CLOSETASK" => {
+                let wimp = self.wimp.as_ref().ok_or_else(|| {
+                    RuntimeError::Program(
+                        "Wimp task lifecycle requires the hosted Wimp service".into(),
+                    )
+                })?;
+                wimp.close_task_for_caller(task, context.registers[R0])
+            }
+            "HOST.WIMP.READSTARTTASKBYTE" => {
+                let wimp = self.wimp.as_ref().ok_or_else(|| {
+                    RuntimeError::Program(
+                        "Wimp task lifecycle requires the hosted Wimp service".into(),
+                    )
+                })?;
+                context.registers[R0] = u32::from(wimp.read_start_task_byte(
+                    task,
+                    context.registers[R0],
+                    context.registers[R1],
+                )?);
+                Ok(())
+            }
+            "HOST.WIMP.QUEUECOMMANDSTASK" | "HOST.WIMP.QUEUEBASICWINDOWTASK" => {
+                let wimp = self.wimp.as_ref().ok_or_else(|| {
+                    RuntimeError::Program(
+                        "Wimp task lifecycle requires the hosted Wimp service".into(),
+                    )
+                })?;
+                let kind = if name.eq_ignore_ascii_case("Host.Wimp.QueueCommandsTask") {
+                    DesktopTaskKind::Commands
+                } else {
+                    DesktopTaskKind::BasicWindow
+                };
+                context.registers[R0] = wimp.queue_launch_for_caller(task, kind, "")?;
+                Ok(())
+            }
+            "HOST.WIMP.QUEUEBASICFILETASK" => {
+                let wimp = self.wimp.as_ref().ok_or_else(|| {
+                    RuntimeError::Program(
+                        "Wimp task lifecycle requires the hosted Wimp service".into(),
+                    )
+                })?;
+                let address = context.registers[R0]
+                    .checked_add(context.registers[R1])
+                    .ok_or(crate::memory::MemoryError::AddressOverflow)?;
+                let bytes = task
+                    .memory
+                    .read_caller_data_bytes(address, context.registers[R2] as usize)?;
+                let path = std::str::from_utf8(&bytes).map_err(|_| {
+                    RuntimeError::Program("Wimp_StartTask path is not valid UTF-8".into())
+                })?;
+                context.registers[R0] =
+                    wimp.queue_launch_for_caller(task, DesktopTaskKind::File, path)?;
+                Ok(())
+            }
+            "HOST.FILESWITCH.SETDIRECTORY" => {
+                let kind = context.registers[R0];
+                let path = fs_control_guest_string(task, context.registers[R1], MAX_STRING_BYTES)?;
+                let path = String::from_utf8(path).map_err(|_| {
+                    RuntimeError::Program("FileSwitch path is not valid UTF-8".into())
+                })?;
+                match kind {
+                    0 => self
+                        .file_system
+                        .set_current_directory(
+                            &mut task.file_system,
+                            if path.is_empty() { "&" } else { &path },
+                        )
+                        .map_err(|_| file_switch_guest_error("directory selection")),
+                    1 => {
+                        let target = if path.is_empty() { "$.Library" } else { &path };
+                        match self
+                            .file_system
+                            .set_library_directory(&mut task.file_system, target)
+                            .map_err(|_| file_switch_guest_error("library selection"))
+                        {
+                            Ok(()) => Ok(()),
+                            Err(_) if path.is_empty() => self
+                                .file_system
+                                .set_library_directory(&mut task.file_system, "@")
+                                .map_err(|_| file_switch_guest_error("library selection")),
+                            Err(error) => Err(error),
+                        }
+                    }
+                    39 => self
+                        .file_system
+                        .set_user_root(&mut task.file_system, &path)
+                        .map_err(|_| file_switch_guest_error("user-root selection")),
+                    _ => Err(RuntimeError::Program(
+                        "unsupported FileSwitch directory kind".into(),
+                    )),
+                }
+            }
+            "HOST.FILESWITCH.UNSETDIRECTORY" => {
+                match context.registers[R0] {
+                    0 => task.file_system.current_directory.clear(),
+                    1 => task.file_system.user_root.clear(),
+                    2 => task.file_system.library_directory.clear(),
+                    _ => {
+                        return Err(RuntimeError::Program(
+                            "unsupported FileSwitch directory kind".into(),
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            "HOST.FILESWITCH.SWAPDIRECTORIES" => {
+                std::mem::swap(
+                    &mut task.file_system.current_directory,
+                    &mut task.file_system.previous_directory,
+                );
+                Ok(())
+            }
+            "HOST.FILESWITCH.SETTEMPORARYFROMPREFIX" => {
+                let address = context.registers[R0];
+                let bytes = fs_control_guest_string(task, address, MAX_STRING_BYTES)?;
+                let path = String::from_utf8(bytes).map_err(|_| {
+                    RuntimeError::Program("FileSwitch prefix is not valid UTF-8".into())
+                })?;
+                let Some(colon) = path.find(':') else {
+                    context.registers[R0] = address;
+                    context.registers[R1] = u32::MAX;
+                    context.registers[R2] = 0;
+                    return Ok(());
+                };
+                let file_system_name = &path[..colon];
+                if file_system_name.contains('#') {
+                    return Err(file_switch_guest_error(
+                        "temporary filing-system special fields are unsupported",
+                    ));
+                }
+                if !self.file_system.check_file_system_name(file_system_name) {
+                    return Err(file_switch_guest_error(
+                        "temporary filing-system prefix is unsupported",
+                    ));
+                }
+                let previous = if task.file_system.temporary_file_system.is_empty() {
+                    0
+                } else if task
+                    .file_system
+                    .temporary_file_system
+                    .eq_ignore_ascii_case(self.file_system.file_system_name())
+                {
+                    HOST_FS_NUMBER
+                } else {
+                    return Err(file_switch_guest_error(
+                        "previous temporary filing system is unsupported",
+                    ));
+                };
+                let next = address
+                    .checked_add(u32::try_from(colon + 1).map_err(|_| {
+                        RuntimeError::Program("FileSwitch prefix exceeds U32".into())
+                    })?)
+                    .ok_or_else(|| RuntimeError::Program("FileSwitch pointer overflow".into()))?;
+                task.file_system.temporary_file_system = file_system_name.to_ascii_uppercase();
+                context.registers[R0] = next;
+                context.registers[R1] = previous;
+                context.registers[R2] = 0;
+                Ok(())
+            }
+            "HOST.FILESWITCH.READPATHVARIABLE" => {
+                let raw_name =
+                    fs_control_guest_string(task, context.registers[R0], MAX_NAME_BYTES)?;
+                let name = std::str::from_utf8(&raw_name)
+                    .map_err(|_| file_switch_guest_error("path-variable name is not ASCII"))?;
+                validate_file_path_variable_name(name)
+                    .map_err(|_| file_switch_guest_error("path-variable name is invalid"))?;
+                match self.system_variables.read(name, None) {
+                    Ok(variable) => {
+                        if !matches!(
+                            variable.variable_type,
+                            SystemVariableType::String | SystemVariableType::LiteralString
+                        ) {
+                            return Err(file_switch_guest_error(
+                                "path-variable type is unsupported",
+                            ));
+                        }
+                        if variable.value.len() > 255 {
+                            return Err(file_switch_guest_error(
+                                "path-variable value exceeds 255 bytes",
+                            ));
+                        }
+                        write_checked_guest_string(task, context.registers[R1], &variable.value)?;
+                        context.registers[R0] = 1;
+                        context.registers[R1] = variable.value.len() as u32;
+                    }
+                    Err(error) if is_system_variable_not_found(&error) => {
+                        context.registers[R0] = 0;
+                        context.registers[R1] = 0;
+                    }
+                    Err(_) => {
+                        return Err(file_switch_guest_error("path-variable lookup"));
+                    }
+                }
+                Ok(())
+            }
+            "HOST.FILESWITCH.READPATHSPECIFICATION" => {
+                let bytes = read_control_terminated_path_spec(task, context.registers[R0], 255)?;
+                let text = String::from_utf8(bytes)
+                    .map_err(|_| file_switch_guest_error("path specification is not UTF-8"))?;
+                if text.len() > 255 {
+                    return Err(file_switch_guest_error(
+                        "path specification exceeds 255 bytes",
+                    ));
+                }
+                write_checked_guest_string(task, context.registers[R1], &text)?;
+                context.registers[R0] = text.len() as u32;
+                Ok(())
+            }
+            "HOST.FILESWITCH.READPATHNAME" => {
+                let bytes = fs_control_guest_string(task, context.registers[R0], MAX_STRING_BYTES)?;
+                let text = String::from_utf8(bytes)
+                    .map_err(|_| file_switch_guest_error("pathname is not UTF-8"))?;
+                if text.len() + 1 > MAX_STRING_BYTES {
+                    return Err(file_switch_guest_error("pathname exceeds 4095 bytes"));
+                }
+                write_checked_guest_string(task, context.registers[R1], &text)?;
+                context.registers[R0] = text.len() as u32;
+                Ok(())
+            }
+            "HOST.FILESWITCH.CANONICALPATHEXISTS" => {
+                let raw = fs_control_guest_string(task, context.registers[R0], MAX_STRING_BYTES)?;
+                let path = String::from_utf8(raw)
+                    .map_err(|_| file_switch_guest_error("pathname is not UTF-8"))?;
+                let resolved = self
+                    .file_system
+                    .canonical_guest_path(&task.file_system, &path)
+                    .map_err(|_| file_switch_guest_error("canonical candidate lookup"))?;
+                context.registers[R0] = u32::from(resolved.host_path.exists());
+                Ok(())
+            }
+            "HOST.FILESWITCH.RESTORETEMPORARY" => {
+                task.file_system.temporary_file_system =
+                    task.file_system.current_file_system.to_ascii_uppercase();
+                Ok(())
+            }
+            "HOST.FILESWITCH.PROBEFILESYSTEMNUMBER" => {
+                let number = context.registers[R0];
+                let present = number == HOST_FS_NUMBER;
+                context.registers[R0] = u32::from(present);
+                context.registers[R1] = if present { HOST_FS_CONTROL_BLOCK } else { 0 };
+                Ok(())
+            }
+            "HOST.FILESWITCH.PROBEFILESYSTEMNAME" => {
+                let raw = read_file_system_name(
+                    task,
+                    context.registers[R0],
+                    MAX_NAME_BYTES,
+                    context.registers[R1] != 0,
+                )?;
+                let name = String::from_utf8(raw).map_err(|_| {
+                    RuntimeError::Program("filing system name is not valid UTF-8".into())
+                })?;
+                if name.is_empty() || name.chars().any(char::is_control) {
+                    return Err(RuntimeError::Program(
+                        "filing system name is malformed".into(),
+                    ));
+                }
+                if context.registers[R1] == 0
+                    && name.bytes().any(|byte| matches!(byte, b'#' | b':' | b'-'))
+                {
+                    return Err(RuntimeError::Program(
+                        "filing system name contains an invalid terminator character".into(),
+                    ));
+                }
+                let present = self.file_system.check_file_system_name(&name);
+                context.registers[R0] = u32::from(present);
+                context.registers[R1] = if present { HOST_FS_NUMBER } else { 0 };
+                context.registers[R2] = if present { HOST_FS_CONTROL_BLOCK } else { 0 };
+                Ok(())
+            }
+            "HOST.FILESWITCH.SELECTFILESYSTEM" => {
+                let number = context.registers[R0];
+                if number != HOST_FS_NUMBER {
+                    return Err(RuntimeError::Program(format!(
+                        "filing system number {number} is not present"
+                    )));
+                }
+                task.file_system.current_file_system =
+                    self.file_system.file_system_name().to_string();
+                task.file_system.temporary_file_system =
+                    task.file_system.current_file_system.clone();
+                Ok(())
+            }
+            "HOST.FILESWITCH.CLEARFILESYSTEMSELECTION" => {
+                task.file_system.current_file_system.clear();
+                task.file_system.temporary_file_system.clear();
+                Ok(())
+            }
+            "HOST.FILESWITCH.CLOSEALLCHANNELS" => {
+                task.file_system.open_files.clear();
+                Ok(())
+            }
+            "HOST.FILESWITCH.RENAMEOBJECT" => {
+                let from = String::from_utf8(fs_control_guest_string(
+                    task,
+                    context.registers[R0],
+                    MAX_STRING_BYTES,
+                )?)
+                .map_err(|_| RuntimeError::Program("source pathname is not valid UTF-8".into()))?;
+                let to = String::from_utf8(fs_control_guest_string(
+                    task,
+                    context.registers[R1],
+                    MAX_STRING_BYTES,
+                )?)
+                .map_err(|_| {
+                    RuntimeError::Program("destination pathname is not valid UTF-8".into())
+                })?;
+                self.file_object_validate_mutation(task, &from, true)?;
+                self.file_object_validate_mutation(task, &to, true)?;
+                self.file_system
+                    .rename(&task.file_system, &from, &to)
+                    .map_err(|_| file_object_error("rename"))
+            }
+            "HOST.FILESWITCH.SETVOLUMENAME" => {
+                let object = String::from_utf8(fs_control_guest_string(
+                    task,
+                    context.registers[R0],
+                    MAX_STRING_BYTES,
+                )?)
+                .map_err(|_| RuntimeError::Program("object pathname is not valid UTF-8".into()))?;
+                let name = String::from_utf8(fs_control_guest_string(
+                    task,
+                    context.registers[R1],
+                    MAX_STRING_BYTES,
+                )?)
+                .map_err(|_| RuntimeError::Program("volume name is not valid UTF-8".into()))?;
+                if name.bytes().any(|byte| matches!(byte, b'/' | b'\\')) {
+                    return Err(RuntimeError::Program("invalid volume name".into()));
+                }
+                let resolved = self
+                    .file_system
+                    .canonical_guest_path(&task.file_system, &object)
+                    .map_err(|_| file_switch_guest_error("volume-name object lookup"))?;
+                if !resolved.host_path.exists() {
+                    return Err(RuntimeError::Program(
+                        "volume rename object was not found".into(),
+                    ));
+                }
+                self.file_system.set_volume_name(&name).map_err(|_| {
+                    RuntimeError::Program(
+                        "volume name update failed in the guest filing system".into(),
+                    )
+                })
+            }
+            "HOST.FILESWITCH.FILETYPETEXT" => {
+                let bytes = file_type_name(context.registers[R0]);
+                context.registers[R0] = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                context.registers[R1] = u32::from_le_bytes(bytes[4..].try_into().unwrap());
+                Ok(())
+            }
+            "HOST.FILESWITCH.PARSEFILETYPE" => {
+                let text =
+                    String::from_utf8(fs_control_guest_string(task, context.registers[R0], 64)?)
+                        .map_err(|_| {
+                            RuntimeError::Program("file type text is not valid UTF-8".into())
+                        })?;
+                context.registers[R0] = parse_file_type(&text)?;
+                Ok(())
+            }
+            "HOST.FILESWITCH.FILESYSTEMNAMELENGTH" => {
+                context.registers[R0] = if context.registers[R0] == HOST_FS_NUMBER {
+                    self.file_system.file_system_name().len() as u32
+                } else {
+                    0
+                };
+                Ok(())
+            }
+            "HOST.FILESWITCH.FILESYSTEMNAMEBYTE" => {
+                let name = if context.registers[R0] == HOST_FS_NUMBER {
+                    self.file_system.file_system_name().as_bytes()
+                } else {
+                    b""
+                };
+                context.registers[R0] =
+                    u32::from(*name.get(context.registers[R1] as usize).ok_or_else(|| {
+                        RuntimeError::Program("filesystem name byte is unavailable".into())
+                    })?);
+                Ok(())
+            }
+            "HOST.FILESWITCH.VOLUMENAMEWRITELENGTH" => {
+                let capacity = context.registers[R0] as usize;
+                let length = context.registers[R1] as usize;
+                if capacity > 0 && capacity < length.saturating_add(1) {
+                    return Err(RuntimeError::Program(
+                        "filesystem name buffer is too small".into(),
+                    ));
+                }
+                context.registers[R0] =
+                    u32::try_from(if capacity == 0 { 0 } else { length }).unwrap_or(u32::MAX);
+                Ok(())
+            }
+            "HOST.FILESWITCH.CANONICALPATHLENGTH" => {
+                let path = String::from_utf8(fs_control_guest_string(
+                    task,
+                    context.registers[R0],
+                    MAX_STRING_BYTES,
+                )?)
+                .map_err(|_| RuntimeError::Program("pathname is not valid UTF-8".into()))?;
+                let resolved = self
+                    .file_system
+                    .canonical_guest_path(&task.file_system, &path)
+                    .map_err(|_| file_switch_guest_error("canonical path lookup"))?;
+                let canonical =
+                    canonical_guest_name(self.file_system.volume_name(), &resolved.guest_path);
+                context.registers[R0] = u32::try_from(canonical.len())
+                    .map_err(|_| RuntimeError::Program("canonical name exceeds U32".into()))?;
+                Ok(())
+            }
+            "HOST.FILESWITCH.CANONICALPATHBYTE" => {
+                let path = String::from_utf8(fs_control_guest_string(
+                    task,
+                    context.registers[R0],
+                    MAX_STRING_BYTES,
+                )?)
+                .map_err(|_| RuntimeError::Program("pathname is not valid UTF-8".into()))?;
+                let resolved = self
+                    .file_system
+                    .canonical_guest_path(&task.file_system, &path)
+                    .map_err(|_| file_switch_guest_error("canonical path lookup"))?;
+                let canonical =
+                    canonical_guest_name(self.file_system.volume_name(), &resolved.guest_path);
+                context.registers[R0] = u32::from(
+                    *canonical
+                        .as_bytes()
+                        .get(context.registers[R1] as usize)
+                        .ok_or_else(|| {
+                            RuntimeError::Program("canonical-name byte is unavailable".into())
+                        })?,
+                );
+                Ok(())
+            }
+            "HOST.FILESWITCH.CANONICALCAPACITYFITS" => {
+                context.registers[R0] = u32::from(
+                    (context.registers[R0] as i32 as u32)
+                        >= context.registers[R1].saturating_add(1),
+                );
+                Ok(())
+            }
+            "HOST.FILESWITCH.CANONICALSPAREBYTES" => {
+                context.registers[R0] = ((context.registers[R0] as i32 as u32)
+                    .wrapping_sub(context.registers[R1])
+                    as i32) as u32;
+                Ok(())
+            }
+            "HOST.FILESWITCH.WRITECANONICALPATH" => {
+                let path = String::from_utf8(fs_control_guest_string(
+                    task,
+                    context.registers[R0],
+                    MAX_STRING_BYTES,
+                )?)
+                .map_err(|_| RuntimeError::Program("pathname is not valid UTF-8".into()))?;
+                let resolved = self
+                    .file_system
+                    .canonical_guest_path(&task.file_system, &path)
+                    .map_err(|_| file_switch_guest_error("canonical path lookup"))?;
+                let canonical =
+                    canonical_guest_name(self.file_system.volume_name(), &resolved.guest_path);
+                if canonical.len() as u32 != context.registers[R2] {
+                    return Err(RuntimeError::Program(
+                        "canonical-name length changed".into(),
+                    ));
+                }
+                let mut bytes = canonical.into_bytes();
+                bytes.push(0);
+                task.memory
+                    .write_caller_data_bytes(context.registers[R1], &bytes)?;
+                Ok(())
+            }
+            "HOST.FILESWITCH.OPENCATALOGUESNAPSHOT" => {
+                let directory = String::from_utf8(fs_control_guest_string(
+                    task,
+                    context.registers[R0],
+                    MAX_STRING_BYTES,
+                )?)
+                .map_err(|_| file_switch_guest_error("catalogue directory is not UTF-8"))?;
+                let wildcard = String::from_utf8(fs_control_guest_string(
+                    task,
+                    context.registers[R1],
+                    MAX_STRING_BYTES,
+                )?)
+                .map_err(|_| file_switch_guest_error("catalogue wildcard is not UTF-8"))?;
+                let entries = self
+                    .file_system
+                    .enumerate_bounded(&task.file_system, &directory, &wildcard, 4096)
+                    .map_err(|_| file_switch_guest_error("catalogue lookup"))?;
+                let mut bytes = 0usize;
+                for item in &entries {
+                    bytes = bytes
+                        .checked_add(item.guest_name.len() + 24)
+                        .ok_or_else(|| RuntimeError::Program("catalogue size overflow".into()))?;
+                }
+                if bytes > crate::memory::GUEST_MEMORY_SIZE {
+                    return Err(RuntimeError::Program(
+                        "catalogue exceeds hosted bound".into(),
+                    ));
+                }
+                let id = task
+                    .file_system
+                    .gbpb_directory_snapshot_id
+                    .wrapping_add(1)
+                    .max(1);
+                task.file_system.gbpb_directory_snapshot = entries;
+                task.file_system.gbpb_directory_snapshot_id = id;
+                context.registers[R0] = id;
+                context.registers[R1] = task.file_system.gbpb_directory_snapshot.len() as u32;
+                Ok(())
+            }
+            "HOST.GRAPHICS.ACCEPTBYTE" => self.vdu_accept_byte(task, context),
+            "HOST.GRAPHICS.SETPACKEDRGB" => {
+                self.graphics_set_packed_rgb_for_task(task, context.registers[R0])
+            }
+            "HOST.GRAPHICS.PLOT" => self.graphics_plot_for_task(
+                task,
+                context.registers[R0] as u8,
+                context.registers[R1] as i32,
+                context.registers[R2] as i32,
+            ),
+            "HOST.GRAPHICS.READPOINT" => {
+                let x = context.registers[R0] as i32;
+                let y = context.registers[R1] as i32;
+                let window = self.graphics_window_for_task(task.id);
+                let graphics = match window {
+                    Some(handle) => self.window_graphics.get(&handle).ok_or_else(|| {
+                        RuntimeError::Program(
+                            "active caller graphics window has no raster context".into(),
+                        )
+                    })?,
+                    None if self.task_uses_shared_default_graphics(task.id) => &self.graphics,
+                    None => self.task_default_graphics_mut(task.id)?,
+                };
+                let modern = graphics.snapshot().text_profile == TextRenderingProfile::Modern;
+                let point = graphics.read_point(x, y);
+                if let Some((colour, tint)) = point {
+                    context.registers[R0] = colour;
+                    context.registers[R1] = tint;
+                    context.registers[R2] = 1;
+                } else {
+                    context.registers[R0] = 0;
+                    context.registers[R1] = 0;
+                    context.registers[R2] = 0;
+                }
+                context.registers[R3] = u32::from(modern);
+                Ok(())
+            }
+            "HOST.DESKTOP.READCATALOGUEENTRY" => {
+                let path = read_desktop_guest_path(task, context.registers[R0], MAX_STRING_BYTES)?;
+                let path = String::from_utf8(path).map_err(|_| {
+                    RuntimeError::Program("desktop guest directory is not valid UTF-8".into())
+                })?;
+                let capacity = context.registers[R3];
+                if capacity == 0 || capacity as usize > MAX_STRING_BYTES {
+                    return Err(RuntimeError::Program(
+                        "desktop entry buffer size is outside the hosted limit".into(),
+                    ));
+                }
+                let entries = self
+                    .file_system
+                    .enumerate_bounded(&task.file_system, &path, "*", 4096)
+                    .map_err(|_| {
+                        RuntimeError::Program(format!(
+                            "desktop catalogue lookup failed for guest path '{path}'"
+                        ))
+                    })?;
+                let Some(entry) = entries.get(context.registers[R1] as usize) else {
+                    task.memory
+                        .write_caller_data_bytes(context.registers[R2], &[0])?;
+                    context.registers[R0] = 0;
+                    context.registers[R1] = 0;
+                    context.registers[R2] = 0;
+                    context.registers[R3] = 0;
+                    return Ok(());
+                };
+                if entry
+                    .guest_name
+                    .len()
+                    .checked_add(1)
+                    .is_none_or(|size| size > capacity as usize)
+                {
+                    return Err(RuntimeError::Program(
+                        "desktop entry name does not fit the caller buffer".into(),
+                    ));
+                }
+                let mut bytes = entry.guest_name.as_bytes().to_vec();
+                bytes.push(0);
+                task.memory
+                    .validate_caller_data_span(context.registers[R2], bytes.len())?;
+                task.memory
+                    .write_caller_data_bytes(context.registers[R2], &bytes)?;
+                context.registers[R0] = 1;
+                context.registers[R1] = u32::from(entry.is_directory);
+                context.registers[R2] = entry.metadata.file_type;
+                context.registers[R3] = entry.length;
+                Ok(())
+            }
+            "HOST.DESKTOP.WRITEVOLUMENAME" => {
+                let capacity = context.registers[R1];
+                let name = self.file_system.volume_name();
+                let required = name.len().checked_add(1).ok_or_else(|| {
+                    RuntimeError::Program("desktop volume name length overflowed".into())
+                })?;
+                if capacity as usize > MAX_STRING_BYTES || (capacity as usize) < required {
+                    return Err(RuntimeError::Program(
+                        "desktop volume name does not fit the caller buffer".into(),
+                    ));
+                }
+                let mut bytes = name.as_bytes().to_vec();
+                bytes.push(0);
+                task.memory
+                    .validate_caller_data_span(context.registers[R0], bytes.len())?;
+                task.memory
+                    .write_caller_data_bytes(context.registers[R0], &bytes)?;
+                context.registers[R0] = u32::try_from(name.len()).unwrap_or(u32::MAX);
+                Ok(())
+            }
+            "HOST.DESKTOP.READMODIFICATIONTIME" => {
+                let path = read_desktop_guest_path(task, context.registers[R0], MAX_STRING_BYTES)?;
+                let path = String::from_utf8(path).map_err(|_| {
+                    RuntimeError::Program("desktop guest directory is not valid UTF-8".into())
+                })?;
+                let entries = self
+                    .file_system
+                    .enumerate_bounded(&task.file_system, &path, "*", 4096)
+                    .map_err(|_| {
+                        RuntimeError::Program(format!(
+                            "desktop catalogue lookup failed for guest path '{path}'"
+                        ))
+                    })?;
+                let modified = entries
+                    .get(context.registers[R1] as usize)
+                    .and_then(|entry| {
+                        std::fs::metadata(&entry.host_path)
+                            .ok()?
+                            .modified()
+                            .ok()?
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .and_then(|duration| u32::try_from(duration.as_secs()).ok())
+                    });
+                context.registers[R0] = u32::from(modified.is_some());
+                context.registers[R1] = modified.unwrap_or(0);
+                Ok(())
+            }
+            "HOST.DESKTOP.REGISTERSYSTEMMENU" => self
+                .wimp
+                .as_ref()
+                .ok_or_else(|| RuntimeError::Program("desktop menu service is unavailable".into()))?
+                .register_system_menu(task.id),
+            "HOST.DISPLAY.QUERY" => {
+                let wimp = self
+                    .wimp
+                    .as_ref()
+                    .or(self.desktop_service.as_ref())
+                    .ok_or_else(|| {
+                        RuntimeError::Program(
+                            "display settings require the hosted Wimp desktop".into(),
+                        )
+                    })?;
+                let mut query = SwiContext::default();
+                write_display_query(wimp, &mut query);
+                context.registers[R0] = query.registers[R2];
+                context.registers[R1] = query.registers[R3];
+                context.registers[R2] = query.registers[R4];
+                context.registers[R3] = query.registers[R5];
+                context.registers[R4] = query.registers[R6];
+                context.registers[R5] = query.registers[R7];
+                Ok(())
+            }
+            "HOST.DISPLAY.APPLY" => {
+                task.require_configuration_write()?;
+                let resolution_id = context.registers[R0];
+                let colour_id = context.registers[R1];
+                let resolution = DesktopResolution::from_id(resolution_id).ok_or_else(|| {
+                    RuntimeError::Program("display resolution ID is invalid".into())
+                })?;
+                let colour = DisplayColour::from_id(colour_id)
+                    .ok_or_else(|| RuntimeError::Program("display colour ID is invalid".into()))?;
+                let wimp = self
+                    .wimp
+                    .as_ref()
+                    .or(self.desktop_service.as_ref())
+                    .ok_or_else(|| {
+                        RuntimeError::Program(
+                            "display settings require the hosted Wimp desktop".into(),
+                        )
+                    })?;
+                let saved = wimp
+                    .apply_display_settings(DisplaySettings { resolution, colour })
+                    .is_ok();
+                let mut query = SwiContext::default();
+                write_display_query(wimp, &mut query);
+                context.registers[R0] = u32::from(!saved);
+                context.registers[R1] = query.registers[R2];
+                context.registers[R2] = query.registers[R3];
+                context.registers[R3] = query.registers[R4];
+                context.registers[R4] = query.registers[R5];
+                context.registers[R5] = query.registers[R6];
+                context.registers[R6] = query.registers[R7];
+                Ok(())
+            }
+            "HOST.DISPLAY.REQUIRECONFIGURATIONWRITE" => {
+                task.require_configuration_write()?;
+                Ok(())
+            }
             "HOST.CONSOLE.WRITEBYTE" => {
                 self.console.write_byte(context.registers[R0] as u8)?;
                 self.console.flush().map_err(RuntimeError::from)
             }
-            "HOST.CONSOLE.READBYTESTATUS" => self.console_read_byte_status(context),
+            "HOST.CONSOLE.READBYTESTATUS" => self.console_read_byte_status(task, context),
+            "HOST.MOSINPUT.INSERTKEY" => {
+                context.registers[R0] = u32::from(self.mos.insert_key(context.registers[R0] as u8));
+                Ok(())
+            }
+            "HOST.MOSINPUT.FLUSHKEYBOARD" => {
+                self.mos.flush_keyboard(&self.console);
+                Ok(())
+            }
+            "HOST.MOSINPUT.READTIMED" => {
+                let timeout = context.registers[R0] as u16;
+                let (key, status) = self.mos.read_timed_key(task, &self.console, timeout);
+                context.registers[R0] = u32::from(key);
+                context.registers[R1] = u32::from(status);
+                Ok(())
+            }
+            "HOST.CLOCK.READSYSTEMCHUNKS" => {
+                let clock = self.mos.system_clock.read();
+                context.registers[R0] = (clock & 0xFFFF) as u32;
+                context.registers[R1] = ((clock >> 16) & 0xFFFF) as u32;
+                context.registers[R2] = ((clock >> 32) & 0xFF) as u32;
+                Ok(())
+            }
+            "HOST.CLOCK.WRITESYSTEMCHUNKS" => {
+                let clock = clock_from_chunks(context);
+                self.mos.system_clock.set(clock);
+                Ok(())
+            }
+            "HOST.CLOCK.READINTERVALCHUNKS" => {
+                let clock = self.mos.interval_timer.read();
+                context.registers[R0] = (clock & 0xFFFF) as u32;
+                context.registers[R1] = ((clock >> 16) & 0xFFFF) as u32;
+                context.registers[R2] = ((clock >> 32) & 0xFF) as u32;
+                Ok(())
+            }
+            "HOST.CLOCK.WRITEINTERVALCHUNKS" => {
+                let clock = clock_from_chunks(context);
+                self.mos.interval_timer.set(clock);
+                Ok(())
+            }
+            "HOST.MEMORY.READFIVEBYTES" => {
+                let bytes = task
+                    .memory
+                    .read_caller_data_bytes(context.registers[R0], 5)?;
+                for (register, byte) in bytes.into_iter().enumerate() {
+                    context.registers[register] = u32::from(byte);
+                }
+                Ok(())
+            }
+            "HOST.MEMORY.WRITEFIVEBYTES" => {
+                let bytes = context.registers[R1..=R5]
+                    .iter()
+                    .map(|byte| *byte as u8)
+                    .collect::<Vec<_>>();
+                task.memory
+                    .write_caller_data_bytes(context.registers[R0], &bytes)?;
+                Ok(())
+            }
+            "HOST.FILECHANNEL.OPEN" => {
+                if !task.file_system.has_file_slot() {
+                    return Err(RuntimeError::Program(
+                        "no FileSwitch handles are available".into(),
+                    ));
+                }
+                let address = context.registers[R0];
+                let mode = context.registers[R1];
+                let path_bytes = mos::read_mos_string(task, address, MAX_STRING_BYTES)?;
+                let path = String::from_utf8(path_bytes).map_err(|_| {
+                    RuntimeError::Program("guest pathname is not valid UTF-8".into())
+                })?;
+                let (read, write, create, truncate) = match mode {
+                    0 => (true, false, false, false),
+                    1 => (true, true, true, true),
+                    2 => (true, true, false, false),
+                    _ => {
+                        return Err(RuntimeError::Program(
+                            "unsupported FileSwitch open mode".into(),
+                        ));
+                    }
+                };
+                match self.file_system.open_file(
+                    &task.file_system,
+                    &path,
+                    read,
+                    write,
+                    create,
+                    truncate,
+                ) {
+                    Ok((file, resolved)) => {
+                        let handle = task
+                            .file_system
+                            .insert_file(OpenFile {
+                                file,
+                                can_read: read,
+                                can_write: write,
+                                guest_path: resolved.guest_path,
+                                eof_error_next: false,
+                            })
+                            .ok_or_else(|| {
+                                RuntimeError::Program("no FileSwitch handles are available".into())
+                            })?;
+                        context.registers[R0] = handle;
+                        context.registers[R1] = 0;
+                        Ok(())
+                    }
+                    Err(RuntimeError::Io(error))
+                        if error.kind() == std::io::ErrorKind::NotFound && mode != 1 =>
+                    {
+                        context.registers[R0] = 0;
+                        context.registers[R1] = 1;
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            "HOST.FILECHANNEL.CLOSE" => {
+                let handle = context.registers[R0];
+                if handle == 0 {
+                    task.file_system.open_files.clear();
+                } else {
+                    task.file_system.open_files.remove(&handle);
+                }
+                Ok(())
+            }
+            "HOST.FILECHANNEL.READBYTE" => {
+                let handle = context.registers[R0];
+                let file = task
+                    .file_system
+                    .open_files
+                    .get_mut(&handle)
+                    .ok_or_else(|| {
+                        RuntimeError::Program(format!("invalid file handle {handle}"))
+                    })?;
+                if !file.can_read {
+                    return Err(RuntimeError::Program("file is not open for reading".into()));
+                }
+                if file.eof_error_next {
+                    file.eof_error_next = false;
+                    return Err(RuntimeError::Program("end of file".into()));
+                }
+                let mut byte = [0_u8; 1];
+                if file.file.read(&mut byte)? == 0 {
+                    file.eof_error_next = true;
+                    context.registers[R0] = 0;
+                    context.registers[R1] = 1;
+                } else {
+                    context.registers[R0] = u32::from(byte[0]);
+                    context.registers[R1] = 0;
+                }
+                Ok(())
+            }
+            "HOST.FILECHANNEL.WRITEBYTE" => {
+                let handle = context.registers[R0];
+                let byte = context.registers[R1] as u8;
+                let file = task
+                    .file_system
+                    .open_files
+                    .get_mut(&handle)
+                    .ok_or_else(|| {
+                        RuntimeError::Program(format!("invalid file handle {handle}"))
+                    })?;
+                if !file.can_write {
+                    return Err(RuntimeError::Program("file is not open for writing".into()));
+                }
+                file.file.write_all(&[byte])?;
+                file.eof_error_next = false;
+                Ok(())
+            }
+            "HOST.FILECHANNEL.READPOSITION" => {
+                let handle = context.registers[R0];
+                let file = task
+                    .file_system
+                    .open_files
+                    .get_mut(&handle)
+                    .ok_or_else(|| {
+                        RuntimeError::Program(format!("invalid file handle {handle}"))
+                    })?;
+                context.registers[R0] =
+                    u32::try_from(file.file.stream_position()?).map_err(|_| {
+                        RuntimeError::Program("file position exceeds the hosted U32 range".into())
+                    })?;
+                Ok(())
+            }
+            "HOST.FILECHANNEL.SETPOSITION" => {
+                let handle = context.registers[R0];
+                let position = context.registers[R1];
+                let file = task
+                    .file_system
+                    .open_files
+                    .get_mut(&handle)
+                    .ok_or_else(|| {
+                        RuntimeError::Program(format!("invalid file handle {handle}"))
+                    })?;
+                let extent = file.file.metadata()?.len();
+                if u64::from(position) > extent {
+                    if !file.can_write {
+                        return Err(RuntimeError::Program("file is not open for writing".into()));
+                    }
+                    file.file.set_len(u64::from(position))?;
+                }
+                file.file.seek(SeekFrom::Start(u64::from(position)))?;
+                file.eof_error_next = false;
+                Ok(())
+            }
+            "HOST.FILECHANNEL.READEXTENT" => {
+                let handle = context.registers[R0];
+                let file = task.file_system.open_files.get(&handle).ok_or_else(|| {
+                    RuntimeError::Program(format!("invalid file handle {handle}"))
+                })?;
+                context.registers[R0] =
+                    u32::try_from(file.file.metadata()?.len()).map_err(|_| {
+                        RuntimeError::Program("file extent exceeds the hosted U32 range".into())
+                    })?;
+                Ok(())
+            }
+            "HOST.FILECHANNEL.SETEXTENT" => {
+                let handle = context.registers[R0];
+                let extent = context.registers[R1];
+                let file = task
+                    .file_system
+                    .open_files
+                    .get_mut(&handle)
+                    .ok_or_else(|| {
+                        RuntimeError::Program(format!("invalid file handle {handle}"))
+                    })?;
+                if !file.can_write {
+                    return Err(RuntimeError::Program("file is not open for writing".into()));
+                }
+                file.file.set_len(u64::from(extent))?;
+                if file.file.stream_position()? > u64::from(extent) {
+                    file.file.seek(SeekFrom::Start(u64::from(extent)))?;
+                }
+                file.eof_error_next = false;
+                Ok(())
+            }
+            "HOST.FILECHANNEL.CANONICALNAMELENGTH" => {
+                let handle = context.registers[R0];
+                let file = task.file_system.open_files.get(&handle).ok_or_else(|| {
+                    RuntimeError::Program(format!("invalid file handle {handle}"))
+                })?;
+                let name = canonical_guest_name(self.file_system.volume_name(), &file.guest_path);
+                let length = u32::try_from(name.len()).map_err(|_| {
+                    RuntimeError::Program("canonical guest name is too long".into())
+                })?;
+                if length >= MAX_STRING_BYTES as u32 {
+                    return Err(RuntimeError::Program(
+                        "canonical guest name exceeds the hosted bound".into(),
+                    ));
+                }
+                context.registers[R0] = length;
+                Ok(())
+            }
+            "HOST.FILECHANNEL.ARGS7SPAREBYTES" => {
+                context.registers[R0] = context.registers[R0].wrapping_sub(context.registers[R1]);
+                Ok(())
+            }
+            "HOST.FILECHANNEL.WRITECANONICALNAME" => {
+                let handle = context.registers[R0];
+                let address = context.registers[R1];
+                let file = task.file_system.open_files.get(&handle).ok_or_else(|| {
+                    RuntimeError::Program(format!("invalid file handle {handle}"))
+                })?;
+                let name = canonical_guest_name(self.file_system.volume_name(), &file.guest_path);
+                let mut bytes = name.into_bytes();
+                if bytes.len() >= MAX_STRING_BYTES {
+                    return Err(RuntimeError::Program(
+                        "canonical guest name exceeds the hosted bound".into(),
+                    ));
+                }
+                bytes.push(0);
+                task.memory.write_caller_data_bytes(address, &bytes)?;
+                Ok(())
+            }
+            "HOST.FILECHANNEL.VALIDATETRANSFERSPAN" => {
+                let address = context.registers[R0];
+                let length = context.registers[R1];
+                if length as usize > crate::memory::GUEST_MEMORY_SIZE {
+                    return Err(RuntimeError::Program(
+                        "OS_GBPB transfer exceeds the hosted 1 MiB limit".into(),
+                    ));
+                }
+                task.memory
+                    .validate_caller_data_span(address, length as usize)?;
+                address.checked_add(length).ok_or_else(|| {
+                    RuntimeError::Program("OS_GBPB caller buffer range overflowed".into())
+                })?;
+                Ok(())
+            }
+            "HOST.FILECHANNEL.VALIDATEDIRECTORYINFOADDRESS" => {
+                if context.registers[R0] & 3 != 0 {
+                    return Err(RuntimeError::Program(
+                        "OS_GBPB reason 10 requires a word-aligned output buffer".into(),
+                    ));
+                }
+                Ok(())
+            }
+            "HOST.FILECHANNEL.VALIDATETRANSFERRANGE" => {
+                let handle = context.registers[R0];
+                let offset = context.registers[R1];
+                let length = context.registers[R2];
+                let writing = context.registers[R3] != 0;
+                offset.checked_add(length).ok_or_else(|| {
+                    RuntimeError::Program(
+                        "OS_GBPB file range exceeds the U32 position limit".into(),
+                    )
+                })?;
+                let file = task.file_system.open_files.get(&handle).ok_or_else(|| {
+                    RuntimeError::Program(format!("invalid file handle {handle}"))
+                })?;
+                if writing && !file.can_write {
+                    return Err(RuntimeError::Program("file is not open for writing".into()));
+                }
+                if !writing && !file.can_read {
+                    return Err(RuntimeError::Program("file is not open for reading".into()));
+                }
+                let end = offset.checked_add(length).ok_or_else(|| {
+                    RuntimeError::Program(
+                        "OS_GBPB file range exceeds the U32 position limit".into(),
+                    )
+                })?;
+                context.registers[R0] =
+                    u32::from(!writing && u64::from(offset) > file.file.metadata()?.len());
+                context.registers[R1] = end;
+                Ok(())
+            }
+            "HOST.FILECHANNEL.VALIDATETRANSFERRANGERAW" => {
+                let handle = context.registers[R0];
+                let offset = context.registers[R1];
+                let length = context.registers[R2];
+                let writing = context.registers[R3] != 0;
+                let end = offset.checked_add(length).ok_or_else(|| {
+                    RuntimeError::Program(
+                        "OS_GBPB file range exceeds the U32 position limit".into(),
+                    )
+                })?;
+                let file = task.file_system.open_files.get(&handle).ok_or_else(|| {
+                    RuntimeError::Program(format!("invalid file handle {handle}"))
+                })?;
+                if writing && !file.can_write {
+                    return Err(RuntimeError::Program("file is not open for writing".into()));
+                }
+                if !writing && !file.can_read {
+                    return Err(RuntimeError::Program("file is not open for reading".into()));
+                }
+                context.registers[R0] =
+                    u32::from(!writing && u64::from(offset) > file.file.metadata()?.len());
+                context.registers[R1] = end;
+                Ok(())
+            }
+            "HOST.FILECHANNEL.READTRANSFER" => {
+                let handle = context.registers[R0];
+                let address = context.registers[R1];
+                let requested = context.registers[R2] as usize;
+                if requested > crate::memory::GUEST_MEMORY_SIZE {
+                    return Err(RuntimeError::Program(
+                        "OS_GBPB transfer exceeds the hosted 1 MiB limit".into(),
+                    ));
+                }
+                task.memory.validate_caller_data_span(address, requested)?;
+                let file = task
+                    .file_system
+                    .open_files
+                    .get_mut(&handle)
+                    .ok_or_else(|| {
+                        RuntimeError::Program(format!("invalid file handle {handle}"))
+                    })?;
+                if !file.can_read {
+                    return Err(RuntimeError::Program("file is not open for reading".into()));
+                }
+                let mut bytes = vec![0; requested];
+                let transferred = if requested == 0 {
+                    0
+                } else {
+                    file.file.read(&mut bytes)?
+                };
+                bytes.truncate(transferred);
+                task.memory.write_caller_data_bytes(address, &bytes)?;
+                file.eof_error_next = false;
+                context.registers[R0] = u32::try_from(transferred)
+                    .map_err(|_| RuntimeError::Program("OS_GBPB byte count exceeds U32".into()))?;
+                Ok(())
+            }
+            "HOST.FILECHANNEL.WRITETRANSFER" => {
+                let handle = context.registers[R0];
+                let address = context.registers[R1];
+                let length = context.registers[R2] as usize;
+                if length > crate::memory::GUEST_MEMORY_SIZE {
+                    return Err(RuntimeError::Program(
+                        "OS_GBPB transfer exceeds the hosted 1 MiB limit".into(),
+                    ));
+                }
+                let bytes = task.memory.read_caller_data_bytes(address, length)?;
+                let file = task
+                    .file_system
+                    .open_files
+                    .get_mut(&handle)
+                    .ok_or_else(|| {
+                        RuntimeError::Program(format!("invalid file handle {handle}"))
+                    })?;
+                if !file.can_write {
+                    return Err(RuntimeError::Program("file is not open for writing".into()));
+                }
+                if !bytes.is_empty() {
+                    file.file.write_all(&bytes)?;
+                }
+                file.eof_error_next = false;
+                Ok(())
+            }
+            "HOST.FILECHANNEL.FIXEDNAMELENGTH" => {
+                let kind = context.registers[R0] as u8;
+                let bytes = fixed_file_switch_name(self, task, kind)?;
+                context.registers[R0] = u32::try_from(bytes.len())
+                    .map_err(|_| RuntimeError::Program("FileSwitch name exceeds U32".into()))?;
+                Ok(())
+            }
+            "HOST.FILECHANNEL.FIXEDNAMEBYTE" => {
+                let kind = context.registers[R0] as u8;
+                let offset = context.registers[R1] as usize;
+                let bytes = fixed_file_switch_name(self, task, kind)?;
+                context.registers[R0] = u32::from(*bytes.get(offset).ok_or_else(|| {
+                    RuntimeError::Program("FileSwitch name byte offset is outside the name".into())
+                })?);
+                Ok(())
+            }
+            "HOST.FILECHANNEL.OPENDIRECTORYSNAPSHOT" => {
+                let path = if context.registers[R0] == 0 {
+                    String::new()
+                } else {
+                    String::from_utf8(read_caller_guest_string(
+                        task,
+                        context.registers[R0],
+                        MAX_STRING_BYTES,
+                    )?)
+                    .map_err(|_| {
+                        RuntimeError::Program("guest directory is not valid UTF-8".into())
+                    })?
+                };
+                let wildcard = if context.registers[R1] == 0 {
+                    "*".to_string()
+                } else {
+                    String::from_utf8(read_caller_guest_string(
+                        task,
+                        context.registers[R1],
+                        MAX_STRING_BYTES,
+                    )?)
+                    .map_err(|_| {
+                        RuntimeError::Program("guest wildcard is not valid UTF-8".into())
+                    })?
+                };
+                let entries = self.file_system.enumerate_bounded(
+                    &task.file_system,
+                    if path.is_empty() { "@" } else { &path },
+                    &wildcard,
+                    4096,
+                )?;
+                let mut staged_bytes = 0usize;
+                for entry in &entries {
+                    if entry.guest_name.len() > u8::MAX as usize {
+                        return Err(RuntimeError::Program("guest leaf name is too long".into()));
+                    }
+                    staged_bytes = staged_bytes
+                        .checked_add(entry.guest_name.len().saturating_add(24))
+                        .ok_or_else(|| {
+                            RuntimeError::Program("catalogue snapshot size overflowed".into())
+                        })?;
+                    if staged_bytes > crate::memory::GUEST_MEMORY_SIZE {
+                        return Err(RuntimeError::Program(
+                            "directory exceeds the hosted 1 MiB catalogue bound".into(),
+                        ));
+                    }
+                }
+                let snapshot_id = task
+                    .file_system
+                    .gbpb_directory_snapshot_id
+                    .wrapping_add(1)
+                    .max(1);
+                task.file_system.gbpb_directory_snapshot = entries;
+                task.file_system.gbpb_directory_snapshot_id = snapshot_id;
+                context.registers[R0] = snapshot_id;
+                context.registers[R1] = u32::try_from(
+                    task.file_system.gbpb_directory_snapshot.len(),
+                )
+                .map_err(|_| RuntimeError::Program("directory entry count exceeds U32".into()))?;
+                Ok(())
+            }
+            "HOST.FILECHANNEL.READDIRECTORYENTRY" => {
+                let snapshot_id = context.registers[R0];
+                let index = usize::try_from(context.registers[R1]).map_err(|_| {
+                    RuntimeError::Program("directory continuation exceeds host range".into())
+                })?;
+                if snapshot_id != task.file_system.gbpb_directory_snapshot_id {
+                    return Err(RuntimeError::Program(
+                        "directory snapshot is no longer active".into(),
+                    ));
+                }
+                let entry = task
+                    .file_system
+                    .gbpb_directory_snapshot
+                    .get(index)
+                    .ok_or_else(|| {
+                        RuntimeError::Program(
+                            "directory continuation is outside the snapshot".into(),
+                        )
+                    })?;
+                context.registers[R0] = u32::try_from(entry.guest_name.len())
+                    .map_err(|_| RuntimeError::Program("guest leaf name is too long".into()))?;
+                context.registers[R1] = if entry.is_directory { 2 } else { 1 };
+                Ok(())
+            }
+            "HOST.FILECHANNEL.NORMALIZEDIRECTORYSTART" => {
+                let snapshot_id = context.registers[R0];
+                if snapshot_id != task.file_system.gbpb_directory_snapshot_id {
+                    return Err(RuntimeError::Program(
+                        "directory snapshot is no longer active".into(),
+                    ));
+                }
+                let requested = context.registers[R1] as i32;
+                let length = task.file_system.gbpb_directory_snapshot.len();
+                let start = if requested < 0 {
+                    length
+                } else {
+                    (requested as usize).min(length)
+                };
+                context.registers[R0] = u32::try_from(start).unwrap_or(u32::MAX);
+                Ok(())
+            }
+            "HOST.FILECHANNEL.READDIRECTORYFIELDBYTE" => {
+                let snapshot_id = context.registers[R0];
+                if snapshot_id != task.file_system.gbpb_directory_snapshot_id {
+                    return Err(RuntimeError::Program(
+                        "directory snapshot is no longer active".into(),
+                    ));
+                }
+                let index = usize::try_from(context.registers[R1]).map_err(|_| {
+                    RuntimeError::Program("directory continuation exceeds host range".into())
+                })?;
+                let field = context.registers[R2] as usize;
+                let byte = context.registers[R3] as usize;
+                if byte > 3 {
+                    return Err(RuntimeError::Program(
+                        "directory field byte index exceeds a word".into(),
+                    ));
+                }
+                let entry = task
+                    .file_system
+                    .gbpb_directory_snapshot
+                    .get(index)
+                    .ok_or_else(|| {
+                        RuntimeError::Program(
+                            "directory continuation is outside the snapshot".into(),
+                        )
+                    })?;
+                let word = match field {
+                    0 => riscos_load_address(&entry.metadata),
+                    1 => entry.metadata.execution_address,
+                    2 => entry.length,
+                    3 => entry.metadata.attributes,
+                    4 => {
+                        if entry.is_directory {
+                            2
+                        } else {
+                            1
+                        }
+                    }
+                    _ => {
+                        return Err(RuntimeError::Program(
+                            "unsupported directory information field".into(),
+                        ));
+                    }
+                };
+                context.registers[R0] = u32::from(word.to_le_bytes()[byte]);
+                Ok(())
+            }
+            "HOST.FILECHANNEL.READDIRECTORYNAMEBYTE" => {
+                let snapshot_id = context.registers[R0];
+                if snapshot_id != task.file_system.gbpb_directory_snapshot_id {
+                    return Err(RuntimeError::Program(
+                        "directory snapshot is no longer active".into(),
+                    ));
+                }
+                let index = usize::try_from(context.registers[R1]).map_err(|_| {
+                    RuntimeError::Program("directory continuation exceeds host range".into())
+                })?;
+                let byte_index = usize::try_from(context.registers[R2]).map_err(|_| {
+                    RuntimeError::Program("directory name offset exceeds host range".into())
+                })?;
+                let entry = task
+                    .file_system
+                    .gbpb_directory_snapshot
+                    .get(index)
+                    .ok_or_else(|| {
+                        RuntimeError::Program(
+                            "directory continuation is outside the snapshot".into(),
+                        )
+                    })?;
+                context.registers[R0] =
+                    u32::from(*entry.guest_name.as_bytes().get(byte_index).ok_or_else(|| {
+                        RuntimeError::Program("directory name offset is outside the name".into())
+                    })?);
+                Ok(())
+            }
+            "HOST.FILECHANNEL.WRITECALLERBYTE" => {
+                task.memory.write_caller_data_bytes(
+                    context.registers[R0],
+                    &[context.registers[R1] as u8],
+                )?;
+                Ok(())
+            }
+            "HOST.FILEOBJECT.CATALOGUE" => {
+                let path = read_file_object_path(task, context.registers[R0])?;
+                let (object_type, metadata, length) = self
+                    .file_object_catalogue(task, &path)
+                    .map_err(|_| file_object_error("catalogue lookup"))?;
+                context.registers[R0] = object_type;
+                if object_type != 0 {
+                    context.registers[R1] = riscos_load_address(&metadata);
+                    context.registers[R2] = metadata.execution_address;
+                    context.registers[R3] = length;
+                    context.registers[R4] = metadata.attributes;
+                }
+                Ok(())
+            }
+            "HOST.FILEOBJECT.CATALOGUECANDIDATE" => {
+                let path_source = context.registers[R0];
+                let object_address = context.registers[R1];
+                let path_info_address = context.registers[R2];
+                let candidate_index = context.registers[R3];
+                let candidate = self.file_object_search_candidate(
+                    task,
+                    path_source,
+                    object_address,
+                    path_info_address,
+                    candidate_index,
+                )?;
+                context.registers[R0] = 0;
+                context.registers[R1..=R5].fill(0);
+                if let Some(path) = candidate {
+                    context.registers[R0] = 1;
+                    let catalogue = self.file_object_catalogue(task, &path);
+                    let (object_type, metadata, length) = match catalogue {
+                        Ok(result) => result,
+                        Err(RuntimeError::Io(error))
+                            if error.kind() == std::io::ErrorKind::NotFound =>
+                        {
+                            (0, metadata_for_new_guest_path(&path), 0)
+                        }
+                        Err(_) => return Err(file_object_error("catalogue search")),
+                    };
+                    context.registers[R1] = object_type;
+                    if object_type != 0 {
+                        context.registers[R2] = riscos_load_address(&metadata);
+                        context.registers[R3] = metadata.execution_address;
+                        context.registers[R4] = length;
+                        context.registers[R5] = metadata.attributes;
+                    }
+                }
+                Ok(())
+            }
+            "HOST.FILEOBJECT.LOADCANDIDATE" => {
+                let path_source = context.registers[R0];
+                let object_address = context.registers[R1];
+                let path_info_address = context.registers[R2];
+                let candidate_index = context.registers[R3];
+                let destination_hint = context.registers[R4];
+                let force_catalogue = context.registers[R5] != 0;
+                let path = self
+                    .file_object_search_candidate(
+                        task,
+                        path_source,
+                        object_address,
+                        path_info_address,
+                        candidate_index,
+                    )?
+                    .ok_or_else(|| file_object_error("search candidate disappeared"))?;
+                let resolved = self
+                    .file_system
+                    .canonical_guest_path(&task.file_system, &path)
+                    .map_err(|_| file_object_error("load lookup"))?;
+                if !resolved.host_path.exists() {
+                    return Err(file_object_error("load file was not found"));
+                }
+                if resolved.is_directory {
+                    return Err(file_object_error("load of a directory"));
+                }
+                let stored_metadata = resolved.metadata.clone();
+                if stored_metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.attributes & 0x11 == 0)
+                {
+                    return Err(file_object_error("load denied by guest read permission"));
+                }
+                let metadata = stored_metadata
+                    .unwrap_or_else(|| metadata_for_new_guest_path(&resolved.guest_path));
+                let host_length = std::fs::metadata(&resolved.host_path)
+                    .map_err(|_| file_object_error("load lookup"))?
+                    .len();
+                if host_length > crate::memory::GUEST_MEMORY_SIZE as u64 {
+                    return Err(file_object_error("load exceeds the hosted 1 MiB limit"));
+                }
+                let destination = if force_catalogue {
+                    metadata.load_address
+                } else {
+                    destination_hint
+                };
+                task.memory
+                    .validate_caller_data_span(destination, host_length as usize)?;
+                let (bytes, metadata) = self
+                    .file_system
+                    .read_file_limited(&task.file_system, &path, crate::memory::GUEST_MEMORY_SIZE)
+                    .map_err(|_| file_object_error("load"))?;
+                task.memory.write_caller_data_bytes(destination, &bytes)?;
+                context.registers[R0] = riscos_load_address(&metadata);
+                context.registers[R1] = metadata.execution_address;
+                context.registers[R2] = u32::try_from(bytes.len())
+                    .map_err(|_| file_object_error("loaded length exceeds the hosted U32 range"))?;
+                context.registers[R3] = metadata.attributes;
+                Ok(())
+            }
+            "HOST.FILEOBJECT.SEARCHPATHNOTFOUND" => {
+                Err(file_object_error("search found no matching object"))
+            }
+            "HOST.FILEOBJECT.SAVEBLOCK" => {
+                let path = read_file_object_path(task, context.registers[R0])?;
+                self.file_object_validate_mutation(task, &path, false)
+                    .map_err(|_| file_object_error("save"))?;
+                let address = context.registers[R1];
+                let length = context.registers[R2];
+                if length as usize > crate::memory::GUEST_MEMORY_SIZE {
+                    return Err(file_object_error("save exceeds the hosted 1 MiB limit"));
+                }
+                let end = address.checked_add(length).ok_or_else(|| {
+                    RuntimeError::Program("OS_File save range exceeds the U32 address limit".into())
+                })?;
+                if end < address {
+                    return Err(RuntimeError::Program(
+                        "OS_File save range exceeds the U32 address limit".into(),
+                    ));
+                }
+                let bytes = task
+                    .memory
+                    .read_caller_data_bytes(address, length as usize)?;
+                let mut metadata = metadata_for_new_guest_path(&path);
+                metadata.file_type = context.registers[R5] & 0xFFF;
+                metadata.load_address = context.registers[R3] & 0x000F_FFFF;
+                metadata.execution_address = context.registers[R4];
+                metadata.attributes = context.registers[R6];
+                apply_riscos_load_address(&mut metadata, context.registers[R3]);
+                self.file_system
+                    .write_file(&task.file_system, &path, &bytes, metadata)
+                    .map_err(|_| file_object_error("save"))
+            }
+            "HOST.FILEOBJECT.LOADBLOCK" => {
+                let path = read_file_object_path(task, context.registers[R0])?;
+                let destination_hint = context.registers[R1];
+                let force_catalogue = context.registers[R2] != 0;
+                let resolved = self
+                    .file_system
+                    .canonical_guest_path(&task.file_system, &path)
+                    .map_err(|_| file_object_error("load lookup"))?;
+                if resolved.is_directory {
+                    return Err(file_object_error("load of a directory"));
+                }
+                let metadata = resolved
+                    .metadata
+                    .clone()
+                    .unwrap_or_else(|| metadata_for_new_guest_path(&resolved.guest_path));
+                let host_length = std::fs::metadata(&resolved.host_path)
+                    .map_err(|_| file_object_error("load lookup"))?
+                    .len();
+                if host_length > crate::memory::GUEST_MEMORY_SIZE as u64 {
+                    return Err(file_object_error("load exceeds the hosted 1 MiB limit"));
+                }
+                let destination = if force_catalogue {
+                    metadata.load_address
+                } else {
+                    destination_hint
+                };
+                task.memory
+                    .validate_caller_data_span(destination, host_length as usize)?;
+                let (bytes, metadata) = self
+                    .file_system
+                    .read_file_limited(&task.file_system, &path, crate::memory::GUEST_MEMORY_SIZE)
+                    .map_err(|_| file_object_error("load"))?;
+                task.memory.write_caller_data_bytes(destination, &bytes)?;
+                context.registers[R0] = riscos_load_address(&metadata);
+                context.registers[R1] = metadata.execution_address;
+                context.registers[R2] = u32::try_from(bytes.len())
+                    .map_err(|_| file_object_error("loaded length exceeds the hosted U32 range"))?;
+                context.registers[R3] = metadata.attributes;
+                Ok(())
+            }
+            "HOST.FILEOBJECT.SETMETADATA" => {
+                let path = read_file_object_path(task, context.registers[R0])?;
+                let field_mask = context.registers[R1];
+                let resolved = self
+                    .file_system
+                    .canonical_guest_path(&task.file_system, &path)
+                    .map_err(|_| file_object_error("metadata update"))?;
+                if resolved.is_directory {
+                    return Err(file_object_error("metadata update on a directory"));
+                }
+                if !resolved.host_path.is_file() {
+                    return Err(file_object_error("metadata update on a missing object"));
+                }
+                let mut metadata = resolved
+                    .metadata
+                    .unwrap_or_else(|| metadata_for_new_guest_path(&resolved.guest_path));
+                if field_mask & 1 != 0 {
+                    apply_riscos_load_address(&mut metadata, context.registers[R2]);
+                }
+                if field_mask & 2 != 0 {
+                    metadata.execution_address = context.registers[R3];
+                }
+                if field_mask & 4 != 0 {
+                    metadata.attributes = context.registers[R5];
+                }
+                if field_mask & 8 != 0 {
+                    metadata.file_type = context.registers[R4] & 0xFFF;
+                }
+                if field_mask & 16 != 0 && metadata.file_type == 0 {
+                    metadata.file_type = 0xFFD;
+                }
+                self.file_system
+                    .set_metadata(&task.file_system, &path, &metadata)
+                    .map_err(|_| file_object_error("metadata update"))
+            }
+            "HOST.FILEOBJECT.CREATEEMPTY" => {
+                let path = read_file_object_path(task, context.registers[R0])?;
+                self.file_object_validate_mutation(task, &path, false)
+                    .map_err(|_| file_object_error("empty-file creation"))?;
+                let mut metadata = metadata_for_new_guest_path(&path);
+                metadata.file_type = context.registers[R3] & 0xFFF;
+                metadata.load_address = context.registers[R1] & 0x000F_FFFF;
+                metadata.execution_address = context.registers[R2];
+                metadata.attributes = context.registers[R4];
+                apply_riscos_load_address(&mut metadata, context.registers[R1]);
+                self.file_system
+                    .write_file(&task.file_system, &path, &[], metadata)
+                    .map_err(|_| file_object_error("empty-file creation"))
+            }
+            "HOST.FILEOBJECT.CREATEDIRECTORY" => {
+                let path = read_file_object_path(task, context.registers[R0])?;
+                match self
+                    .file_system
+                    .canonical_guest_path(&task.file_system, &path)
+                {
+                    Ok(resolved) if resolved.is_directory && resolved.host_path.exists() => Ok(()),
+                    Ok(resolved) if resolved.host_path.exists() => {
+                        Err(file_object_error("directory creation on a file"))
+                    }
+                    Ok(_) => self
+                        .file_system
+                        .create_directory(&task.file_system, &path)
+                        .map(|_| ())
+                        .map_err(|_| file_object_error("directory creation")),
+                    Err(_) => self
+                        .file_system
+                        .create_directory(&task.file_system, &path)
+                        .map(|_| ())
+                        .map_err(|_| file_object_error("directory creation")),
+                }
+            }
+            "HOST.FILEOBJECT.DELETEFILE" => {
+                let path = read_file_object_path(task, context.registers[R0])?;
+                self.file_object_validate_mutation(task, &path, false)
+                    .map_err(|_| file_object_error("file deletion"))?;
+                self.file_system
+                    .delete_file(&task.file_system, &path)
+                    .map_err(|_| file_object_error("file deletion"))
+            }
+            "HOST.FILEOBJECT.DELETEDIRECTORY" => {
+                let path = read_file_object_path(task, context.registers[R0])?;
+                self.file_object_validate_mutation(task, &path, true)
+                    .map_err(|_| file_object_error("directory deletion"))?;
+                self.file_system
+                    .remove_directory(&task.file_system, &path)
+                    .map_err(|_| file_object_error("directory deletion"))
+            }
+            "HOST.FILEOBJECT.INVALIDSAVERANGE" => Err(file_object_error("save range is invalid")),
             "HOST.CONSOLE.SOFTWAREECHO" => {
                 context.registers[R0] = u32::from(self.console.software_echo());
                 Ok(())
@@ -2780,6 +5986,8 @@ impl SwiDispatcher {
             }
             "HOST.SYSTEM.SWINUMBERTOSTRING" => self.system_swi_number_to_string(task, context),
             "HOST.SYSTEM.SWINUMBERFROMSTRING" => self.system_swi_number_from_string(task, context),
+            "HOST.SYSTEMVARIABLES.READ" => self.system_variable_read(task, context),
+            "HOST.SYSTEMVARIABLES.WRITE" => self.system_variable_write(task, context),
             "HOST.RUNTIME.MISSINGTERMINATOR" => {
                 Err(crate::memory::MemoryError::MissingNullTerminator(context.registers[R0]).into())
             }
@@ -3155,7 +6363,359 @@ impl SwiDispatcher {
                 context.registers[R5] = (id >> 32) as u32;
                 Ok(())
             }
-            "HOST.MOS.EXECUTELEGACY" => self.execute_cli(task, context),
+            "HOST.COMMANDREGISTRY.READENTRY" => {
+                let cursor = context.registers[R0];
+                let address = context.registers[R1];
+                let capacity = context.registers[R2];
+                if capacity == 0 || capacity > 1024 {
+                    return Err(module_service_error(
+                        "CommandRegistryBufferError",
+                        capacity,
+                        "command entry capacity must be 1..=1024 bytes",
+                    ));
+                }
+                let commands = self.module_registry.active_commands();
+                let Some(entry) = usize::try_from(cursor)
+                    .ok()
+                    .and_then(|index| commands.get(index))
+                else {
+                    context.registers[R0] = cursor;
+                    context.registers[R1] = 0;
+                    return Ok(());
+                };
+                let (kind, handler) = match &entry.command.handler {
+                    CommandHandler::Basic64Proc(handler) => ("PROC", handler.as_str()),
+                    CommandHandler::RustBridge => ("BRIDGE", entry.command.name.as_str()),
+                };
+                let category = match entry.command.category {
+                    crate::ricochet::CommandCategory::Commands => "Commands",
+                    crate::ricochet::CommandCategory::FileCommands => "FileCommands",
+                };
+                let row = [
+                    entry.command.name.as_str(),
+                    entry.module_name.as_str(),
+                    &format!(
+                        "{}.{}.{}",
+                        entry.module_version.major,
+                        entry.module_version.minor,
+                        entry.module_version.patch
+                    ),
+                    kind,
+                    handler,
+                    category,
+                    entry.command.syntax.as_str(),
+                    entry.command.description.as_str(),
+                ]
+                .join("|");
+                let required = row.len().saturating_add(1);
+                if required > capacity as usize {
+                    return Err(module_service_error(
+                        "CommandRegistryBufferError",
+                        u32::try_from(required).unwrap_or(u32::MAX),
+                        "command entry does not fit the caller buffer",
+                    ));
+                }
+                let mut bytes = row.into_bytes();
+                bytes.push(0);
+                task.memory.write_bytes(address, &bytes)?;
+                context.registers[R0] = cursor.saturating_add(1);
+                context.registers[R1] = 1;
+                Ok(())
+            }
+            "HOST.COMMANDREGISTRY.INVOKE" => {
+                let read = |address: u32, bound: usize| -> Result<String, RuntimeError> {
+                    let bytes = task.memory.read_c_string(address, bound)?;
+                    Ok(String::from_utf8_lossy(&bytes).into_owned())
+                };
+                let command_name = read(context.registers[R0], 33)?;
+                let owner_name = read(context.registers[R1], 65)?;
+                let handler_kind = read(context.registers[R2], 17)?;
+                let handler_name = read(context.registers[R3], 65)?;
+                let arguments = read(context.registers[R4], MAX_CLI_BYTES)?;
+                let Some(active) = self.module_registry.active_command(
+                    &owner_name,
+                    &command_name,
+                    &handler_kind,
+                    &handler_name,
+                ) else {
+                    return Err(module_service_error(
+                        "CommandNotFound",
+                        1,
+                        format!("command {command_name} is no longer active in {owner_name}"),
+                    ));
+                };
+                self.invoke_registered_command(active, arguments, task, context)
+            }
+            "HOST.COMMANDSCRIPTS.OPEN" => {
+                let raw_path = task
+                    .memory
+                    .read_c_string(context.registers[R0], MAX_CLI_BYTES)?;
+                let path = std::str::from_utf8(&raw_path).map_err(|_| {
+                    module_service_error("ObeyPathError", 1, "guest path is not valid UTF-8")
+                })?;
+                if path.is_empty() {
+                    return Err(module_service_error(
+                        "ObeyPathError",
+                        2,
+                        "Obey requires one guest pathname",
+                    ));
+                }
+                let raw_arguments = task
+                    .memory
+                    .read_c_string(context.registers[R1], MAX_CLI_BYTES)?;
+                let arguments = String::from_utf8(raw_arguments).map_err(|_| {
+                    module_service_error(
+                        "ObeyParameterError",
+                        1,
+                        "Obey parameters are not valid UTF-8",
+                    )
+                })?;
+                let session = self.obey_scripts.get(&task.id);
+                if session.is_some_and(|session| session.frames.len() >= MAX_OBEY_NESTING) {
+                    return Err(module_service_error(
+                        "ObeyNestingLimit",
+                        u32::try_from(MAX_OBEY_NESTING).unwrap_or(u32::MAX),
+                        "nested Obey depth exceeds the hosted limit of 8",
+                    ));
+                }
+                let resolved = self
+                    .file_system
+                    .canonical_guest_path(&task.file_system, path)
+                    .map_err(|_| {
+                        module_service_error(
+                            "ObeyFileError",
+                            1,
+                            "Obey could not resolve the guest file",
+                        )
+                    })?;
+                let (bytes, _) = self
+                    .file_system
+                    .read_file_limited(&task.file_system, path, MAX_OBEY_SCRIPT_BYTES)
+                    .map_err(|_| {
+                        module_service_error(
+                            "ObeyFileError",
+                            2,
+                            "Obey could not read the guest file within its 65,536-byte limit",
+                        )
+                    })?;
+                let source = std::str::from_utf8(&bytes).map_err(|_| {
+                    module_service_error("ObeyFileError", 3, "Obey source is not valid UTF-8")
+                })?;
+                let source_path = if resolved.guest_path.is_empty() {
+                    format!("HostFS::{}.$", self.file_system.volume_name())
+                } else {
+                    format!(
+                        "HostFS::{}.$.{}",
+                        self.file_system.volume_name(),
+                        resolved.guest_path
+                    )
+                };
+                let guest_parent = resolved
+                    .guest_path
+                    .rsplit_once('.')
+                    .map(|(parent, _)| parent)
+                    .unwrap_or("");
+                let obey_directory = if guest_parent.is_empty() {
+                    format!("HostFS::{}.$", self.file_system.volume_name())
+                } else {
+                    format!(
+                        "HostFS::{}.$.{}",
+                        self.file_system.volume_name(),
+                        guest_parent
+                    )
+                };
+                if let Some((line_number, character)) = first_unsupported_obey_control(source) {
+                    let error = module_service_error(
+                        if character == '\0' {
+                            "ObeyEmbeddedNul"
+                        } else {
+                            "ObeyControlCharacter"
+                        },
+                        u32::from(character),
+                        if character == '\0' {
+                            "Obey source contains an embedded NUL; the whole file was rejected before execution"
+                                .to_owned()
+                        } else {
+                            format!(
+                                "Obey source contains unsupported control U+{:04X}; only tab and line endings are permitted",
+                                u32::from(character)
+                            )
+                        },
+                    );
+                    return Err(obey_source_error(&source_path, line_number, error));
+                }
+                let session = self.obey_scripts.entry(task.id).or_default();
+                let next_total = session
+                    .total_bytes
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| {
+                        module_service_error("ObeyByteLimit", 1, "Obey byte count overflowed")
+                    })?;
+                if next_total > MAX_OBEY_SCRIPT_BYTES {
+                    return Err(module_service_error(
+                        "ObeyByteLimit",
+                        u32::try_from(next_total).unwrap_or(u32::MAX),
+                        "simultaneously open Obey source exceeds the 65,536-byte aggregate limit",
+                    ));
+                }
+                let handle = self.next_obey_handle;
+                self.next_obey_handle = handle.checked_add(1).ok_or_else(|| {
+                    module_service_error("ObeyHandleLimit", handle, "Obey handle space exhausted")
+                })?;
+                let buffer = task.memory.create_dynamic_area(
+                    u32::MAX,
+                    (MAX_CLI_BYTES * 2) as u32,
+                    u32::MAX,
+                    0,
+                    (MAX_CLI_BYTES * 2) as u32,
+                    0,
+                    0,
+                    0,
+                    "Obey line buffer".into(),
+                )?;
+                session.total_bytes = next_total;
+                session.frames.push(ObeyScriptFrame {
+                    handle,
+                    source_path,
+                    obey_directory,
+                    arguments,
+                    bytes,
+                    buffer_number: buffer.number,
+                    buffer_base: buffer.base_address,
+                    offset: 0,
+                    next_line: 1,
+                    current_line: None,
+                });
+                context.registers[R0] = handle;
+                Ok(())
+            }
+            "HOST.COMMANDSCRIPTS.READLINE" => {
+                let handle = context.registers[R0];
+                let session = self.obey_scripts.get_mut(&task.id).ok_or_else(|| {
+                    module_service_error("ObeyContextError", handle, "no active Obey source")
+                })?;
+                let frame = session.frames.last_mut().ok_or_else(|| {
+                    module_service_error("ObeyContextError", handle, "no active Obey source")
+                })?;
+                if handle != 0 && frame.handle != handle {
+                    return Err(module_service_error(
+                        "ObeyContextError",
+                        handle,
+                        "Obey handle is not the active nested source",
+                    ));
+                }
+                if self.quit_requested {
+                    context.registers[R0] = 0;
+                    context.registers[R1] = frame.next_line;
+                    context.registers[R2] = 2;
+                    context.registers[R3] = frame.buffer_base;
+                    context.registers[R4] = frame.buffer_base + MAX_CLI_BYTES as u32;
+                    return Ok(());
+                }
+                if frame.offset == frame.bytes.len() {
+                    context.registers[R0] = 0;
+                    context.registers[R1] = frame.next_line;
+                    context.registers[R2] = 0;
+                    context.registers[R3] = frame.buffer_base;
+                    context.registers[R4] = frame.buffer_base + MAX_CLI_BYTES as u32;
+                    return Ok(());
+                }
+                if session.total_lines >= MAX_OBEY_LINES {
+                    let source_path = frame.source_path.clone();
+                    let line_number = frame.next_line;
+                    return Err(obey_source_error(
+                        &source_path,
+                        line_number,
+                        module_service_error(
+                            "ObeyWorkLimit",
+                            u32::try_from(MAX_OBEY_LINES).unwrap_or(u32::MAX),
+                            "script work exceeds the 4,096-line hosted limit",
+                        ),
+                    ));
+                }
+                let line_number = frame.next_line;
+                let start = frame.offset;
+                let mut end = start;
+                while end < frame.bytes.len() && !matches!(frame.bytes[end], b'\r' | b'\n') {
+                    end += 1;
+                }
+                let length = end - start;
+                if length > MAX_OBEY_LINE_BYTES {
+                    let source_path = frame.source_path.clone();
+                    return Err(obey_source_error(
+                        &source_path,
+                        line_number,
+                        module_service_error(
+                            "ObeyLineTooLong",
+                            u32::try_from(length).unwrap_or(u32::MAX),
+                            "script line exceeds the 255-byte OS_CLI content limit",
+                        ),
+                    ));
+                }
+                let line = std::str::from_utf8(&frame.bytes[start..end]).map_err(|_| {
+                    obey_source_error(
+                        &frame.source_path,
+                        line_number,
+                        module_service_error("ObeyFileError", 4, "script line is not valid UTF-8"),
+                    )
+                })?;
+                if end < frame.bytes.len() {
+                    let first = frame.bytes[end];
+                    end += 1;
+                    if first == b'\r' && frame.bytes.get(end) == Some(&b'\n') {
+                        end += 1;
+                    }
+                }
+                let mut bytes = line.as_bytes().to_vec();
+                bytes.push(0);
+                task.memory.write_bytes(frame.buffer_base, &bytes)?;
+                let mut arguments = frame.arguments.as_bytes().to_vec();
+                arguments.push(0);
+                task.memory
+                    .write_bytes(frame.buffer_base + MAX_CLI_BYTES as u32, &arguments)?;
+                frame.offset = end;
+                frame.current_line = Some(line_number);
+                frame.next_line = line_number.saturating_add(1);
+                session.total_lines = session.total_lines.saturating_add(1);
+                context.registers[R0] = u32::try_from(length).unwrap_or(u32::MAX);
+                context.registers[R1] = line_number;
+                context.registers[R2] = 1;
+                context.registers[R3] = frame.buffer_base;
+                context.registers[R4] = frame.buffer_base + MAX_CLI_BYTES as u32;
+                Ok(())
+            }
+            "HOST.COMMANDSCRIPTS.CLOSE" => {
+                let handle = context.registers[R0];
+                let Some(session) = self.obey_scripts.get_mut(&task.id) else {
+                    return Err(module_service_error(
+                        "ObeyContextError",
+                        handle,
+                        "no active Obey source",
+                    ));
+                };
+                let Some(frame) = session.frames.last() else {
+                    return Err(module_service_error(
+                        "ObeyContextError",
+                        handle,
+                        "no active Obey source",
+                    ));
+                };
+                if handle != 0 && frame.handle != handle {
+                    return Err(module_service_error(
+                        "ObeyContextError",
+                        handle,
+                        "Obey handle is not the active nested source",
+                    ));
+                }
+                let frame = session.frames.pop().expect("active Obey source exists");
+                session.total_bytes = session.total_bytes.saturating_sub(frame.bytes.len());
+                task.memory.remove_dynamic_area(frame.buffer_number)?;
+                if session.frames.is_empty() {
+                    self.obey_scripts.remove(&task.id);
+                }
+                Ok(())
+            }
+            "HOST.EXECINPUT.REPLACE" => self.replace_exec_input(task, context),
             "HOST.TASK.READIDENTITY" => {
                 context.registers[R0] = u32::try_from(task.id).map_err(|_| {
                     RuntimeError::Program("caller task identity exceeds the public U32 ABI".into())
@@ -3238,6 +6798,263 @@ impl SwiDispatcher {
                 "primitive {name} has no host implementation"
             ))),
         }
+    }
+
+    fn system_variable_read(
+        &mut self,
+        task: &mut Task,
+        context: &mut SwiContext,
+    ) -> Result<(), RuntimeError> {
+        let incoming_context = context.registers[R3];
+        let selector = match read_system_variable_selector(&task.memory, context.registers[R0]) {
+            Ok(selector) => selector,
+            Err(error) => {
+                if incoming_context != 0
+                    && task.system_variable_read_cursor(incoming_context).is_some()
+                {
+                    task.remove_system_variable_read_cursor(incoming_context);
+                }
+                return Err(error);
+            }
+        };
+        let selector_key = selector.to_ascii_uppercase();
+        let wildcard = selector.contains('*') || selector.contains('#');
+        let requested_type = context.registers[R4];
+        // The PRM only gives entry R4 special meaning when it is 3 (request
+        // conversion). Every other value requests the raw representation.
+        // Our store contains only String and LiteralString, so raw and
+        // converted reads both return their stored bytes without evaluation.
+        let probe = context.registers[R2] & 0x8000_0000 != 0;
+        let capacity = context.registers[R2] as usize;
+
+        let cursor = if wildcard && incoming_context != 0 {
+            let Some(cursor) = task.system_variable_read_cursor(incoming_context).cloned() else {
+                return Err(name_error(
+                    "wildcard context is not an active caller-owned enumeration",
+                ));
+            };
+            if cursor.pattern != selector_key {
+                task.remove_system_variable_read_cursor(incoming_context);
+                return Err(name_error(
+                    "wildcard context does not match this selector and caller task",
+                ));
+            }
+            let returned_name = match task
+                .memory
+                .read_c_string(cursor.scratch_base, MAX_NAME_BYTES + 1)
+            {
+                Ok(name) => name,
+                Err(error) => {
+                    task.remove_system_variable_read_cursor(incoming_context);
+                    return Err(error.into());
+                }
+            };
+            if cursor
+                .after_key
+                .as_ref()
+                .is_none_or(|after| returned_name.to_ascii_uppercase() != after.as_bytes())
+            {
+                task.remove_system_variable_read_cursor(incoming_context);
+                return Err(name_error("wildcard context was modified by the caller"));
+            }
+            Some(cursor)
+        } else {
+            if incoming_context != 0 {
+                if task.system_variable_read_cursor(incoming_context).is_some() {
+                    task.remove_system_variable_read_cursor(incoming_context);
+                }
+                return Err(name_error(
+                    "a wildcard context is valid only for a wildcard selector",
+                ));
+            }
+            None
+        };
+
+        let after_key = cursor
+            .as_ref()
+            .and_then(|cursor| cursor.after_key.as_deref());
+        let active_obey_directory = self.obey_directory(task.id).map(str::to_owned);
+        let variable = if wildcard {
+            self.system_variables.read_with_obey_directory(
+                &selector,
+                after_key,
+                active_obey_directory.as_deref(),
+            )
+        } else if selector_key == "OBEY$DIR" {
+            active_obey_directory
+                .as_ref()
+                .map(|directory| SystemVariable {
+                    name: "Obey$Dir".into(),
+                    value: directory.clone(),
+                    variable_type: SystemVariableType::String,
+                })
+                .map(Ok)
+                .unwrap_or_else(|| self.system_variables.read(&selector, after_key))
+        } else {
+            self.system_variables.read(&selector, after_key)
+        };
+        let variable = match variable {
+            Ok(variable) => variable,
+            Err(error)
+                if is_system_variable_not_found(&error) && probe && incoming_context == 0 =>
+            {
+                context.registers[R2] = 0;
+                context.registers[R3] = 0;
+                context.registers[R4] = 0;
+                return Ok(());
+            }
+            Err(error) => {
+                if incoming_context != 0 {
+                    task.remove_system_variable_read_cursor(incoming_context);
+                }
+                return Err(error);
+            }
+        };
+        let value_bytes = variable.value.as_bytes();
+        if !probe {
+            if capacity < value_bytes.len() {
+                if incoming_context != 0 {
+                    task.remove_system_variable_read_cursor(incoming_context);
+                }
+                return Err(buffer_error(value_bytes.len(), capacity));
+            }
+            let buffer_preflight = if value_bytes.is_empty() {
+                task.memory.read_byte(context.registers[R1]).map(|_| ())
+            } else {
+                task.memory
+                    .read_bytes(context.registers[R1], value_bytes.len())
+                    .map(|_| ())
+            };
+            if let Err(error) = buffer_preflight {
+                if incoming_context != 0 {
+                    task.remove_system_variable_read_cursor(incoming_context);
+                }
+                return Err(error.into());
+            }
+        }
+
+        let result_context = if wildcard {
+            let (scratch_number, scratch_base) = match cursor.as_ref() {
+                Some(cursor) => (cursor.scratch_number, cursor.scratch_base),
+                None => {
+                    let area = task.memory.acquire_system_variable_context()?;
+                    (area.number, area.base_address)
+                }
+            };
+            let mut terminated_name = variable.name.as_bytes().to_vec();
+            terminated_name.push(0);
+            if let Err(error) = task.memory.write_bytes(scratch_base, &terminated_name) {
+                if cursor.is_some() {
+                    task.remove_system_variable_read_cursor(incoming_context);
+                } else {
+                    let _ = task.memory.release_system_variable_context(scratch_number);
+                }
+                return Err(error.into());
+            }
+            let next_key = variable.name.to_ascii_uppercase();
+            if cursor.is_some() {
+                task.update_system_variable_read_cursor_after_key(incoming_context, next_key)?;
+            } else {
+                task.set_system_variable_read_cursor(SystemVariableReadCursor {
+                    pattern: selector_key,
+                    after_key: Some(next_key),
+                    scratch_number,
+                    scratch_base,
+                });
+            }
+            scratch_base
+        } else {
+            0
+        };
+
+        if !probe && !value_bytes.is_empty() {
+            task.memory
+                .write_bytes(context.registers[R1], value_bytes)?;
+        }
+        context.registers[R2] = if probe {
+            if requested_type == 3 {
+                0x8000_0000 | u32::try_from(value_bytes.len()).unwrap_or(u32::MAX)
+            } else {
+                !u32::try_from(value_bytes.len()).unwrap_or(u32::MAX)
+            }
+        } else {
+            u32::try_from(value_bytes.len()).unwrap_or(u32::MAX)
+        };
+        context.registers[R3] = result_context;
+        context.registers[R4] = variable.variable_type.register_value();
+        Ok(())
+    }
+
+    fn system_variable_write(
+        &mut self,
+        task: &mut Task,
+        context: &mut SwiContext,
+    ) -> Result<(), RuntimeError> {
+        // Enforce caller rights before reading any caller-supplied selector or
+        // value pointer, so a privileged provider cannot become a confused
+        // deputy for an ordinary task.
+        task.require_system_variable_write()?;
+        let variable_type = SystemVariableType::from_register(context.registers[R4])?;
+        let selector = read_system_variable_selector(&task.memory, context.registers[R0])?;
+        if self.obey_directory(task.id).is_some() && selector_matches_name(&selector, "Obey$Dir") {
+            return Err(name_error("Obey$Dir is a runtime-owned read-only variable"));
+        }
+        if context.registers[R3] != 0 {
+            return Err(name_error(
+                "hosted variable writes do not accept a continuation context",
+            ));
+        }
+        let requested_length = context.registers[R2] as i32;
+        if requested_length < 0 {
+            self.system_variables.delete(&selector)?;
+            context.registers[R3] = 0;
+            return Ok(());
+        }
+        let length = usize::try_from(requested_length).unwrap_or(usize::MAX);
+        if length > MAX_VALUE_BYTES {
+            return Err(limit_error(format!(
+                "hosted system-variable values are limited to {MAX_VALUE_BYTES} UTF-8 bytes"
+            )));
+        }
+        let value_address = context.registers[R1];
+        let value = match variable_type {
+            SystemVariableType::String => {
+                let bytes = task.memory.read_bytes(value_address, length)?;
+                let terminator_address = value_address
+                    .checked_add(
+                        u32::try_from(length)
+                            .map_err(|_| crate::memory::MemoryError::AddressOverflow)?,
+                    )
+                    .ok_or(crate::memory::MemoryError::AddressOverflow)?;
+                let terminator = task.memory.read_byte(terminator_address)?;
+                if !matches!(terminator, 0 | 10 | 13) {
+                    return Err(buffer_error(length.saturating_add(1), length));
+                }
+                String::from_utf8(bytes).map_err(|_| RuntimeError::Structured {
+                    type_name: "SystemVariableTypeError".into(),
+                    code: 5,
+                    message: "hosted string variables require valid UTF-8".into(),
+                })?
+            }
+            SystemVariableType::LiteralString => {
+                let bytes = task.memory.read_bytes(value_address, length)?;
+                String::from_utf8(bytes).map_err(|_| RuntimeError::Structured {
+                    type_name: "SystemVariableTypeError".into(),
+                    code: 5,
+                    message: "hosted literal variables require valid UTF-8".into(),
+                })?
+            }
+        };
+        let obey_directory = self.obey_directory(task.id).map(str::to_owned);
+        self.system_variables.set_with_obey_directory(
+            &selector,
+            value,
+            variable_type,
+            obey_directory.as_deref(),
+        )?;
+        context.registers[R3] = 0;
+        context.registers[R4] = variable_type.register_value();
+        Ok(())
     }
 
     fn system_swi_number_to_string(
@@ -3563,10 +7380,7 @@ impl SwiDispatcher {
         // installed title spelling stable across a source reload.
         module.preserve_module_title(&old_manifest.name);
 
-        let mut expected_manifest = old_manifest.clone();
-        expected_manifest.source_path = module.manifest.source_path.clone();
-        expected_manifest.source_hash = module.manifest.source_hash.clone();
-        if expected_manifest != module.manifest {
+        if !same_replacement_manifest(&old_manifest, &module.manifest) {
             return Err(module_service_error(
                 "ModuleReplacementIncompatible",
                 1,
@@ -3811,49 +7625,441 @@ impl SwiDispatcher {
         let _ = self.module_registry.discard_unpublished_module(module_id);
     }
 
-    fn vdu_accept_byte(&mut self, context: &mut SwiContext) -> Result<(), RuntimeError> {
+    fn vdu_accept_byte(
+        &mut self,
+        task: &Task,
+        context: &mut SwiContext,
+    ) -> Result<(), RuntimeError> {
         let character = context.registers[R0] as u8;
-        if let Some(mode) = self.current_graphics().mode_after_vdu_byte(character) {
-            self.ensure_graphics_pixel_budget(
-                self.active_graphics_window,
-                u64::from(mode.pixel_width) * u64::from(mode.pixel_height),
-            )?;
+        let window = self.graphics_window_for_task(task.id);
+        let uses_shared_default = self.task_uses_shared_default_graphics(task.id);
+        if window.is_none() && !uses_shared_default {
+            self.task_default_graphics_mut(task.id)?;
+        }
+        let next_mode = match window {
+            Some(handle) => self.window_graphics.get(&handle),
+            None if uses_shared_default => Some(&self.graphics),
+            None => self.task_default_graphics.get(&task.id),
+        }
+        .ok_or_else(|| RuntimeError::Program("caller graphics context is unavailable".into()))?
+        .mode_after_vdu_byte(character);
+        if let Some(mode) = next_mode {
+            let replacement_pixels = u64::from(mode.pixel_width) * u64::from(mode.pixel_height);
+            if window.is_some() {
+                self.ensure_graphics_pixel_budget(window, replacement_pixels)?;
+            } else if !uses_shared_default {
+                self.ensure_task_default_graphics_pixel_budget(task.id, replacement_pixels)?;
+            }
         }
         let grid_changed = self.sync_modern_shell_grid_from_wimp();
-        let previous_mode = self.current_graphics().snapshot().mode;
-        let output_byte = self.current_graphics_mut().write_byte(character)?;
-        let mode_changed = self.current_graphics().snapshot().mode != previous_mode;
+        let graphics = match window {
+            Some(handle) => self.window_graphics.get_mut(&handle).ok_or_else(|| {
+                RuntimeError::Program("active caller graphics window has no raster context".into())
+            })?,
+            None if uses_shared_default => &mut self.graphics,
+            None => self.task_default_graphics_mut(task.id)?,
+        };
+        let previous_mode = graphics.snapshot().mode;
+        let output_byte = graphics.write_byte(character)?;
+        let mode_changed = graphics.snapshot().mode != previous_mode;
+        let snapshot = graphics.snapshot().clone();
         if mode_changed || grid_changed {
-            self.publish_snapshot(self.current_graphics().snapshot().clone());
+            self.publish_graphics_snapshot_for_task(task.id, window, snapshot);
         } else if !self.display_batch_active || output_byte.is_some() {
             self.publish_display_event(DisplayEvent::WriteByte {
-                task_id: self.display_task_id,
-                window_handle: self.active_graphics_window,
+                task_id: task.id,
+                window_handle: window,
                 byte: character,
             });
         } else {
-            self.publish_snapshot(self.current_graphics().snapshot().clone());
+            self.publish_graphics_snapshot_for_task(task.id, window, snapshot);
         }
         context.registers[R0] = u32::from(output_byte.unwrap_or_default());
         context.registers[R1] = u32::from(output_byte.is_some());
         Ok(())
     }
 
-    fn console_read_byte_status(&mut self, context: &mut SwiContext) -> Result<(), RuntimeError> {
-        let byte = match self.mos.input.pop_front() {
-            Some(byte) => Some(byte),
-            None => self.console.read_byte()?,
+    fn graphics_window_for_task(&self, task_id: u64) -> Option<u32> {
+        self.wimp
+            .as_ref()
+            .or(self.desktop_service.as_ref())
+            .and_then(|wimp| wimp.current_graphics_context(task_id))
+            .map(|(window_handle, _, _)| window_handle)
+    }
+
+    fn task_uses_shared_default_graphics(&self, task_id: u64) -> bool {
+        task_id == self.display_task_id || (self.wimp.is_none() && self.desktop_service.is_none())
+    }
+
+    fn task_default_graphics_mut(
+        &mut self,
+        task_id: u64,
+    ) -> Result<&mut GraphicsService, RuntimeError> {
+        if !self.task_default_graphics.contains_key(&task_id) {
+            if self.task_default_graphics.len() >= MAX_TASK_DEFAULT_GRAPHICS_CONTEXTS {
+                return Err(RuntimeError::Program(
+                    "hosted task-default graphics context limit is exhausted".into(),
+                ));
+            }
+            let initial = self.graphics.new_window_output();
+            let initial_pixels = initial.mode_pixel_count();
+            let existing_pixels = self
+                .task_default_graphics
+                .values()
+                .map(GraphicsService::mode_pixel_count)
+                .sum::<u64>()
+                .saturating_add(self.graphics.mode_pixel_count())
+                .saturating_add(
+                    self.window_graphics
+                        .values()
+                        .map(GraphicsService::mode_pixel_count)
+                        .sum::<u64>(),
+                );
+            if existing_pixels.saturating_add(initial_pixels) > MAX_TASK_GRAPHICS_PIXELS {
+                return Err(RuntimeError::Program(
+                    "hosted task-default graphics pixel budget is exhausted".into(),
+                ));
+            }
+            self.task_default_graphics.insert(task_id, initial);
+        }
+        self.task_default_graphics
+            .get_mut(&task_id)
+            .ok_or_else(|| RuntimeError::Program("caller graphics context is unavailable".into()))
+    }
+
+    fn ensure_task_default_graphics_pixel_budget(
+        &self,
+        task_id: u64,
+        replacement_pixels: u64,
+    ) -> Result<(), RuntimeError> {
+        let other_pixels = self
+            .task_default_graphics
+            .iter()
+            .filter(|(id, _)| **id != task_id)
+            .map(|(_, graphics)| graphics.mode_pixel_count())
+            .sum::<u64>()
+            .saturating_add(self.graphics.mode_pixel_count())
+            .saturating_add(
+                self.window_graphics
+                    .values()
+                    .map(GraphicsService::mode_pixel_count)
+                    .sum::<u64>(),
+            );
+        if other_pixels.saturating_add(replacement_pixels) > MAX_TASK_GRAPHICS_PIXELS {
+            return Err(RuntimeError::Program(
+                "hosted task-default graphics pixel budget is exhausted".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn graphics_plot_for_task(
+        &mut self,
+        task: &Task,
+        plot_code: u8,
+        x: i32,
+        y: i32,
+    ) -> Result<(), RuntimeError> {
+        let window = self.graphics_window_for_task(task.id);
+        let snapshot = {
+            let graphics = match window {
+                Some(handle) => self.window_graphics.get_mut(&handle).ok_or_else(|| {
+                    RuntimeError::Program(
+                        "active caller graphics window has no raster context".into(),
+                    )
+                })?,
+                None if self.task_uses_shared_default_graphics(task.id) => &mut self.graphics,
+                None => self.task_default_graphics_mut(task.id)?,
+            };
+            graphics.plot(plot_code, x, y)?;
+            graphics.snapshot().clone()
+        };
+        if self.display_batch_active {
+            if self.display_events.is_some()
+                && self
+                    .last_display_batch_publish
+                    .is_some_and(|last| last.elapsed() >= DISPLAY_BATCH_FRAME_INTERVAL)
+            {
+                self.publish_graphics_snapshot_for_task(task.id, window, snapshot);
+                self.last_display_batch_publish = Some(Instant::now());
+            }
+        } else {
+            self.publish_display_event(DisplayEvent::Plot {
+                task_id: task.id,
+                window_handle: window,
+                code: plot_code,
+                x,
+                y,
+            });
+        }
+        Ok(())
+    }
+
+    fn graphics_set_packed_rgb_for_task(
+        &mut self,
+        task: &Task,
+        packed_rgb: u32,
+    ) -> Result<(), RuntimeError> {
+        let window = self.graphics_window_for_task(task.id);
+        let snapshot = {
+            let graphics = match window {
+                Some(handle) => self.window_graphics.get_mut(&handle).ok_or_else(|| {
+                    RuntimeError::Program(
+                        "active caller graphics window has no raster context".into(),
+                    )
+                })?,
+                None if self.task_uses_shared_default_graphics(task.id) => &mut self.graphics,
+                None => self.task_default_graphics_mut(task.id)?,
+            };
+            graphics.set_rgb_gcol(packed_rgb);
+            graphics.snapshot().clone()
+        };
+        // Publish an immediate state change outside batched drawing. Within a
+        // batch, the normal final snapshot carries the new GCOL without
+        // flooding the display channel for per-pixel ColourTrans calls.
+        if !self.display_batch_active {
+            self.publish_graphics_snapshot_for_task(task.id, window, snapshot);
+        }
+        Ok(())
+    }
+
+    fn publish_graphics_snapshot_for_task(
+        &self,
+        task_id: u64,
+        window_handle: Option<u32>,
+        snapshot: GraphicsSnapshot,
+    ) {
+        if let Some(wimp) = self.wimp.as_ref().or(self.desktop_service.as_ref()) {
+            wimp.sync_console_mode(task_id, window_handle, snapshot.mode);
+        }
+        self.publish_display_event(DisplayEvent::GraphicsSnapshot {
+            task_id,
+            window_handle,
+            snapshot,
+        });
+    }
+
+    fn replace_exec_input(
+        &mut self,
+        task: &mut Task,
+        context: &mut SwiContext,
+    ) -> Result<(), RuntimeError> {
+        let raw_path = task
+            .memory
+            .read_c_string(context.registers[R0], MAX_CLI_BYTES)?;
+        if raw_path.is_empty() {
+            task.close_exec_input();
+            return Ok(());
+        }
+        let path = std::str::from_utf8(&raw_path).map_err(|_| {
+            module_service_error("ExecPathError", 1, "Exec path is not valid UTF-8")
+        })?;
+        let resolved = self
+            .file_system
+            .canonical_guest_path(&task.file_system, path)
+            .map_err(|_| {
+                module_service_error("ExecFileError", 1, "Exec could not resolve the guest file")
+            })?;
+        let guest_path = if resolved.guest_path.is_empty() {
+            format!("HostFS::{}.$", self.file_system.volume_name())
+        } else {
+            format!(
+                "HostFS::{}.$.{}",
+                self.file_system.volume_name(),
+                resolved.guest_path
+            )
+        };
+        let (bytes, _) = self
+            .file_system
+            .read_file_limited(&task.file_system, path, MAX_EXEC_SOURCE_BYTES)
+            .map_err(|_| {
+                module_service_error(
+                    "ExecFileError",
+                    2,
+                    format!("{guest_path}: Exec could not read the guest file within its 65,536-byte limit"),
+                )
+            })?;
+        let source = std::str::from_utf8(&bytes).map_err(|error| {
+            let line = exec_source_line_at(&bytes, error.valid_up_to());
+            module_service_error(
+                "ExecSourceError",
+                line,
+                format!("{guest_path}:{line}: Exec source is not valid UTF-8"),
+            )
+        })?;
+        for (byte_offset, character) in source.char_indices() {
+            if character != '\t' && character != '\r' && character != '\n' && character.is_control()
+            {
+                let line = exec_source_line_at(&bytes, byte_offset);
+                return Err(module_service_error(
+                    "ExecSourceControlCharacter",
+                    line,
+                    format!(
+                        "{guest_path}:{line}: Exec source contains unsupported control U+{:04X}; the active input source was not replaced",
+                        u32::from(character)
+                    ),
+                ));
+            }
+        }
+
+        let mut normalized = Vec::with_capacity(bytes.len());
+        let mut offset = 0_usize;
+        let mut physical_lines = 0_usize;
+        let mut line_bytes = 0_usize;
+        let mut current_line = 1_u32;
+        while offset < bytes.len() {
+            let byte = bytes[offset];
+            if let Some(terminator_len) = exec_line_terminator_len(&bytes, offset) {
+                physical_lines += 1;
+                if physical_lines > MAX_EXEC_LINES {
+                    return Err(module_service_error(
+                        "ExecLineLimit",
+                        u32::try_from(physical_lines).unwrap_or(u32::MAX),
+                        format!(
+                            "{guest_path}:{physical_lines}: Exec source exceeds the 4,096-line limit; the active input source was not replaced"
+                        ),
+                    ));
+                }
+                if line_bytes > MAX_EXEC_LINE_BYTES {
+                    return Err(module_service_error(
+                        "ExecLineLength",
+                        current_line,
+                        format!(
+                            "{guest_path}:{current_line}: Exec source contains a line longer than the 255-byte input limit; the active input source was not replaced"
+                        ),
+                    ));
+                }
+                line_bytes = 0;
+                current_line = current_line.saturating_add(1);
+                normalized.push(b'\r');
+                offset += terminator_len - 1;
+            } else {
+                line_bytes += 1;
+                if line_bytes > MAX_EXEC_LINE_BYTES {
+                    return Err(module_service_error(
+                        "ExecLineLength",
+                        current_line,
+                        format!(
+                            "{guest_path}:{current_line}: Exec source contains a line longer than the 255-byte input limit; the active input source was not replaced"
+                        ),
+                    ));
+                }
+                normalized.push(byte);
+            }
+            offset += 1;
+        }
+        if line_bytes > 0 {
+            physical_lines += 1;
+            if physical_lines > MAX_EXEC_LINES {
+                return Err(module_service_error(
+                    "ExecLineLimit",
+                    u32::try_from(physical_lines).unwrap_or(u32::MAX),
+                    format!(
+                        "{guest_path}:{physical_lines}: Exec source exceeds the 4,096-line limit; the active input source was not replaced"
+                    ),
+                ));
+            }
+        }
+
+        task.install_exec_input(guest_path, normalized);
+        Ok(())
+    }
+
+    fn console_read_byte_status(
+        &mut self,
+        task: &mut Task,
+        context: &mut SwiContext,
+    ) -> Result<(), RuntimeError> {
+        let byte = match task.read_exec_input() {
+            ExecInputRead::Byte {
+                byte,
+                guest_path,
+                line,
+            } => Some((byte, Some((guest_path, line)))),
+            ExecInputRead::UnterminatedLineEnd => {
+                context.registers[R0] = 0;
+                context.registers[R1] = 1;
+                context.carry = false;
+                return Ok(());
+            }
+            ExecInputRead::Inactive => {
+                // Once the file source has ended, subsequent keyboard input
+                // belongs to the caller's normal stream, not the old file.
+                task.set_exec_input_provenance(None);
+                let byte = match self.mos.input.pop_front() {
+                    Some(byte) => Some(byte),
+                    None => self.console.read_byte()?,
+                };
+                byte.map(|byte| (byte, None))
+            }
         };
         if let Some(byte) = byte {
-            context.registers[R0] = u32::from(byte);
+            context.registers[R0] = u32::from(byte.0);
             context.registers[R1] = 0;
-            context.carry = byte == 0x1B;
+            context.carry = byte.0 == 0x1B;
+            task.set_exec_input_provenance(byte.1);
         } else {
             context.registers[R0] = 0;
             context.registers[R1] = 1;
             context.carry = false;
         }
         Ok(())
+    }
+
+    fn dispatch_named_module_service(
+        &mut self,
+        service_name: &str,
+        owner_module: &str,
+        exported_definition: &str,
+        contract: SwiContract,
+        task: &mut Task,
+        context: &mut SwiContext,
+    ) -> Result<(), RuntimeError> {
+        let record = self
+            .module_registry
+            .module_named(owner_module)
+            .ok_or_else(|| {
+                RuntimeError::Program(format!(
+                    "named service {service_name} has no registered BASIC64 owner"
+                ))
+            })?;
+        if record.state != ModuleState::Active {
+            return Err(RuntimeError::Program(format!(
+                "named service {service_name} is published but its owning module is not active"
+            )));
+        }
+        if !record
+            .manifest
+            .symbol_exports
+            .iter()
+            .any(|export| export.eq_ignore_ascii_case(exported_definition))
+        {
+            return Err(RuntimeError::Program(format!(
+                "module {owner_module} does not export named service {service_name}"
+            )));
+        }
+        let Some(definition) = record.definitions.get(exported_definition).cloned() else {
+            return Err(RuntimeError::Program(format!(
+                "named service {service_name} has no live definition"
+            )));
+        };
+        let module_id = record.id;
+        let Some(module) = self.module_programs.get(&definition.id).cloned() else {
+            return Err(RuntimeError::Program(format!(
+                "named service {service_name} has no retained BASIC64 source"
+            )));
+        };
+        self.module_dispatch_count = self.module_dispatch_count.saturating_add(1);
+        let result = module.invoke(module_id, &definition, &contract, task, self, context);
+        self.last_dispatch_route = Some(SwiDispatchRoute::ModuleOwnedNamed {
+            name: service_name.to_owned(),
+            module: owner_module.to_owned(),
+            definition: definition.name,
+            definition_id: definition.id.diagnostic_value(),
+            source_hash: definition.source_hash,
+        });
+        self.collect_retired_module_programs();
+        result
     }
 
     pub(crate) fn dispatch_named_swi(
@@ -3872,9 +8078,42 @@ impl SwiDispatcher {
         if let Some(number) = self.module_registry.swi_number(service_name) {
             return self.dispatch(number | x_bit, task, context);
         }
+        let named_owner = match service_name {
+            "COLOURTRANS_CONVERTHSVTORGB" | "COLOURTRANS_SETGCOL" | "COLOURTRANS_WRITEPALETTE" => {
+                Some((
+                    "ColourTrans",
+                    service_name,
+                    named_colourtrans_contract(service_name),
+                ))
+            }
+            "RICOCHET_DESKTOP" => Some((
+                "DesktopServices",
+                "DESKTOPSERVICE",
+                named_project_service_contract(service_name),
+            )),
+            "RICOCHET_DISPLAY" => Some((
+                "DisplayManager",
+                "DISPLAYSERVICE",
+                named_project_service_contract(service_name),
+            )),
+            _ => None,
+        };
+        if let Some((owner, definition, contract)) = named_owner {
+            let result = self.dispatch_named_module_service(
+                service_name,
+                owner,
+                definition,
+                contract,
+                task,
+                context,
+            );
+            return if x_form {
+                return_x_form_error(result, task, context)
+            } else {
+                result
+            };
+        }
         let result = match service_name {
-            "OS_BYTE" => self.dispatch(OS_BYTE | x_bit, task, context),
-            "OS_WORD" => self.dispatch(OS_WORD | x_bit, task, context),
             "OS_WRITEC" => self.dispatch(OS_WRITE_C | x_bit, task, context),
             "OS_WRITES" => self.dispatch(OS_WRITE_S | x_bit, task, context),
             "OS_WRITE0" => self.dispatch(OS_WRITE_0 | x_bit, task, context),
@@ -3894,22 +8133,6 @@ impl SwiDispatcher {
             "OS_CHANGEDYNAMICAREA" => self.dispatch(OS_CHANGE_DYNAMIC_AREA | x_bit, task, context),
             "OS_GENERATEERROR" => self.dispatch(OS_GENERATE_ERROR | x_bit, task, context),
             "OS_DYNAMICAREA" => self.dispatch(OS_DYNAMIC_AREA | x_bit, task, context),
-            "COLOURTRANS_CONVERTHSVTORGB" => {
-                let hue = f64::from(context.registers[R0] as i32) / 65_536.0;
-                let saturation = f64::from(context.registers[R1]) / 65_280.0;
-                let value = f64::from(context.registers[R2] & 0xFF) / 255.0;
-                let (red, green, blue) = hsv_to_rgb(hue, saturation, value);
-                context.registers[R0] = u32::from(red);
-                context.registers[R1] = u32::from(green);
-                context.registers[R2] = u32::from(blue);
-                Ok(())
-            }
-            "COLOURTRANS_SETGCOL" => {
-                self.current_graphics_mut()
-                    .set_rgb_gcol(context.registers[R0]);
-                Ok(())
-            }
-            "COLOURTRANS_WRITEPALETTE" => Ok(()),
             "WIMP_INITIALISE" => self.dispatch(WIMP_INITIALISE | x_bit, task, context),
             "WIMP_CREATEWINDOW" => self.dispatch(WIMP_CREATE_WINDOW | x_bit, task, context),
             "WIMP_CREATEICON" => self.dispatch(WIMP_CREATE_ICON | x_bit, task, context),
@@ -3929,8 +8152,6 @@ impl SwiDispatcher {
             "WIMP_SETEXTENT" => self.dispatch(WIMP_SET_EXTENT | x_bit, task, context),
             "WIMP_CLOSEDOWN" => self.dispatch(WIMP_CLOSE_DOWN | x_bit, task, context),
             "WIMP_STARTTASK" => self.dispatch(WIMP_START_TASK | x_bit, task, context),
-            "RICOCHET_DESKTOP" => self.ricochet_desktop(task, context),
-            "RICOCHET_DISPLAY" => self.ricochet_display(task, context),
             _ => Err(RuntimeError::Structured {
                 type_name: "UnknownSwi".into(),
                 code: SWI_UNKNOWN_ERROR_CODE,
@@ -3962,9 +8183,46 @@ impl SwiDispatcher {
         let x_form = encoded_number & SWI_X_BIT != 0;
         let number = encoded_number & !SWI_X_BIT;
         context.overflow = false;
-        let result = self.dispatch_unchecked(number, task, context);
-        let result = if number == OS_CLI {
-            match (result, task.memory.release_all_command_scratch()) {
+        let obey_depth_before = self
+            .obey_scripts
+            .get(&task.id)
+            .map_or(0, |session| session.frames.len());
+        let system_variable_contexts_before =
+            (number == OS_CLI).then(|| task.system_variable_read_context_addresses());
+        let command_scratch_before = ((number == OS_CLI && self.active_command_context.is_some())
+            || number == OS_FS_CONTROL)
+            .then(|| task.memory.command_scratch_snapshot());
+        let result = match self.dispatch_unchecked(number, task, context) {
+            Err(error) if number == OS_CLI => {
+                let error = if let Some((path, line)) = self.obey_source(task.id) {
+                    obey_source_error(&path, line, error)
+                } else if let Some((path, line)) = task.exec_input_provenance() {
+                    if matches!(
+                        &error,
+                        RuntimeError::Structured { type_name, .. }
+                            if type_name == "ExecInputSourceError"
+                    ) {
+                        error
+                    } else {
+                        exec_input_source_error(path, line, error.to_string())
+                    }
+                } else {
+                    error
+                };
+                self.unwind_obey_scripts(task, obey_depth_before);
+                Err(error)
+            }
+            result => result,
+        };
+        let result = if number == OS_CLI || number == OS_FS_CONTROL {
+            if let Some(existing) = &system_variable_contexts_before {
+                task.clear_new_system_variable_read_cursors(existing);
+            }
+            let cleanup = match &command_scratch_before {
+                Some(existing) => task.memory.release_command_scratch_after(existing),
+                None => task.memory.release_all_command_scratch(),
+            };
+            match (result, cleanup) {
                 (Err(error), _) => Err(error),
                 (Ok(()), Ok(())) => Ok(()),
                 (Ok(()), Err(error)) => Err(error.into()),
@@ -3973,9 +8231,17 @@ impl SwiDispatcher {
             result
         };
         if x_form {
-            return return_x_form_error(result, task, context);
+            let result = return_x_form_error(result, task, context);
+            if number == OS_CLI && !task.has_exec_input() {
+                task.set_exec_input_provenance(None);
+            }
+            return result;
         }
-        result.map_err(normalize_swi_error)
+        let result = result.map_err(normalize_swi_error);
+        if number == OS_CLI && !task.has_exec_input() {
+            task.set_exec_input_provenance(None);
+        }
+        result
     }
 
     fn dispatch_unchecked(
@@ -3989,8 +8255,7 @@ impl SwiDispatcher {
         }
         if matches!(
             number,
-            WIMP_INITIALISE
-                | WIMP_CREATE_WINDOW
+            WIMP_CREATE_WINDOW
                 | WIMP_REDRAW_WINDOW
                 | WIMP_UPDATE_WINDOW
                 | WIMP_GET_RECTANGLE
@@ -3998,16 +8263,10 @@ impl SwiDispatcher {
                 | WIMP_CREATE_ICON
                 | WIMP_CREATE_ICON_EX
                 | WIMP_DELETE_ICON
-                | WIMP_OPEN_WINDOW
-                | WIMP_CLOSE_WINDOW
                 | WIMP_POLL
-                | WIMP_GET_WINDOW_STATE
                 | WIMP_SET_ICON_STATE
                 | WIMP_GET_POINTER_INFO
                 | WIMP_CREATE_MENU
-                | WIMP_SET_EXTENT
-                | WIMP_CLOSE_DOWN
-                | WIMP_START_TASK
         ) {
             self.record_transitional_numeric_dispatch(number);
             return self.dispatch_wimp(number, task, context);
@@ -4048,54 +8307,25 @@ impl SwiDispatcher {
                 self.emit_via_write_c(task, b'\r')
             }
             OS_READ_C => self.read_character(context),
-            OS_CLI => self.execute_cli(task, context),
-            OS_BYTE => self.os_byte(context),
-            OS_WORD => self.os_word(task, context),
+            OS_CLI => {
+                let source = task
+                    .exec_input_provenance()
+                    .map(|(path, line)| (path.to_owned(), line));
+                self.execute_cli(task, context).map_err(|error| {
+                    if matches!(
+                        &error,
+                        RuntimeError::Structured { type_name, .. }
+                            if type_name == "ExecInputSourceError"
+                    ) {
+                        error
+                    } else if let Some((path, line)) = source {
+                        exec_input_source_error(&path, line, error.to_string())
+                    } else {
+                        error
+                    }
+                })
+            }
             OS_READ_LINE => self.read_line(task, context),
-            OS_FILE => self.os_file(task, context),
-            OS_ARGS => self.os_args(task, context),
-            OS_BGET => self.os_bget(task, context),
-            OS_BPUT => self.os_bput(task, context),
-            OS_GBPB => self.os_gbpb(task, context),
-            OS_FIND => self.os_find(task, context),
-            OS_FSCONTROL => self.os_fscontrol(task, context),
-            OS_PLOT => {
-                let code = context.registers[R0] as u8;
-                let x = context.registers[R1] as i32;
-                let y = context.registers[R2] as i32;
-                self.current_graphics_mut().plot(code, x, y)?;
-                if self.display_batch_active {
-                    self.publish_display_batch_snapshot_if_due();
-                } else {
-                    self.publish_display_event(DisplayEvent::Plot {
-                        task_id: self.display_task_id,
-                        window_handle: self.active_graphics_window,
-                        code,
-                        x,
-                        y,
-                    });
-                }
-                Ok(())
-            }
-            OS_READ_POINT => {
-                if self.current_graphics().snapshot().text_profile == TextRenderingProfile::Modern {
-                    return Err(RuntimeError::Program(
-                        "OS_ReadPoint requires TEXT=CLASSIC because Modern text is not stored in the guest raster".into(),
-                    ));
-                }
-                let x = context.registers[R0] as i32;
-                let y = context.registers[R1] as i32;
-                if let Some((colour, tint)) = self.current_graphics().read_point(x, y) {
-                    context.registers[R2] = colour;
-                    context.registers[R3] = tint;
-                    context.registers[R4] = 0;
-                } else {
-                    context.registers[R2] = u32::MAX;
-                    context.registers[R3] = 0;
-                    context.registers[R4] = u32::MAX;
-                }
-                Ok(())
-            }
             other => Err(RuntimeError::InvalidSwi(other)),
         };
         if !matches!(&result, Err(RuntimeError::InvalidSwi(_))) {
@@ -4145,144 +8375,6 @@ impl SwiDispatcher {
         Ok(())
     }
 
-    /// Project extension for the BASIC64 Filer. It exposes checked HostFS
-    /// catalogue records and the mounted volume name; Filer navigation and
-    /// activation policy remain in BASIC64.
-    fn ricochet_desktop(
-        &mut self,
-        task: &mut Task,
-        context: &mut SwiContext,
-    ) -> Result<(), RuntimeError> {
-        match context.registers[R0] {
-            1 => {
-                let path = read_guest_control_string(task, context.registers[R1])?;
-                let index = context.registers[R2] as usize;
-                let capacity = context.registers[R4] as usize;
-                if capacity == 0 || capacity > crate::memory::GUEST_MEMORY_SIZE as usize {
-                    return Err(RuntimeError::Program(
-                        "desktop entry buffer size is outside the hosted limit".into(),
-                    ));
-                }
-                let entries = self.file_system.enumerate(&task.file_system, &path, "*")?;
-                let Some(entry) = entries.get(index) else {
-                    task.memory.write_byte(context.registers[R3], 0)?;
-                    context.registers[R0] = 0;
-                    context.registers[R1] = 0;
-                    return Ok(());
-                };
-                if entry.guest_name.len() + 1 > capacity {
-                    return Err(RuntimeError::Program(
-                        "desktop entry name does not fit the caller buffer".into(),
-                    ));
-                }
-                write_guest_string(task, context.registers[R3], &entry.guest_name)?;
-                context.registers[R0] = if entry.is_directory {
-                    2
-                } else if matches!(
-                    entry.metadata.file_type & 0xFFF,
-                    FILETYPE_BASIC | FILETYPE_BASIC64
-                ) {
-                    1
-                } else if entry.metadata.file_type & 0xFFF == FILETYPE_TEXT {
-                    3
-                } else {
-                    4
-                };
-                context.registers[R1] = entry.metadata.file_type;
-                context.registers[R2] = entry.length;
-                Ok(())
-            }
-            2 => {
-                let capacity = context.registers[R2] as usize;
-                let name = self.file_system.volume_name();
-                if name.len() + 1 > capacity {
-                    return Err(RuntimeError::Program(
-                        "desktop volume name does not fit the caller buffer".into(),
-                    ));
-                }
-                write_guest_string(task, context.registers[R1], name)?;
-                context.registers[R0] = u32::try_from(name.len()).unwrap_or(u32::MAX);
-                Ok(())
-            }
-            4 => self
-                .wimp
-                .as_ref()
-                .ok_or(RuntimeError::InvalidSwi(0x4FF00))?
-                .register_system_menu(task.id),
-            3 => {
-                // Additive hosted catalogue metadata: leave reason 1 unchanged.
-                let path = read_guest_control_string(task, context.registers[R1])?;
-                let index = context.registers[R2] as usize;
-                let entries = self.file_system.enumerate(&task.file_system, &path, "*")?;
-                let modified = entries.get(index).and_then(|entry| {
-                    std::fs::metadata(&entry.host_path)
-                        .ok()?
-                        .modified()
-                        .ok()?
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .ok()
-                        .and_then(|duration| u32::try_from(duration.as_secs()).ok())
-                });
-                context.registers[R0] = u32::from(modified.is_some());
-                context.registers[R1] = modified.unwrap_or(0);
-                Ok(())
-            }
-            action => Err(RuntimeError::Program(format!(
-                "desktop catalogue action {action} is not supported"
-            ))),
-        }
-    }
-
-    /// Versioned, register-only Display Manager service. A combined apply is
-    /// persisted before Wimp state changes; R8 reports a persistence failure
-    /// without terminating the BASIC64 Desktop task.
-    fn ricochet_display(&mut self, task: &Task, context: &mut SwiContext) -> Result<(), RuntimeError> {
-        if context.registers[R0] != RICOCHET_DISPLAY_ABI_VERSION {
-            return Err(RuntimeError::Program(format!(
-                "display service ABI version {} is unsupported",
-                context.registers[R0]
-            )));
-        }
-        let wimp = self
-            .wimp
-            .as_ref()
-            .or(self.desktop_service.as_ref())
-            .ok_or_else(|| {
-                RuntimeError::Program("display settings require the hosted Wimp desktop".into())
-            })?;
-        match context.registers[R1] {
-            RICOCHET_DISPLAY_QUERY => {
-                write_display_query(wimp, context);
-                context.registers[R8] = 0;
-                Ok(())
-            }
-            RICOCHET_DISPLAY_APPLY => {
-                task.require_configuration_write()?;
-                let resolution =
-                    DesktopResolution::from_id(context.registers[R2]).ok_or_else(|| {
-                        RuntimeError::Program(format!(
-                            "display resolution ID {} is invalid",
-                            context.registers[R2]
-                        ))
-                    })?;
-                let colour = DisplayColour::from_id(context.registers[R3]).ok_or_else(|| {
-                    RuntimeError::Program(format!(
-                        "display colour ID {} is invalid",
-                        context.registers[R3]
-                    ))
-                })?;
-                let settings = DisplaySettings { resolution, colour };
-                let saved = wimp.apply_display_settings(settings).is_ok();
-                write_display_query(wimp, context);
-                context.registers[R8] = if saved { 0 } else { 1 };
-                Ok(())
-            }
-            action => Err(RuntimeError::Program(format!(
-                "display settings action {action} is unsupported"
-            ))),
-        }
-    }
-
     fn publish_snapshot(&self, snapshot: GraphicsSnapshot) {
         self.publish_snapshot_for_window(self.active_graphics_window, snapshot);
     }
@@ -4328,134 +8420,7 @@ impl SwiDispatcher {
             .set_current_directory(&mut task.file_system, &parent)
     }
 
-    fn os_file(&mut self, task: &mut Task, context: &mut SwiContext) -> Result<(), RuntimeError> {
-        let reason = context.registers[R0];
-        let path = read_guest_string(task, context.registers[R1])?;
-        match reason {
-            0 | 10 => {
-                let start = context.registers[R4];
-                let end = context.registers[R5];
-                let length = end.checked_sub(start).ok_or_else(|| {
-                    RuntimeError::Program("OS_File save end precedes its start".into())
-                })?;
-                let bytes = task.memory.read_bytes(start, length as usize)?;
-                let mut metadata = metadata_for_new_guest_path(&path);
-                if reason == 0 {
-                    apply_riscos_load_address(&mut metadata, context.registers[R2]);
-                    metadata.execution_address = context.registers[R3];
-                } else {
-                    metadata.file_type = context.registers[R2] & 0xFFF;
-                }
-                self.file_system
-                    .write_file(&task.file_system, &path, &bytes, metadata)
-            }
-            1 | 2 | 3 | 4 | 9 | 18 => {
-                let mut metadata = self.metadata_for_guest_object(task, &path)?;
-                match reason {
-                    1 => {
-                        apply_riscos_load_address(&mut metadata, context.registers[R2]);
-                        metadata.execution_address = context.registers[R3];
-                        metadata.attributes = context.registers[R5];
-                    }
-                    2 => apply_riscos_load_address(&mut metadata, context.registers[R2]),
-                    3 => metadata.execution_address = context.registers[R3],
-                    4 => metadata.attributes = context.registers[R5],
-                    9 if metadata.file_type == 0 => metadata.file_type = 0xFFD,
-                    18 => metadata.file_type = context.registers[R2] & 0xFFF,
-                    _ => {}
-                }
-                self.file_system
-                    .set_metadata(&task.file_system, &path, &metadata)
-            }
-            5 | 13 | 15 | 17 => {
-                let (object_type, metadata, length) = self.catalogue_object(task, &path)?;
-                context.registers[R0] = object_type;
-                if object_type != 0 {
-                    context.registers[R2] = riscos_load_address(&metadata);
-                    context.registers[R3] = metadata.execution_address;
-                    context.registers[R4] = length;
-                    context.registers[R5] = metadata.attributes;
-                }
-                Ok(())
-            }
-            6 => {
-                let (object_type, metadata, length) = self.catalogue_object(task, &path)?;
-                context.registers[R0] = object_type;
-                if object_type != 0 {
-                    context.registers[R2] = riscos_load_address(&metadata);
-                    context.registers[R3] = metadata.execution_address;
-                    context.registers[R4] = length;
-                    context.registers[R5] = metadata.attributes;
-                    if object_type == 2 {
-                        self.file_system
-                            .remove_directory(&task.file_system, &path)?;
-                    } else {
-                        self.file_system.delete_file(&task.file_system, &path)?;
-                    }
-                }
-                Ok(())
-            }
-            7 | 11 => {
-                let mut metadata = metadata_for_new_guest_path(&path);
-                if reason == 7 {
-                    apply_riscos_load_address(&mut metadata, context.registers[R2]);
-                    metadata.execution_address = context.registers[R3];
-                } else {
-                    metadata.file_type = context.registers[R2] & 0xFFF;
-                }
-                self.file_system
-                    .write_file(&task.file_system, &path, &[], metadata)
-            }
-            8 => {
-                match self
-                    .file_system
-                    .canonical_guest_path(&task.file_system, &path)
-                {
-                    Ok(resolved) if resolved.is_directory => Ok(()),
-                    _ => self
-                        .file_system
-                        .create_directory(&task.file_system, &path)
-                        .map(|_| ()),
-                }
-            }
-            12 | 14 | 16 | 255 => {
-                let (bytes, metadata) = self.file_system.read_file(&task.file_system, &path)?;
-                let destination = if context.registers[R3] & 0xFF == 0 {
-                    context.registers[R2]
-                } else {
-                    metadata.load_address
-                };
-                task.memory.write_bytes(destination, &bytes)?;
-                context.registers[R0] = 1;
-                context.registers[R2] = riscos_load_address(&metadata);
-                context.registers[R3] = metadata.execution_address;
-                context.registers[R4] = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
-                context.registers[R5] = metadata.attributes;
-                Ok(())
-            }
-            other => Err(RuntimeError::Program(format!(
-                "OS_File reason {other} is not implemented by the hosted FileSwitch"
-            ))),
-        }
-    }
-
-    fn metadata_for_guest_object(
-        &self,
-        task: &Task,
-        path: &str,
-    ) -> Result<FileMetadata, RuntimeError> {
-        let resolved = self
-            .file_system
-            .canonical_guest_path(&task.file_system, path)?;
-        if resolved.is_directory {
-            return Err(RuntimeError::Program(format!("'{path}' is a directory")));
-        }
-        Ok(resolved
-            .metadata
-            .unwrap_or_else(|| metadata_for_new_guest_path(&resolved.guest_path)))
-    }
-
-    fn catalogue_object(
+    fn file_object_catalogue(
         &self,
         task: &Task,
         path: &str,
@@ -4483,652 +8448,91 @@ impl SwiDispatcher {
             .metadata
             .unwrap_or_else(|| metadata_for_new_guest_path(&resolved.guest_path));
         let length =
-            u32::try_from(std::fs::metadata(&resolved.host_path)?.len()).unwrap_or(u32::MAX);
+            u32::try_from(std::fs::metadata(&resolved.host_path)?.len()).map_err(|_| {
+                RuntimeError::Program("file length exceeds the hosted U32 range".into())
+            })?;
         Ok((1, metadata, length))
     }
 
-    fn os_find(&mut self, task: &mut Task, context: &mut SwiContext) -> Result<(), RuntimeError> {
-        let reason = context.registers[R0] as u8;
-        if reason == 0 {
-            let handle = context.registers[R1];
-            if handle == 0 {
-                task.file_system.open_files.clear();
+    fn file_object_search_candidate(
+        &self,
+        task: &Task,
+        path_source: u32,
+        object_address: u32,
+        path_info_address: u32,
+        candidate_index: u32,
+    ) -> Result<Option<String>, RuntimeError> {
+        if candidate_index >= 16 {
+            return Ok(None);
+        }
+        let object_name = read_file_object_path(task, object_address)?;
+        if object_name.contains(':') {
+            return if candidate_index == 0 {
+                Ok(Some(object_name))
             } else {
-                task.file_system.open_files.remove(&handle);
-            }
-            return Ok(());
+                Ok(None)
+            };
         }
 
-        let path = String::from_utf8_lossy(&mos::read_mos_string(
-            task,
-            context.registers[R1],
-            MAX_STRING_BYTES,
-        )?)
-        .into_owned();
-        let mode = reason & 0xC0;
-        if !matches!(mode, 0x40 | 0x80 | 0xC0) {
-            return Err(RuntimeError::Program(format!(
-                "unsupported OS_Find reason &{reason:02X}"
-            )));
-        }
-        let read = mode != 0x80;
-        let write = mode != 0x40;
-        let create = mode == 0x80;
-        let truncate = create;
-        let (file, resolved) = match self.file_system.open_file(
-            &task.file_system,
-            &path,
-            read,
-            write,
-            create,
-            truncate,
-        ) {
-            Ok(opened) => opened,
-            Err(RuntimeError::Io(error))
-                if error.kind() == std::io::ErrorKind::NotFound
-                    && !create
-                    && reason & 0x08 == 0 =>
-            {
-                context.registers[R0] = 0;
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        let handle = task
-            .file_system
-            .insert_file(OpenFile {
-                file,
-                can_read: read,
-                can_write: write,
-                guest_path: resolved.guest_path,
-                eof_error_next: false,
-            })
-            .ok_or_else(|| RuntimeError::Program("no FileSwitch handles are available".into()))?;
-        context.registers[R0] = handle;
-        Ok(())
-    }
-
-    fn os_args(&mut self, task: &mut Task, context: &mut SwiContext) -> Result<(), RuntimeError> {
-        let reason = context.registers[R0];
-        let handle = context.registers[R1];
-        if reason == 0 && handle == 0 {
-            context.registers[R0] = HOST_FS_NUMBER;
-            return Ok(());
-        }
-        let file = task
-            .file_system
-            .open_files
-            .get_mut(&handle)
-            .ok_or_else(|| RuntimeError::Program(format!("invalid file handle {handle}")))?;
-        match reason {
-            0 => {
-                context.registers[R2] =
-                    u32::try_from(file.file.stream_position()?).unwrap_or(u32::MAX)
-            }
-            1 => {
-                let position = u64::from(context.registers[R2]);
-                let length = file.file.metadata()?.len();
-                if position > length {
-                    if !file.can_write {
-                        return Err(RuntimeError::Program("file is not open for writing".into()));
-                    }
-                    file.file.set_len(position)?;
-                }
-                file.file.seek(SeekFrom::Start(position))?;
-                file.eof_error_next = false;
-            }
-            2 | 4 => {
-                context.registers[R2] =
-                    u32::try_from(file.file.metadata()?.len()).unwrap_or(u32::MAX)
-            }
+        let path_spec = match path_source {
+            1 => match self.system_variables.read("File$Path", None) {
+                Ok(variable) => supported_file_path_variable(variable)?,
+                Err(error) if is_system_variable_not_found(&error) => String::new(),
+                Err(error) => return Err(error),
+            },
+            2 => read_guest_path_spec(task, path_info_address, 255)?,
             3 => {
-                if !file.can_write {
-                    return Err(RuntimeError::Program("file is not open for writing".into()));
-                }
-                let extent = u64::from(context.registers[R2]);
-                file.file.set_len(extent)?;
-                if file.file.stream_position()? > extent {
-                    file.file.seek(SeekFrom::Start(extent))?;
-                }
-                file.eof_error_next = false;
+                let name = read_guest_path_spec(task, path_info_address, MAX_NAME_BYTES)?;
+                validate_file_path_variable_name(&name)?;
+                let variable = self.system_variables.read(&name, None)?;
+                supported_file_path_variable(variable)?
             }
-            5 => {
-                context.registers[R2] =
-                    u32::from(file.file.stream_position()? >= file.file.metadata()?.len());
-            }
-            7 => {
-                let canonical =
-                    canonical_guest_name(self.file_system.volume_name(), &file.guest_path);
-                let bytes = canonical.as_bytes();
-                let buffer = context.registers[R2];
-                let capacity = context.registers[R5] as usize;
-                let required = bytes.len() + 1;
-                if required <= capacity {
-                    task.memory.write_bytes(buffer, bytes)?;
-                    task.memory.write_byte(buffer + bytes.len() as u32, 0)?;
-                    context.registers[R5] = (capacity - required) as u32;
-                } else {
-                    context.registers[R5] = (capacity as i64 - required as i64) as i32 as u32;
-                }
-            }
-            other => {
-                return Err(RuntimeError::Program(format!(
-                    "OS_Args reason {other} is not implemented by the hosted FileSwitch"
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    fn os_bget(&mut self, task: &mut Task, context: &mut SwiContext) -> Result<(), RuntimeError> {
-        let handle = context.registers[R1];
-        let file = task
-            .file_system
-            .open_files
-            .get_mut(&handle)
-            .ok_or_else(|| RuntimeError::Program(format!("invalid file handle {handle}")))?;
-        if !file.can_read {
-            return Err(RuntimeError::Program("file is not open for reading".into()));
-        }
-        if file.eof_error_next {
-            file.eof_error_next = false;
-            return Err(RuntimeError::Program("end of file".into()));
-        }
-        let mut byte = [0u8; 1];
-        if file.file.read(&mut byte)? == 0 {
-            file.eof_error_next = true;
-            context.carry = true;
-        } else {
-            context.registers[R0] = u32::from(byte[0]);
-            context.carry = false;
-        }
-        Ok(())
-    }
-
-    fn os_bput(&mut self, task: &mut Task, context: &mut SwiContext) -> Result<(), RuntimeError> {
-        let handle = context.registers[R1];
-        let file = task
-            .file_system
-            .open_files
-            .get_mut(&handle)
-            .ok_or_else(|| RuntimeError::Program(format!("invalid file handle {handle}")))?;
-        if !file.can_write {
-            return Err(RuntimeError::Program("file is not open for writing".into()));
-        }
-        file.file.write_all(&[context.registers[R0] as u8])?;
-        file.eof_error_next = false;
-        Ok(())
-    }
-
-    fn os_gbpb(&mut self, task: &mut Task, context: &mut SwiContext) -> Result<(), RuntimeError> {
-        match context.registers[R0] {
-            1 | 2 | 3 | 4 => self.os_gbpb_file(task, context),
-            5 | 6 | 7 => self.os_gbpb_names(task, context),
-            8 | 9 | 10 => self.os_gbpb_directory(task, context),
-            reason => Err(RuntimeError::Program(format!(
-                "OS_GBPB reason {reason} is not implemented by the hosted FileSwitch"
-            ))),
-        }
-    }
-
-    fn os_gbpb_file(
-        &mut self,
-        task: &mut Task,
-        context: &mut SwiContext,
-    ) -> Result<(), RuntimeError> {
-        let reason = context.registers[R0];
-        let handle = context.registers[R1];
-        let buffer = context.registers[R2];
-        let requested = context.registers[R3] as usize;
-        let file = task
-            .file_system
-            .open_files
-            .get_mut(&handle)
-            .ok_or_else(|| RuntimeError::Program(format!("invalid file handle {handle}")))?;
-        if reason <= 2 {
-            if !file.can_write {
-                return Err(RuntimeError::Program("file is not open for writing".into()));
-            }
-            let initial = if reason == 1 {
-                u64::from(context.registers[R4])
-            } else {
-                file.file.stream_position()?
-            };
-            file.file.seek(SeekFrom::Start(initial))?;
-            let bytes = task.memory.read_bytes(buffer, requested)?;
-            file.file.write_all(&bytes)?;
-            let end = initial.saturating_add(requested as u64);
-            context.registers[R2] = buffer.wrapping_add(requested as u32);
-            context.registers[R3] = 0;
-            context.registers[R4] = u32::try_from(end).unwrap_or(u32::MAX);
-            context.carry = false;
-            file.eof_error_next = false;
-        } else {
-            if !file.can_read {
-                return Err(RuntimeError::Program("file is not open for reading".into()));
-            }
-            if requested > crate::memory::GUEST_MEMORY_SIZE {
-                return Err(RuntimeError::Program(
-                    "OS_GBPB transfer exceeds the task's logical buffer size".into(),
-                ));
-            }
-            let initial = if reason == 3 {
-                u64::from(context.registers[R4])
-            } else {
-                file.file.stream_position()?
-            };
-            file.file.seek(SeekFrom::Start(initial))?;
-            let mut bytes = vec![0; requested];
-            let transferred = file.file.read(&mut bytes)?;
-            bytes.truncate(transferred);
-            task.memory.write_bytes(buffer, &bytes)?;
-            let end = initial.saturating_add(transferred as u64);
-            context.registers[R2] = buffer.wrapping_add(transferred as u32);
-            context.registers[R3] = u32::try_from(requested - transferred).unwrap_or(u32::MAX);
-            context.registers[R4] = u32::try_from(end).unwrap_or(u32::MAX);
-            context.carry = transferred != requested;
-            file.eof_error_next = false;
-        }
-        Ok(())
-    }
-
-    fn os_gbpb_names(
-        &mut self,
-        task: &mut Task,
-        context: &mut SwiContext,
-    ) -> Result<(), RuntimeError> {
-        let reason = context.registers[R0];
-        let bytes = match reason {
-            5 => {
-                let name = self.file_system.volume_name().as_bytes();
-                let mut bytes = vec![u8::try_from(name.len()).unwrap_or(u8::MAX)];
-                bytes.extend_from_slice(name);
-                bytes.push(0);
-                bytes
-            }
-            6 => directory_name_bytes(&task.file_system.current_directory)?,
-            _ => directory_name_bytes(&task.file_system.library_directory)?,
+            0 => String::new(),
+            _ => return Err(file_object_error("unsupported search-path reason")),
         };
-        task.memory.write_bytes(context.registers[R2], &bytes)?;
-        Ok(())
-    }
-
-    fn os_gbpb_directory(
-        &mut self,
-        task: &mut Task,
-        context: &mut SwiContext,
-    ) -> Result<(), RuntimeError> {
-        let reason = context.registers[R0];
-        let (directory, wildcard) = if reason == 8 {
-            ("@".to_string(), "*".to_string())
+        let path_items = if path_source == 0 {
+            vec![String::new()]
         } else {
-            let directory = read_guest_string(task, context.registers[R1])?;
-            let wildcard = if context.registers[R6] == 0 {
-                "*".to_string()
-            } else {
-                read_guest_string(task, context.registers[R6])?
-            };
-            (
-                if directory.is_empty() {
-                    "@".to_string()
-                } else {
-                    directory
-                },
-                wildcard,
-            )
+            parse_file_search_path(&path_spec)?
         };
-        let objects = self
-            .file_system
-            .enumerate(&task.file_system, &directory, &wildcard)?;
-        let start = context.registers[R4] as usize;
-        let requested = context.registers[R3] as usize;
-        if reason == 8 {
-            let mut offset = context.registers[R2];
-            let mut read_count = 0usize;
-            for object in objects.iter().skip(start).take(requested) {
-                let name = object.guest_name.as_bytes();
-                if name.len() > u8::MAX as usize {
-                    return Err(RuntimeError::Program("guest leaf name is too long".into()));
-                }
-                task.memory.write_byte(offset, name.len() as u8)?;
-                offset = offset.wrapping_add(1);
-                task.memory.write_bytes(offset, name)?;
-                offset = offset.wrapping_add(name.len() as u32);
-                read_count += 1;
-            }
-            context.registers[R3] = (requested - read_count) as u32;
-            context.registers[R4] = if start + read_count >= objects.len() {
-                u32::MAX
-            } else {
-                (start + read_count) as u32
-            };
-            context.carry = read_count < requested;
-            return Ok(());
-        }
-
-        let mut offset = context.registers[R2];
-        let mut capacity = context.registers[R5] as usize;
-        let mut read_count = 0usize;
-        for object in objects.iter().skip(start).take(requested) {
-            let mut record = Vec::new();
-            if reason == 9 {
-                record.extend_from_slice(object.guest_name.as_bytes());
-                record.push(0);
-            } else {
-                let metadata = &object.metadata;
-                push_word(&mut record, riscos_load_address(metadata));
-                push_word(&mut record, metadata.execution_address);
-                push_word(&mut record, object.length);
-                push_word(&mut record, metadata.attributes);
-                push_word(&mut record, if object.is_directory { 2 } else { 1 });
-                record.extend_from_slice(object.guest_name.as_bytes());
-                record.push(0);
-                while record.len() % 4 != 0 {
-                    record.push(0);
-                }
-            }
-            if record.len() > capacity {
-                break;
-            }
-            task.memory.write_bytes(offset, &record)?;
-            offset = offset.wrapping_add(record.len() as u32);
-            capacity -= record.len();
-            read_count += 1;
-        }
-        context.registers[R3] = read_count as u32;
-        context.registers[R4] = if start + read_count >= objects.len() {
-            u32::MAX
-        } else {
-            (start + read_count) as u32
+        let Some(prefix) = path_items.get(candidate_index as usize) else {
+            return Ok(None);
         };
-        context.carry = read_count != 0;
-        Ok(())
+        let candidate = format!("{}{}", prefix, object_name);
+        if candidate.len() > 4096 {
+            return Err(file_object_error("search candidate exceeds 4096 bytes"));
+        }
+        Ok(Some(candidate))
     }
 
-    fn os_fscontrol(
-        &mut self,
-        task: &mut Task,
-        context: &mut SwiContext,
-    ) -> Result<(), RuntimeError> {
-        let reason = context.registers[R0];
-        match reason {
-            0 => {
-                let path = read_guest_string(task, context.registers[R1])?;
-                self.file_system
-                    .set_current_directory(&mut task.file_system, &path)
-            }
-            1 => {
-                let path = read_guest_string(task, context.registers[R1])?;
-                self.file_system
-                    .set_library_directory(&mut task.file_system, &path)
-            }
-            5 | 6 | 7 | 8 => {
-                let path = if context.registers[R1] == 0 {
-                    match reason {
-                        7 | 8 => format!("%"),
-                        _ => "@".to_string(),
-                    }
-                } else {
-                    read_guest_string(task, context.registers[R1])?
-                };
-                self.catalogue_directory(task, &path, reason == 6 || reason == 8)
-            }
-            9 => {
-                let pattern = if context.registers[R1] == 0 {
-                    "*".to_string()
-                } else {
-                    read_guest_string(task, context.registers[R1])?
-                };
-                let (directory, wildcard) = pattern
-                    .rsplit_once('.')
-                    .map(|(directory, leaf)| (directory.to_string(), leaf.to_string()))
-                    .unwrap_or_else(|| ("@".to_string(), pattern));
-                self.catalogue_objects(task, &directory, &wildcard)
-            }
-            11 => {
-                let prefix = if context.registers[R1] == 0 {
-                    String::new()
-                } else {
-                    read_guest_string(task, context.registers[R1])?
-                };
-                if let Some((name, _)) = prefix.split_once(':') {
-                    if !self.file_system.check_file_system_name(name) {
-                        return Err(RuntimeError::Program(format!(
-                            "filing system '{name}' is not present"
-                        )));
-                    }
-                    task.file_system.temporary_file_system =
-                        self.file_system.file_system_name().to_string();
-                } else {
-                    task.file_system.temporary_file_system =
-                        task.file_system.current_file_system.clone();
-                }
-                Ok(())
-            }
-            19 => {
-                task.file_system.temporary_file_system =
-                    task.file_system.current_file_system.clone();
-                Ok(())
-            }
-            13 => {
-                let requested = context.registers[R1];
-                let present = if requested < 0x100 {
-                    requested == HOST_FS_NUMBER
-                } else {
-                    let name = read_guest_string(task, requested)?;
-                    self.file_system
-                        .check_file_system_name(name.trim_end_matches(['#', ':', '-']))
-                };
-                if present {
-                    context.registers[R1] = HOST_FS_NUMBER;
-                    context.registers[R2] = HOST_FS_CONTROL_BLOCK;
-                } else {
-                    context.registers[R2] = 0;
-                }
-                Ok(())
-            }
-            14 => {
-                let requested = context.registers[R1];
-                if requested == 0 {
-                    task.file_system.current_file_system.clear();
-                    task.file_system.temporary_file_system.clear();
-                    return Ok(());
-                }
-                let name = if requested < 0x100 {
-                    if requested != HOST_FS_NUMBER {
-                        return Err(RuntimeError::Program(format!(
-                            "filing system number {requested} is not present"
-                        )));
-                    }
-                    self.file_system.file_system_name().to_string()
-                } else {
-                    read_guest_string(task, requested)?
-                };
-                if !self
-                    .file_system
-                    .check_file_system_name(name.trim_end_matches(['#', ':', '-']))
-                {
-                    return Err(RuntimeError::Program(format!(
-                        "filing system '{name}' is not present"
-                    )));
-                }
-                task.file_system.current_file_system =
-                    self.file_system.file_system_name().to_string();
-                task.file_system.temporary_file_system =
-                    task.file_system.current_file_system.clone();
-                Ok(())
-            }
-            18 => {
-                let name = file_type_name(context.registers[R2] & 0xFFF);
-                context.registers[R2] = u32::from_le_bytes(name[..4].try_into().unwrap());
-                context.registers[R3] = u32::from_le_bytes(name[4..].try_into().unwrap());
-                Ok(())
-            }
-            22 => {
-                task.file_system.open_files.clear();
-                Ok(())
-            }
-            25 => {
-                let from = read_guest_string(task, context.registers[R1])?;
-                let to = read_guest_string(task, context.registers[R2])?;
-                self.file_system.rename(&task.file_system, &from, &to)
-            }
-            31 => {
-                let name = read_guest_string(task, context.registers[R1])?;
-                context.registers[R2] = parse_file_type(&name)?;
-                Ok(())
-            }
-            33 => {
-                if context.registers[R1] == HOST_FS_NUMBER {
-                    write_guest_buffer(
-                        task,
-                        context.registers[R2],
-                        context.registers[R3] as usize,
-                        self.file_system.file_system_name().as_bytes(),
-                    )?;
-                } else {
-                    task.memory.write_byte(context.registers[R2], 0)?;
-                }
-                Ok(())
-            }
-            37 => {
-                let path = read_guest_string(task, context.registers[R1])?;
-                let resolved = self
-                    .file_system
-                    .canonical_guest_path(&task.file_system, &path)?;
-                let canonical =
-                    canonical_guest_name(self.file_system.volume_name(), &resolved.guest_path);
-                let capacity = context.registers[R5] as usize;
-                let required = canonical.len() + 1;
-                if required <= capacity {
-                    task.memory
-                        .write_bytes(context.registers[R2], canonical.as_bytes())?;
-                    task.memory.write_byte(
-                        context.registers[R2].wrapping_add(canonical.len() as u32),
-                        0,
-                    )?;
-                    context.registers[R5] = (capacity - required) as u32;
-                } else {
-                    context.registers[R5] = (capacity as i64 - required as i64) as i32 as u32;
-                }
-                Ok(())
-            }
-            39 => {
-                let path = read_guest_string(task, context.registers[R1])?;
-                self.file_system.set_user_root(&mut task.file_system, &path)
-            }
-            40 => {
-                std::mem::swap(
-                    &mut task.file_system.current_directory,
-                    &mut task.file_system.previous_directory,
-                );
-                Ok(())
-            }
-            43 => {
-                task.file_system.current_directory.clear();
-                Ok(())
-            }
-            44 => {
-                task.file_system.user_root.clear();
-                Ok(())
-            }
-            45 => {
-                task.file_system.library_directory.clear();
-                Ok(())
-            }
-            50 => {
-                let object = read_guest_string(task, context.registers[R1])?;
-                let resolved = self
-                    .file_system
-                    .canonical_guest_path(&task.file_system, &object)?;
-                if !resolved.host_path.exists() {
-                    return Err(RuntimeError::Program(format!(
-                        "object '{object}' does not exist on HostFS"
-                    )));
-                }
-                let name = read_guest_string(task, context.registers[R2])?;
-                self.file_system.set_volume_name(name.trim())
-            }
-            other => Err(RuntimeError::Program(format!(
-                "OS_FSControl reason {other} is not implemented by the hosted FileSwitch"
-            ))),
-        }
-    }
-
-    fn catalogue_directory(
-        &mut self,
-        task: &mut Task,
+    fn file_object_validate_mutation(
+        &self,
+        task: &Task,
         path: &str,
-        detailed: bool,
+        allow_directory: bool,
     ) -> Result<(), RuntimeError> {
         let resolved = self
             .file_system
             .canonical_guest_path(&task.file_system, path)?;
-        if !resolved.is_directory {
-            return Err(RuntimeError::Program(format!(
-                "'{path}' is not a directory"
-            )));
+        if resolved.is_directory && !allow_directory {
+            return Err(file_object_error("operation on a directory"));
         }
-        let objects = self.file_system.enumerate(&task.file_system, path, "*")?;
-        let title = canonical_guest_name(self.file_system.volume_name(), &resolved.guest_path);
-        self.write_inline(task, title.as_bytes())?;
-        self.write_new_line(task)?;
-        for object in objects {
-            if detailed {
-                let kind = if object.is_directory {
-                    "<DIR>"
-                } else {
-                    "     "
-                };
-                let line = format!(
-                    "{:<10} {:>8} {} {:03X}",
-                    object.guest_name,
-                    object.length,
-                    kind,
-                    object.metadata.file_type & 0xFFF
-                );
-                self.write_inline(task, line.as_bytes())?;
-                self.write_new_line(task)?;
-            } else {
-                self.write_inline(task, object.guest_name.as_bytes())?;
-                self.write_new_line(task)?;
-            }
+        if !resolved.host_path.exists() {
+            return Ok(());
         }
-        Ok(())
-    }
-
-    fn catalogue_objects(
-        &mut self,
-        task: &mut Task,
-        directory: &str,
-        wildcard: &str,
-    ) -> Result<(), RuntimeError> {
-        let resolved = self
-            .file_system
-            .canonical_guest_path(&task.file_system, directory)?;
-        if !resolved.is_directory {
-            return Err(RuntimeError::Program(format!(
-                "'{directory}' is not a directory"
-            )));
+        if resolved
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.attributes & (1 << 3) != 0)
+        {
+            return Err(file_object_error("operation on a deletion-locked file"));
         }
-        let objects = self
-            .file_system
-            .enumerate(&task.file_system, directory, wildcard)?;
-        for object in objects {
-            let kind = if object.is_directory {
-                "<DIR>"
-            } else {
-                "     "
-            };
-            let line = format!(
-                "{:<10} {:>8} {} {:03X}",
-                object.guest_name,
-                object.length,
-                kind,
-                object.metadata.file_type & 0xFFF
-            );
-            self.write_inline(task, line.as_bytes())?;
-            self.write_new_line(task)?;
+        if task.file_system.open_files.values().any(|open_file| {
+            open_file
+                .guest_path
+                .eq_ignore_ascii_case(&resolved.guest_path)
+        }) {
+            return Err(file_object_error("operation on an open file"));
         }
         Ok(())
     }
@@ -5183,21 +8587,6 @@ impl SwiDispatcher {
         if self.display_events.is_some() {
             self.publish_snapshot(self.current_graphics().snapshot().clone());
         }
-    }
-
-    fn publish_display_batch_snapshot_if_due(&mut self) {
-        if self.display_events.is_none()
-            || !self
-                .last_display_batch_publish
-                .is_some_and(|last| last.elapsed() >= DISPLAY_BATCH_FRAME_INTERVAL)
-        {
-            return;
-        }
-
-        self.sync_modern_shell_grid_from_wimp();
-        let snapshot = self.current_graphics().snapshot().clone();
-        self.publish_snapshot(snapshot);
-        self.last_display_batch_publish = Some(Instant::now());
     }
 
     pub fn write_inline(&mut self, task: &mut Task, text: &[u8]) -> Result<(), RuntimeError> {
@@ -5411,10 +8800,31 @@ impl SwiDispatcher {
             )
         };
 
-        if cli_command_matches(verb, "HELP") && arguments.is_empty() {
-            self.write_inline(task, HELP_TEXT)?;
-            self.write_new_line(task)
-        } else if cli_command_matches(verb, "QUIT") && arguments.is_empty() {
+        self.execute_cli_command(task, verb, arguments)
+    }
+
+    fn execute_cli_command(
+        &mut self,
+        task: &mut Task,
+        verb: &str,
+        arguments: &str,
+    ) -> Result<(), RuntimeError> {
+        let scratch = task.memory.acquire_command_scratch()?;
+        let result =
+            self.execute_cli_command_with_scratch(task, verb, arguments, scratch.base_address);
+        task.memory.release_command_scratch(scratch.number)?;
+        result
+    }
+
+    fn execute_cli_command_with_scratch(
+        &mut self,
+        task: &mut Task,
+        verb: &str,
+        arguments: &str,
+        scratch_base: u32,
+    ) -> Result<(), RuntimeError> {
+        if cli_command_matches(verb, "QUIT") && arguments.is_empty() {
+            task.close_exec_input();
             self.quit_requested = true;
             Ok(())
         } else if verb.eq_ignore_ascii_case("BASIC64") {
@@ -5529,185 +8939,13 @@ impl SwiDispatcher {
                     self.write_new_line(task)
                 }
             }
-        } else if cli_command_matches(verb, "BASICLOAD") {
-            if arguments.is_empty() {
-                self.write_inline(task, b"Syntax: BASICLOAD <file>")?;
-                return self.write_new_line(task);
-            }
-
-            let path = unquote_single_argument(arguments);
-            match self.file_system.read_file(&task.file_system, path) {
-                Ok((bytes, metadata)) if metadata.file_type & 0xFFF == FILETYPE_BASIC => {
-                    let program =
-                        match crate::tokenized_basic::TokenizedBasicProgram::decode(&bytes) {
-                            Ok(program) => program,
-                            Err(error) => {
-                                let message = format!("BASICLOAD error: {error}");
-                                self.write_inline(task, message.as_bytes())?;
-                                return self.write_new_line(task);
-                            }
-                        };
-                    let line_count = program.line_count();
-                    let reference_count = program.line_reference_count();
-                    let unresolved_count = program.unresolved_line_reference_count();
-                    task.loaded_tokenized_program = Some(program);
-                    let message = format!(
-                        "Loaded {line_count} tokenised BASIC lines; {reference_count} line references, {unresolved_count} unresolved."
-                    );
-                    self.write_inline(task, message.as_bytes())?;
-                    self.write_new_line(task)
-                }
-                Ok((_, metadata)) => {
-                    let message = format!(
-                        "BASICLOAD requires file type &FFB; '{}' has type &{:03X}.",
-                        path,
-                        metadata.file_type & 0xFFF
-                    );
-                    self.write_inline(task, message.as_bytes())?;
-                    self.write_new_line(task)
-                }
-                Err(error) => {
-                    let message = format!("BASICLOAD error: {error}");
-                    self.write_inline(task, message.as_bytes())?;
-                    self.write_new_line(task)
-                }
-            }
-        } else if cli_command_matches(verb, "BASICRUN") {
-            if !arguments.is_empty() {
-                self.write_inline(task, b"Syntax: BASICRUN")?;
-                return self.write_new_line(task);
-            }
-
-            let Some(program) = task.loaded_tokenized_program.take() else {
-                self.write_inline(
-                    task,
-                    b"No tokenised BASIC program is loaded; use BASICLOAD first.",
-                )?;
-                return self.write_new_line(task);
-            };
-            self.begin_display_batch();
-            let configuration = match self.load_basic_configuration() {
-                Ok(configuration) => configuration,
-                Err(error) => {
-                    self.finish_display_batch();
-                    task.loaded_tokenized_program = Some(program);
-                    let message = format!("BASIC configuration error: {error}");
-                    self.write_inline(task, message.as_bytes())?;
-                    return self.write_new_line(task);
-                }
-            };
-            let result = self.with_mos_shell_suspended(|dispatcher| {
-                let result = crate::basic_compat::run_program_configured(
-                    &program,
-                    task,
-                    dispatcher,
-                    &configuration,
-                );
-                dispatcher.finish_display_batch();
-                result
-            });
-            task.loaded_tokenized_program = Some(program);
-            match result {
-                Ok(Some(report)) => {
-                    log_jit_report("BASICRUN", report);
-                    Ok(())
-                }
-                Ok(None) => Ok(()),
-                Err(error) => {
-                    let message = format!("BASICRUN error: {error}");
-                    self.write_inline(task, message.as_bytes())?;
-                    self.write_new_line(task)
-                }
-            }
-        } else if cli_command_matches(verb, "BASICJIT") {
-            self.begin_display_batch();
-            let arguments = arguments.trim();
-            let (strict, arguments) = match arguments.split_once(char::is_whitespace) {
-                Some((first, rest)) if first.eq_ignore_ascii_case("STRICT") => (true, rest.trim()),
-                None if arguments.eq_ignore_ascii_case("STRICT") => (true, ""),
-                _ => (false, arguments),
-            };
-            let (benchmark_validation, arguments) = if strict {
-                match arguments.strip_prefix("--benchmark-validation") {
-                    Some(rest) if rest.is_empty() || rest.starts_with(char::is_whitespace) => {
-                        (true, rest.trim())
-                    }
-                    _ => (false, arguments),
-                }
-            } else {
-                (false, arguments)
-            };
-            let options = crate::basic_compat::StrictJitOptions {
-                benchmark_validation,
-            };
-            let configuration = match self.load_basic_configuration() {
-                Ok(configuration) => configuration,
-                Err(error) => {
-                    self.finish_display_batch();
-                    eprintln!("BASICJIT configuration error: {error}");
-                    return Ok(());
-                }
-            };
-            let engine = if strict {
-                BasicEngine::StrictJit
-            } else {
-                BasicEngine::HybridJit
-            };
-            if arguments.is_empty() && task.loaded_tokenized_program.is_none() {
-                self.finish_display_batch();
-                self.write_inline(
-                    task,
-                    b"No tokenised BASIC program is loaded; use BASICLOAD or pass a file.",
-                )?;
-                return self.write_new_line(task);
-            }
-            let result = self.with_mos_shell_suspended(|dispatcher| {
-                let result = if arguments.is_empty() {
-                    let Some(program) = task.loaded_tokenized_program.take() else {
-                        unreachable!("loaded program presence was checked before execution")
-                    };
-                    let result = crate::basic_compat::run_program_with_engine_options(
-                        &program,
-                        task,
-                        dispatcher,
-                        &configuration,
-                        Some(engine),
-                        options,
-                    );
-                    task.loaded_tokenized_program = Some(program);
-                    result
-                } else {
-                    let path = unquote_single_argument(arguments);
-                    crate::basic64::run_guest_file_with_engine_options(
-                        path,
-                        task,
-                        dispatcher,
-                        &configuration,
-                        Some(engine),
-                        options,
-                    )
-                };
-                dispatcher.finish_display_batch();
-                result
-            });
-            match result {
-                Ok(Some(report)) => {
-                    log_jit_report("BASICJIT", report);
-                    Ok(())
-                }
-                Ok(None) => Ok(()),
-                Err(error) => {
-                    eprintln!("BASICJIT error: {error}");
-                    Ok(())
-                }
-            }
         } else if verb == "." || cli_command_matches(verb, "CAT") {
             let path = unquote_single_argument(arguments);
             let mut call = SwiContext::default();
             call.registers[R0] = 5;
             if !path.is_empty() {
-                call.registers[R1] = CLI_STRING_BUFFER;
-                write_guest_string(task, CLI_STRING_BUFFER, path)?;
+                call.registers[R1] = scratch_base;
+                write_guest_string(task, scratch_base, path)?;
             }
             self.dispatch(OS_FSCONTROL, task, &mut call)
         } else if cli_command_matches(verb, "DIR") {
@@ -5720,10 +8958,10 @@ impl SwiDispatcher {
                 self.write_inline(task, selected.as_bytes())?;
                 self.write_new_line(task)
             } else {
-                write_guest_string(task, CLI_STRING_BUFFER, path)?;
+                write_guest_string(task, scratch_base, path)?;
                 let mut call = SwiContext::default();
                 call.registers[R0] = 0;
-                call.registers[R1] = CLI_STRING_BUFFER;
+                call.registers[R1] = scratch_base;
                 self.dispatch(OS_FSCONTROL, task, &mut call)
             }
         } else if cli_command_matches(verb, "CDIR") {
@@ -5732,10 +8970,10 @@ impl SwiDispatcher {
                 self.write_inline(task, b"Syntax: *CDIR <directory>")?;
                 return self.write_new_line(task);
             }
-            write_guest_string(task, CLI_STRING_BUFFER, path)?;
+            write_guest_string(task, scratch_base, path)?;
             let mut call = SwiContext::default();
             call.registers[R0] = 8;
-            call.registers[R1] = CLI_STRING_BUFFER;
+            call.registers[R1] = scratch_base;
             self.dispatch(OS_FILE, task, &mut call)
         } else if cli_command_matches(verb, "DELETE") {
             let path = unquote_single_argument(arguments);
@@ -5743,37 +8981,37 @@ impl SwiDispatcher {
                 self.write_inline(task, b"Syntax: *DELETE <file>")?;
                 return self.write_new_line(task);
             }
-            write_guest_string(task, CLI_STRING_BUFFER, path)?;
+            write_guest_string(task, scratch_base, path)?;
             let mut call = SwiContext::default();
             call.registers[R0] = 6;
-            call.registers[R1] = CLI_STRING_BUFFER;
+            call.registers[R1] = scratch_base;
             self.dispatch(OS_FILE, task, &mut call)
         } else if cli_command_matches(verb, "RENAME") {
             let Some((from, to)) = split_two_cli_arguments(arguments) else {
                 self.write_inline(task, b"Syntax: *RENAME <old> <new>")?;
                 return self.write_new_line(task);
             };
-            write_guest_string(task, CLI_STRING_BUFFER, &from)?;
-            write_guest_string(task, CLI_STRING_BUFFER + 0x1000, &to)?;
+            write_guest_string(task, scratch_base, &from)?;
+            write_guest_string(task, scratch_base + 0x200, &to)?;
             let mut call = SwiContext::default();
             call.registers[R0] = 25;
-            call.registers[R1] = CLI_STRING_BUFFER;
-            call.registers[R2] = CLI_STRING_BUFFER + 0x1000;
+            call.registers[R1] = scratch_base;
+            call.registers[R2] = scratch_base + 0x200;
             self.dispatch(OS_FSCONTROL, task, &mut call)
         } else if cli_command_matches(verb, "FILETYPE") {
             let Some((path, type_name)) = split_two_cli_arguments(arguments) else {
                 self.write_inline(task, b"Syntax: *FILETYPE <file> <type>")?;
                 return self.write_new_line(task);
             };
-            write_guest_string(task, CLI_STRING_BUFFER, &path)?;
-            write_guest_string(task, CLI_STRING_BUFFER + 0x1000, &type_name)?;
+            write_guest_string(task, scratch_base, &path)?;
+            write_guest_string(task, scratch_base + 0x200, &type_name)?;
             let mut convert = SwiContext::default();
             convert.registers[R0] = 31;
-            convert.registers[R1] = CLI_STRING_BUFFER + 0x1000;
+            convert.registers[R1] = scratch_base + 0x200;
             self.dispatch(OS_FSCONTROL, task, &mut convert)?;
             let mut set_type = SwiContext::default();
             set_type.registers[R0] = 18;
-            set_type.registers[R1] = CLI_STRING_BUFFER;
+            set_type.registers[R1] = scratch_base;
             set_type.registers[R2] = convert.registers[R2];
             self.dispatch(OS_FILE, task, &mut set_type)
         } else if cli_command_matches(verb, "TYPE") {
@@ -5782,10 +9020,10 @@ impl SwiDispatcher {
                 self.write_inline(task, b"Syntax: *TYPE <file>")?;
                 return self.write_new_line(task);
             }
-            write_guest_string(task, CLI_STRING_BUFFER, path)?;
+            write_guest_string(task, scratch_base, path)?;
             let mut open = SwiContext::default();
             open.registers[R0] = 0x40;
-            open.registers[R1] = CLI_STRING_BUFFER;
+            open.registers[R1] = scratch_base;
             self.dispatch(OS_FIND, task, &mut open)?;
             if open.registers[R0] == 0 {
                 self.write_inline(task, b"File not found")?;
@@ -5816,26 +9054,26 @@ impl SwiDispatcher {
             if arguments.is_empty() {
                 let mut call = SwiContext::default();
                 call.registers[R0] = 5;
-                call.registers[R2] = CLI_STRING_BUFFER;
+                call.registers[R2] = scratch_base;
                 self.dispatch(OS_GBPB, task, &mut call)?;
-                let length = task.memory.read_byte(CLI_STRING_BUFFER)? as usize;
-                let name = task.memory.read_bytes(CLI_STRING_BUFFER + 1, length)?;
+                let length = task.memory.read_byte(scratch_base)? as usize;
+                let name = task.memory.read_bytes(scratch_base + 1, length)?;
                 self.write_inline(task, &name)?;
                 self.write_new_line(task)
             } else {
-                write_guest_string(task, CLI_STRING_BUFFER + 0x1000, arguments.trim())?;
-                write_guest_string(task, CLI_STRING_BUFFER, "@")?;
+                write_guest_string(task, scratch_base + 0x200, arguments.trim())?;
+                write_guest_string(task, scratch_base, "@")?;
                 let mut call = SwiContext::default();
                 call.registers[R0] = 50;
-                call.registers[R1] = CLI_STRING_BUFFER;
-                call.registers[R2] = CLI_STRING_BUFFER + 0x1000;
+                call.registers[R1] = scratch_base;
+                call.registers[R2] = scratch_base + 0x200;
                 self.dispatch(OS_FSCONTROL, task, &mut call)
             }
         } else if cli_command_matches(verb, "HOSTFS") {
-            write_guest_string(task, CLI_STRING_BUFFER, "HostFS")?;
+            write_guest_string(task, scratch_base, "HostFS")?;
             let mut call = SwiContext::default();
             call.registers[R0] = 14;
-            call.registers[R1] = CLI_STRING_BUFFER;
+            call.registers[R1] = scratch_base;
             self.dispatch(OS_FSCONTROL, task, &mut call)
         } else if cli_command_matches(verb, "DESKTOP") {
             if !arguments.is_empty() {
@@ -5843,16 +9081,38 @@ impl SwiDispatcher {
                 return self.write_new_line(task);
             }
             self.begin_desktop()
-        } else if cli_command_matches(verb, "FX")
-            && arguments
+        } else if cli_command_matches(verb, "FX") {
+            let compact = arguments
                 .chars()
                 .filter(|character| !character.is_ascii_whitespace())
-                .collect::<String>()
-                == "151,78,243"
-        {
-            // ClockSP5 resets machine-specific display and timing state here;
-            // the hosted profile has no such hardware state to restore.
-            Ok(())
+                .collect::<String>();
+            if compact == "151,78,243" {
+                // ClockSP5 resets machine-specific display and timing state
+                // here; the hosted profile has no such hardware state.
+                return Ok(());
+            }
+            let fields = arguments.split(',').map(str::trim).collect::<Vec<_>>();
+            if fields.is_empty() || fields.len() > 3 || fields.iter().any(|field| field.is_empty())
+            {
+                self.write_inline(task, b"Syntax: FX <reason>[,<r1>[,<r2>]]")?;
+                return self.write_new_line(task);
+            }
+            let mut registers = [0_u32; 3];
+            for (register, field) in registers.iter_mut().zip(fields) {
+                let parsed = if let Some(hex) = field.strip_prefix('&') {
+                    u32::from_str_radix(hex, 16)
+                } else {
+                    field.parse::<u32>()
+                };
+                let Ok(value) = parsed else {
+                    self.write_inline(task, b"Syntax: FX <reason>[,<r1>[,<r2>]]")?;
+                    return self.write_new_line(task);
+                };
+                *register = value;
+            }
+            let mut call = SwiContext::default();
+            call.registers[..3].copy_from_slice(&registers);
+            self.dispatch(OS_BYTE, task, &mut call)
         } else {
             self.write_inline(task, b"Bad command")?;
             self.write_new_line(task)
@@ -6004,25 +9264,6 @@ fn read_guest_string(task: &Task, address: u32) -> Result<String, RuntimeError> 
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-fn read_guest_control_string(task: &Task, address: u32) -> Result<String, RuntimeError> {
-    let mut bytes = Vec::new();
-    for offset in 0..MAX_STRING_BYTES {
-        let current = address
-            .checked_add(
-                u32::try_from(offset).map_err(|_| crate::memory::MemoryError::AddressOverflow)?,
-            )
-            .ok_or(crate::memory::MemoryError::AddressOverflow)?;
-        let byte = task.memory.read_byte(current)?;
-        if byte <= 31 {
-            return Ok(String::from_utf8_lossy(&bytes).into_owned());
-        }
-        bytes.push(byte);
-    }
-    Err(RuntimeError::Program(
-        "guest control-terminated string is too long".into(),
-    ))
-}
-
 fn write_guest_string(task: &mut Task, address: u32, value: &str) -> Result<(), RuntimeError> {
     if value.len() + 1 > MAX_STRING_BYTES {
         return Err(RuntimeError::Program("guest string is too long".into()));
@@ -6106,6 +9347,107 @@ fn apply_riscos_load_address(metadata: &mut FileMetadata, load_address: u32) {
     }
 }
 
+fn read_file_object_path(task: &Task, address: u32) -> Result<String, RuntimeError> {
+    let bytes = mos::read_mos_string(task, address, MAX_STRING_BYTES)?;
+    let path = String::from_utf8(bytes)
+        .map_err(|_| RuntimeError::Program("OS_File guest pathname is not valid UTF-8".into()))?;
+    if path.is_empty() || path.chars().any(char::is_control) {
+        return Err(RuntimeError::Program(
+            "OS_File requires a non-empty printable guest pathname".into(),
+        ));
+    }
+    if path.contains('*') || path.contains('#') {
+        return Err(RuntimeError::Program(
+            "wildcard OS_File pathnames are not supported by the hosted FileSwitch".into(),
+        ));
+    }
+    Ok(path)
+}
+
+fn read_guest_path_spec(
+    task: &Task,
+    address: u32,
+    max_bytes: usize,
+) -> Result<String, RuntimeError> {
+    let mut bytes = Vec::new();
+    for offset in 0..=max_bytes {
+        let current =
+            address
+                .checked_add(u32::try_from(offset).map_err(|_| {
+                    RuntimeError::Program("OS_File path pointer exceeds U32".into())
+                })?)
+                .ok_or_else(|| RuntimeError::Program("OS_File path pointer exceeds U32".into()))?;
+        let byte = task.memory.read_caller_data_bytes(current, 1)?[0];
+        if byte < 0x20 || byte == 0x7f {
+            return String::from_utf8(bytes)
+                .map_err(|_| file_object_error("path specification is not valid UTF-8"));
+        }
+        bytes.push(byte);
+    }
+    Err(file_object_error(
+        "path specification is unterminated or too long",
+    ))
+}
+
+fn validate_file_path_variable_name(name: &str) -> Result<(), RuntimeError> {
+    if name.is_empty()
+        || name.len() > MAX_NAME_BYTES
+        || !name.is_ascii()
+        || name
+            .bytes()
+            .any(|byte| !byte.is_ascii_graphic() || matches!(byte, b'*' | b'#'))
+    {
+        return Err(file_object_error("path-variable name is invalid"));
+    }
+    Ok(())
+}
+
+fn supported_file_path_variable(variable: SystemVariable) -> Result<String, RuntimeError> {
+    if !matches!(
+        variable.variable_type,
+        SystemVariableType::String | SystemVariableType::LiteralString
+    ) {
+        return Err(file_object_error("path variable type is unsupported"));
+    }
+    if variable.value.len() > 255 {
+        return Err(file_object_error("path variable exceeds 255 bytes"));
+    }
+    Ok(variable.value)
+}
+
+fn parse_file_search_path(specification: &str) -> Result<Vec<String>, RuntimeError> {
+    if specification.len() > 255 || specification.chars().any(char::is_control) {
+        return Err(file_object_error(
+            "path specification is invalid or too long",
+        ));
+    }
+    let entries = specification.split(',').collect::<Vec<_>>();
+    if entries.len() > 16 {
+        return Err(file_object_error(
+            "path specification exceeds 16 candidates",
+        ));
+    }
+    let mut prefixes = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let prefix = entry.trim_matches(' ');
+        if !prefix.is_empty()
+            && ((!prefix.ends_with('.') && !prefix.ends_with(':'))
+                || prefix.contains('*')
+                || prefix.contains('#'))
+        {
+            return Err(file_object_error("path prefix is not supported"));
+        }
+        prefixes.push(prefix.to_owned());
+    }
+    Ok(prefixes)
+}
+
+fn file_object_error(operation: &str) -> RuntimeError {
+    RuntimeError::Program(format!(
+        "OS_File {operation} failed in the guest filing system"
+    ))
+}
+
 fn canonical_guest_name(volume_name: &str, guest_path: &str) -> String {
     if guest_path.is_empty() {
         format!("HostFS::{volume_name}.$")
@@ -6114,23 +9456,188 @@ fn canonical_guest_name(volume_name: &str, guest_path: &str) -> String {
     }
 }
 
-fn directory_name_bytes(components: &[String]) -> Result<Vec<u8>, RuntimeError> {
-    let directory = if components.is_empty() {
+fn fixed_file_switch_name(
+    dispatcher: &SwiDispatcher,
+    task: &Task,
+    kind: u8,
+) -> Result<Vec<u8>, RuntimeError> {
+    match kind {
+        0 => Ok(dispatcher.file_system.volume_name().as_bytes().to_vec()),
+        1 => Ok(guest_directory_name(&task.file_system.current_directory)?.into_bytes()),
+        2 => Ok(guest_directory_name(&task.file_system.library_directory)?.into_bytes()),
+        _ => Err(RuntimeError::Program(
+            "unsupported fixed FileSwitch name kind".into(),
+        )),
+    }
+}
+
+fn read_caller_guest_string(
+    task: &Task,
+    address: u32,
+    max_bytes: usize,
+) -> Result<Vec<u8>, RuntimeError> {
+    let mut output = Vec::new();
+    for index in 0..max_bytes {
+        let offset =
+            u32::try_from(index).map_err(|_| crate::memory::MemoryError::AddressOverflow)?;
+        let current = address
+            .checked_add(offset)
+            .ok_or(crate::memory::MemoryError::AddressOverflow)?;
+        let byte = task.memory.read_caller_data_bytes(current, 1)?[0];
+        if byte == 0 {
+            return Ok(output);
+        }
+        output.push(byte);
+    }
+    Err(crate::memory::MemoryError::MissingNullTerminator(address).into())
+}
+
+/// Desktop's existing Filer passes both ordinary NUL strings and BASIC
+/// indirect strings, whose storage terminator is carriage return. Keep this
+/// compatibility at the narrow desktop mechanism boundary without treating
+/// arbitrary controls as terminators.
+fn read_desktop_guest_path(
+    task: &Task,
+    address: u32,
+    max_bytes: usize,
+) -> Result<Vec<u8>, RuntimeError> {
+    let mut output = Vec::new();
+    for index in 0..max_bytes {
+        let offset =
+            u32::try_from(index).map_err(|_| crate::memory::MemoryError::AddressOverflow)?;
+        let current = address
+            .checked_add(offset)
+            .ok_or(crate::memory::MemoryError::AddressOverflow)?;
+        let byte = task.memory.read_caller_data_bytes(current, 1)?[0];
+        if byte == 0 || byte == b'\r' {
+            return Ok(output);
+        }
+        if byte < 0x20 || byte == 0x7f {
+            return Err(RuntimeError::Program(
+                "desktop guest pathname contains an unsupported control character".into(),
+            ));
+        }
+        output.push(byte);
+    }
+    Err(crate::memory::MemoryError::MissingNullTerminator(address).into())
+}
+
+fn fs_control_guest_string(
+    task: &Task,
+    address: u32,
+    max_bytes: usize,
+) -> Result<Vec<u8>, RuntimeError> {
+    if address == 0 {
+        return Ok(Vec::new());
+    }
+    let mut bytes = Vec::new();
+    for offset in 0..=max_bytes {
+        let offset =
+            u32::try_from(offset).map_err(|_| crate::memory::MemoryError::AddressOverflow)?;
+        let current = address
+            .checked_add(offset)
+            .ok_or(crate::memory::MemoryError::AddressOverflow)?;
+        let byte = task.memory.read_caller_data_bytes(current, 1)?[0];
+        if byte == 0 {
+            return Ok(bytes);
+        }
+        if byte < 0x20 || byte == 0x7f {
+            return Err(RuntimeError::Program(
+                "FileSwitch string contains an unsupported control character".into(),
+            ));
+        }
+        bytes.push(byte);
+    }
+    Err(crate::memory::MemoryError::MissingNullTerminator(address).into())
+}
+
+fn read_control_terminated_path_spec(
+    task: &Task,
+    address: u32,
+    max_bytes: usize,
+) -> Result<Vec<u8>, RuntimeError> {
+    if address == 0 {
+        return Ok(Vec::new());
+    }
+    let mut bytes = Vec::new();
+    for offset in 0..=max_bytes {
+        let offset =
+            u32::try_from(offset).map_err(|_| crate::memory::MemoryError::AddressOverflow)?;
+        let current = address
+            .checked_add(offset)
+            .ok_or(crate::memory::MemoryError::AddressOverflow)?;
+        let byte = task.memory.read_caller_data_bytes(current, 1)?[0];
+        if byte < 0x20 || byte == 0x7f {
+            return Ok(bytes);
+        }
+        bytes.push(byte);
+    }
+    Err(file_switch_guest_error(
+        "path specification is unterminated or too long",
+    ))
+}
+
+fn write_checked_guest_string(
+    task: &mut Task,
+    address: u32,
+    value: &str,
+) -> Result<(), RuntimeError> {
+    let output_length = value
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| file_switch_guest_error("string output length overflowed"))?;
+    let mut bytes = Vec::with_capacity(output_length);
+    bytes.extend_from_slice(value.as_bytes());
+    bytes.push(0);
+    task.memory.write_caller_data_bytes(address, &bytes)?;
+    Ok(())
+}
+
+fn file_switch_guest_error(action: &str) -> RuntimeError {
+    RuntimeError::Program(format!(
+        "FileSwitch {action} failed in the guest filing system"
+    ))
+}
+
+fn read_file_system_name(
+    task: &Task,
+    address: u32,
+    max_bytes: usize,
+    special_terminators: bool,
+) -> Result<Vec<u8>, RuntimeError> {
+    let mut bytes = Vec::new();
+    for offset in 0..=max_bytes {
+        let offset =
+            u32::try_from(offset).map_err(|_| crate::memory::MemoryError::AddressOverflow)?;
+        let current = address
+            .checked_add(offset)
+            .ok_or(crate::memory::MemoryError::AddressOverflow)?;
+        let byte = task.memory.read_caller_data_bytes(current, 1)?[0];
+        if byte == 0 || byte < 0x20 || (special_terminators && matches!(byte, b'#' | b':' | b'-')) {
+            return Ok(bytes);
+        }
+        if !byte.is_ascii_graphic() {
+            return Err(RuntimeError::Program(
+                "filing system name contains an invalid character".into(),
+            ));
+        }
+        bytes.push(byte);
+    }
+    Err(RuntimeError::Program(
+        "filing system name is unterminated or too long".into(),
+    ))
+}
+
+fn guest_directory_name(components: &[String]) -> Result<String, RuntimeError> {
+    let value = if components.is_empty() {
         "$".to_string()
     } else {
         format!("$.{}", components.join("."))
     };
-    let bytes = directory.as_bytes();
-    let length = u8::try_from(bytes.len())
-        .map_err(|_| RuntimeError::Program("directory name is too long".into()))?;
-    let mut result = vec![0, length];
-    result.extend_from_slice(bytes);
-    result.push(0);
-    Ok(result)
-}
-
-fn push_word(bytes: &mut Vec<u8>, word: u32) {
-    bytes.extend_from_slice(&word.to_le_bytes());
+    if value.len() > u8::MAX as usize {
+        return Err(RuntimeError::Program("directory name is too long".into()));
+    }
+    Ok(value)
 }
 
 fn file_type_name(file_type: u32) -> [u8; 8] {
@@ -6206,6 +9713,59 @@ fn unquote_single_argument(arguments: &str) -> &str {
         .unwrap_or(arguments)
 }
 
+fn obey_source_error(source_path: &str, source_line: u32, error: RuntimeError) -> RuntimeError {
+    if matches!(
+        &error,
+        RuntimeError::Structured { type_name, .. } if type_name == "ObeySourceError"
+    ) {
+        return error;
+    }
+    RuntimeError::Structured {
+        type_name: "ObeySourceError".into(),
+        code: 1,
+        message: format!("{source_path}:{source_line}: {error}"),
+    }
+}
+
+fn exec_input_source_error(source_path: &str, source_line: u32, error: String) -> RuntimeError {
+    RuntimeError::Structured {
+        type_name: "ExecInputSourceError".into(),
+        code: 1,
+        message: format!("{source_path}:{source_line}: {error}"),
+    }
+}
+
+/// Return the first control character that would be ambiguous or truncated by
+/// the line-oriented CLI bridge. Tabs are valid horizontal whitespace; CR/LF
+/// are handled as line separators. Validate before installing a source frame
+/// so no prefix of a malformed script can run.
+fn first_unsupported_obey_control(source: &str) -> Option<(u32, char)> {
+    let mut line_number = 1u32;
+    let mut previous_was_cr = false;
+    for character in source.chars() {
+        match character {
+            '\r' => {
+                line_number = line_number.saturating_add(1);
+                previous_was_cr = true;
+            }
+            '\n' => {
+                if !previous_was_cr {
+                    line_number = line_number.saturating_add(1);
+                }
+                previous_was_cr = false;
+            }
+            '\t' => previous_was_cr = false,
+            other => {
+                previous_was_cr = false;
+                if other.is_control() {
+                    return Some((line_number, other));
+                }
+            }
+        }
+    }
+    None
+}
+
 fn split_two_cli_arguments(arguments: &str) -> Option<(String, String)> {
     let arguments = arguments.trim();
     let (first, remainder) = if let Some(quoted) = arguments.strip_prefix('"') {
@@ -6259,6 +9819,7 @@ mod tests {
     use std::sync::mpsc;
 
     use crate::boot::BootModuleInput;
+    use crate::configure::BasicEngine;
     use crate::display::{DesktopResolution, DisplayColour, DisplaySettings};
 
     use super::*;
@@ -6358,12 +9919,54 @@ mod tests {
                 grants: &["RuntimeErrors", "TaskQuery"],
             },
             BootModuleInput {
+                source_path: "modules/Mos.bas64",
+                source: include_str!("../modules/Mos.bas64"),
+                grants: &["MosInput", "MosClock", "TaskMemory", "RuntimeErrors"],
+            },
+            BootModuleInput {
+                source_path: "modules/FileSwitch.bas64",
+                source: include_str!("../modules/FileSwitch.bas64"),
+                grants: &[
+                    "FileSystem",
+                    "RuntimeErrors",
+                    "SystemVariableStore",
+                    "TaskMemory",
+                ],
+            },
+            BootModuleInput {
+                source_path: "modules/Graphics.bas64",
+                source: include_str!("../modules/Graphics.bas64"),
+                grants: &["GraphicsRaster", "RuntimeErrors"],
+            },
+            BootModuleInput {
+                source_path: "modules/ColourTrans.bas64",
+                source: include_str!("../modules/ColourTrans.bas64"),
+                grants: &["GraphicsRaster"],
+            },
+            BootModuleInput {
+                source_path: "modules/DesktopServices.bas64",
+                source: include_str!("../modules/DesktopServices.bas64"),
+                grants: &["FileSystem", "WimpSystemMenu"],
+            },
+            BootModuleInput {
+                source_path: "modules/DisplayManager.bas64",
+                source: include_str!("../modules/DisplayManager.bas64"),
+                grants: &["DisplaySettings"],
+            },
+            BootModuleInput {
+                source_path: "modules/Wimp.bas64",
+                source: include_str!("../modules/Wimp.bas64"),
+                grants: &["RuntimeErrors", "WimpTaskLifecycle", "WimpWindowState"],
+            },
+            BootModuleInput {
                 source_path: "modules/RicochetCommands.bas64",
                 source: include_str!("../modules/RicochetCommands.bas64"),
                 grants: &[
+                    "CommandRegistry",
                     "ConfigurationStoreRead",
                     "ConfigurationStoreWrite",
-                    "MosCommandBridge",
+                    "CommandScripts",
+                    "ExecInput",
                     "RuntimeErrors",
                     "TaskMemory",
                 ],
@@ -6707,18 +10310,20 @@ mod tests {
             RuntimeError::Structured { type_name, .. } if type_name == "SwiNameBufferError"
         ));
 
-        let mut transitional = SwiContext::default();
-        transitional.registers[R0] = OS_READ_POINT;
-        transitional.registers[R1] = name_buffer;
-        transitional.registers[R2] = SYSTEM_SWI_NAME_MAX_BYTES as u32;
-        let error = dispatcher
-            .dispatch(OS_SWI_NUMBER_TO_STRING, &mut task, &mut transitional)
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            RuntimeError::Structured { type_name, code, .. }
-                if type_name == "SwiIdentityNotFound" && code == OS_READ_POINT
-        ));
+        let mut graphics_swi = SwiContext::default();
+        graphics_swi.registers[R0] = OS_READ_POINT;
+        graphics_swi.registers[R1] = name_buffer;
+        graphics_swi.registers[R2] = SYSTEM_SWI_NAME_MAX_BYTES as u32;
+        dispatcher
+            .dispatch(OS_SWI_NUMBER_TO_STRING, &mut task, &mut graphics_swi)
+            .unwrap();
+        assert_eq!(
+            task.memory
+                .read_c_string(name_buffer, SYSTEM_SWI_NAME_MAX_BYTES)
+                .unwrap(),
+            b"OS_ReadPoint"
+        );
+        assert_eq!(graphics_swi.registers[R0], OS_READ_POINT);
     }
 
     #[test]
@@ -7632,7 +11237,7 @@ mod tests {
             crate::boot::BootModuleInput {
                 source_path: "modules/System.bas64",
                 source: include_str!("../modules/System.bas64"),
-                grants: &["StartupPolicy", "SystemQueries"],
+                grants: &["StartupPolicy", "SystemQueries", "SystemVariableStore"],
             },
         ];
         append_remaining_foundation_inputs(&mut inputs);
@@ -7672,7 +11277,7 @@ mod tests {
             crate::boot::BootModuleInput {
                 source_path: "modules/System.bas64",
                 source: include_str!("../modules/System.bas64"),
-                grants: &["StartupPolicy", "SystemQueries"],
+                grants: &["StartupPolicy", "SystemQueries", "SystemVariableStore"],
             },
         ];
         append_remaining_foundation_inputs(&mut inputs);
@@ -7714,7 +11319,7 @@ mod tests {
         assert!(dispatcher.recover_boot().unwrap());
 
         assert!(dispatcher.boot_failure.is_none());
-        assert_eq!(dispatcher.module_registry.registered_swi_count(), 20);
+        assert_eq!(dispatcher.module_registry.registered_swi_count(), 40);
         let recovery_output = display_receiver
             .try_iter()
             .filter_map(|event| match event {
@@ -7750,7 +11355,7 @@ mod tests {
 
         assert!(dispatcher.recover_boot().unwrap());
         assert!(dispatcher.boot_failure.is_none());
-        assert_eq!(dispatcher.module_registry.registered_swi_count(), 20);
+        assert_eq!(dispatcher.module_registry.registered_swi_count(), 40);
     }
 
     #[test]
@@ -7764,7 +11369,7 @@ mod tests {
             crate::boot::BootModuleInput {
                 source_path: "modules/System.bas64",
                 source: include_str!("../modules/System.bas64"),
-                grants: &["StartupPolicy", "SystemQueries"],
+                grants: &["StartupPolicy", "SystemQueries", "SystemVariableStore"],
             },
             crate::boot::BootModuleInput {
                 source_path: "modules/Console.bas64",
@@ -7853,7 +11458,7 @@ mod tests {
         )
     }
 
-    fn initialise_wimp_task(dispatcher: &mut SwiDispatcher, task: &mut Task) {
+    fn initialise_wimp_task(dispatcher: &mut SwiDispatcher, task: &mut Task) -> u32 {
         const DESCRIPTION: u32 = 0x1000;
         task.memory
             .write_bytes(DESCRIPTION, b"Graphics routing test\0")
@@ -7865,6 +11470,7 @@ mod tests {
         dispatcher
             .dispatch(WIMP_INITIALISE, task, &mut context)
             .unwrap();
+        context.registers[R1]
     }
 
     fn create_wimp_window(
@@ -7932,6 +11538,19 @@ mod tests {
         let colour = u32::from(character - b'A' + 1);
         let mut painted_point = None;
         while redraw.registers[R0] != 0 {
+            let packed_colour = 0x0102_0300 + colour;
+            let mut set_gcol = SwiContext::default();
+            set_gcol.registers[R0] = packed_colour;
+            dispatcher
+                .dispatch_named_swi("COLOURTRANS_SETGCOL", task, &mut set_gcol)
+                .unwrap();
+            assert_eq!(
+                dispatcher.window_graphics[&handle]
+                    .snapshot()
+                    .graphics_colour,
+                packed_colour,
+                "named SetGCOL follows the active redraw window context"
+            );
             for byte in [18, 0, colour as u8] {
                 let mut output = SwiContext::default();
                 output.registers[R0] = u32::from(byte);
@@ -8487,9 +12106,9 @@ mod tests {
             .unwrap();
         assert_eq!(console.workspace_number("QUIESCECOUNT%"), Some(1.0));
         assert_eq!(console.workspace_number("FINALISECOUNT%"), Some(1.0));
-        // The current capsule publishes twenty exports; retiring Console
-        // removes its six owned character SWIs.
-        assert_eq!(dispatcher.module_registry().registered_swi_count(), 20 - 6);
+        // The current capsule publishes forty exports; retiring Console
+        // removes its six character SWIs.
+        assert_eq!(dispatcher.module_registry().registered_swi_count(), 40 - 6);
         assert!(
             dispatcher
                 .module_registry()
@@ -8544,7 +12163,7 @@ mod tests {
                 .state,
             crate::ricochet::ModuleState::Active
         );
-        assert_eq!(dispatcher.module_registry().registered_swi_count(), 20);
+        assert_eq!(dispatcher.module_registry().registered_swi_count(), 40);
         assert!(
             dispatcher
                 .module_registry()
@@ -8609,7 +12228,7 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("must be quiesced"));
         assert_eq!(module_program.workspace_number("FINALISECOUNT%"), Some(0.0));
-        assert_eq!(dispatcher.module_registry().registered_swi_count(), 20);
+        assert_eq!(dispatcher.module_registry().registered_swi_count(), 40);
         assert_eq!(
             dispatcher
                 .module_registry()
@@ -8628,7 +12247,7 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("finalise denied"));
         assert_eq!(module_program.workspace_number("FINALISECOUNT%"), Some(0.0));
-        assert_eq!(dispatcher.module_registry().registered_swi_count(), 20);
+        assert_eq!(dispatcher.module_registry().registered_swi_count(), 40);
         assert!(
             dispatcher
                 .module_registry()
@@ -8659,7 +12278,7 @@ mod tests {
             .retire("Console", &mut task)
             .unwrap();
         assert_eq!(module_program.workspace_number("FINALISECOUNT%"), Some(1.0));
-        assert_eq!(dispatcher.module_registry().registered_swi_count(), 20 - 6);
+        assert_eq!(dispatcher.module_registry().registered_swi_count(), 40 - 6);
         assert!(
             dispatcher
                 .module_programs
@@ -9164,6 +12783,58 @@ mod tests {
     }
 
     #[test]
+    fn graphics_swis_isolate_non_display_task_defaults_in_desktop_mode() {
+        let (display_sender, _display_receiver) = mpsc::channel();
+        let wimp = WimpServer::new(mpsc::channel().0);
+        let mut dispatcher = SwiDispatcher::desktop_task(
+            HostConsole::windowed(mpsc::channel().1),
+            display_sender,
+            77,
+            wimp,
+        );
+        let mut display_task = Task::new(77);
+        let mut guest_task = Task::new(78);
+
+        for byte in [22_u8, 0, 18, 0, 3] {
+            let mut output = SwiContext::default();
+            output.registers[R0] = u32::from(byte);
+            dispatcher
+                .dispatch(OS_WRITE_C, &mut display_task, &mut output)
+                .unwrap();
+        }
+        let mut display_plot = SwiContext::default();
+        display_plot.registers[R0] = 0x45;
+        display_plot.registers[R1] = 40;
+        display_plot.registers[R2] = 40;
+        dispatcher
+            .dispatch(OS_PLOT, &mut display_task, &mut display_plot)
+            .unwrap();
+
+        let mut guest_read = SwiContext::default();
+        guest_read.registers[R0] = 40;
+        guest_read.registers[R1] = 40;
+        dispatcher
+            .dispatch(OS_READ_POINT, &mut guest_task, &mut guest_read)
+            .unwrap();
+        assert_eq!(guest_read.registers[R2], 0);
+
+        let mut guest_plot = SwiContext::default();
+        guest_plot.registers[R0] = 0x45;
+        guest_plot.registers[R1] = 48;
+        guest_plot.registers[R2] = 48;
+        dispatcher
+            .dispatch(OS_PLOT, &mut guest_task, &mut guest_plot)
+            .unwrap();
+        let mut display_read = SwiContext::default();
+        display_read.registers[R0] = 48;
+        display_read.registers[R1] = 48;
+        dispatcher
+            .dispatch(OS_READ_POINT, &mut display_task, &mut display_read)
+            .unwrap();
+        assert_eq!(display_read.registers[R2], 0);
+    }
+
+    #[test]
     fn wimp_redraw_routes_to_independent_window_surfaces_and_restores_task_default() {
         let (input_sender, input_receiver) = mpsc::channel();
         let (display_sender, _display_receiver) = mpsc::channel();
@@ -9183,7 +12854,7 @@ mod tests {
                 .dispatch(OS_WRITE_C, &mut task, &mut output)
                 .unwrap();
         }
-        initialise_wimp_task(&mut dispatcher, &mut task);
+        let wimp_task_handle = initialise_wimp_task(&mut dispatcher, &mut task);
 
         let first = create_wimp_window(
             &mut dispatcher,
@@ -9284,6 +12955,22 @@ mod tests {
         assert_eq!(
             dispatcher.window_graphics[&second].snapshot().text_cells[0],
             b'B'
+        );
+        assert_eq!(dispatcher.window_graphics.len(), 2);
+        dispatcher.task_default_graphics_mut(task.id).unwrap();
+        assert!(dispatcher.task_default_graphics.contains_key(&task.id));
+
+        let mut close_down = SwiContext::default();
+        close_down.registers[R0] = wimp_task_handle;
+        close_down.registers[R1] = u32::from_le_bytes(*b"TASK");
+        dispatcher
+            .dispatch(WIMP_CLOSE_DOWN, &mut task, &mut close_down)
+            .unwrap();
+        assert!(dispatcher.window_graphics.is_empty());
+        assert_eq!(dispatcher.active_graphics_window, None);
+        assert!(
+            dispatcher.task_default_graphics.contains_key(&task.id),
+            "CloseDown releases Wimp window surfaces but keeps the live task-default raster"
         );
         drop(input_sender);
     }
@@ -9460,49 +13147,5 @@ mod tests {
 
         dispatch_cli_line(&mut dispatcher, &mut task, "*fx151,78,243").unwrap();
         assert!(display_receiver.try_iter().next().is_none());
-    }
-
-    #[cfg(feature = "experimental-jit")]
-    #[test]
-    fn strict_basicjit_returns_to_cli_with_loaded_program_available() {
-        let (_input_sender, input_receiver) = mpsc::channel();
-        let (display_sender, display_receiver) = mpsc::channel();
-        let mut dispatcher =
-            SwiDispatcher::windowed(HostConsole::windowed(input_receiver), display_sender);
-        let mut task = Task::new(1);
-        task.loaded_tokenized_program = Some(crate::tokenized_basic::TokenizedBasicProgram {
-            lines: vec![
-                crate::tokenized_basic::TokenizedBasicLine {
-                    number: 10,
-                    bytes: vec![0xF1, b'"', b'S', b'T', b'R', b'I', b'C', b'T', b'"'],
-                    line_references: Vec::new(),
-                },
-                crate::tokenized_basic::TokenizedBasicLine {
-                    number: 20,
-                    bytes: vec![0xE0],
-                    line_references: Vec::new(),
-                },
-            ],
-            record_layout: None,
-        });
-
-        dispatch_cli_line(
-            &mut dispatcher,
-            &mut task,
-            "BASICJIT STRICT --benchmark-validation",
-        )
-        .unwrap();
-        assert!(task.loaded_tokenized_program.is_some());
-        let native_output = display_receiver
-            .try_iter()
-            .filter_map(|event| match event {
-                DisplayEvent::WriteByte { byte, .. } => Some(byte),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert!(native_output.windows(6).any(|bytes| bytes == b"STRICT"));
-        dispatch_cli_line(&mut dispatcher, &mut task, "HELP").unwrap();
-        dispatch_cli_line(&mut dispatcher, &mut task, "QUIT").unwrap();
-        assert!(dispatcher.quit_requested());
     }
 }

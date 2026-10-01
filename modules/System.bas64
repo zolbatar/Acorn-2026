@@ -3,12 +3,15 @@ REM @SYSTEM_PROFILE 0.1
 REM @MODULE System 1.0.0
 REM @CAPABILITY StartupPolicy
 REM @CAPABILITY SystemQueries
+REM @CAPABILITY SystemVariableStore
 REM @IMPORT Host.Configuration.ReadStartupLanguage StartupPolicy
 REM @IMPORT Host.Boot.RequestMos StartupPolicy
 REM @IMPORT Host.Boot.RequestDesktop StartupPolicy
 REM @IMPORT Host.System.ReadMonotonicTime SystemQueries
 REM @IMPORT Host.System.SwiNumberToString SystemQueries
 REM @IMPORT Host.System.SwiNumberFromString SystemQueries
+REM @IMPORT Host.SystemVariables.Read SystemVariableStore
+REM @IMPORT Host.SystemVariables.Write SystemVariableStore
 REM @STATE STARTUPLANGUAGE% UINT32
 REM @STATE CONFIGURATIONRECOVERY% UINT32
 REM @EXPORT FN StartupLanguage
@@ -19,6 +22,8 @@ REM @EXPORT PROC RequestDesktop
 REM @SWI OS_SWINumberToString &38 SwiNumberToString REGISTERS=R0:U32:IN|R1:ADDRESS32:INOUT|R2:U32:INOUT;MEMORY=R1:WRITE:128;BLOCKING=FALSE;REENTRANT=TRUE;ERROR=SwiNameError
 REM @SWI OS_SWINumberFromString &39 SwiNumberFromString REGISTERS=R0:U32:OUT|R1:ADDRESS32:IN;MEMORY=R1:READ:128;BLOCKING=FALSE;REENTRANT=TRUE;ERROR=SwiNameError
 REM @SWI OS_ReadMonotonicTime &42 ReadMonotonicTime REGISTERS=R0:U32:OUT;BLOCKING=FALSE;REENTRANT=TRUE
+REM @SWI OS_ReadVarVal &23 ReadVarVal REGISTERS=R0:ADDRESS32:IN|R1:ADDRESS32:IN|R2:S32:INOUT|R3:U32:INOUT|R4:U32:INOUT;BLOCKING=FALSE;REENTRANT=TRUE;ERROR=SystemVariableError
+REM @SWI OS_SetVarVal &24 SetVarVal REGISTERS=R0:ADDRESS32:IN|R1:ADDRESS32:IN|R2:S32:IN|R3:U32:INOUT|R4:U32:INOUT;BLOCKING=FALSE;REENTRANT=FALSE;ERROR=SystemVariableError
 
 DEF PROC ReadStartupLanguage
     PRIMITIVE Host.Configuration.ReadStartupLanguage TO LANGUAGE%, CONFIGURATIONRECOVERY%
@@ -52,4 +57,12 @@ ENDPROC
 DEF PROC ReadMonotonicTime
     PRIMITIVE Host.System.ReadMonotonicTime TO TICKCOUNT%
     R0% = TICKCOUNT%
+ENDPROC
+
+DEF PROC ReadVarVal
+    PRIMITIVE Host.SystemVariables.Read, R0%, R1%, R2%, R3%, R4% TO R0%, R1%, R2%, R3%, R4%
+ENDPROC
+
+DEF PROC SetVarVal
+    PRIMITIVE Host.SystemVariables.Write, R0%, R1%, R2%, R3%, R4% TO R0%, R1%, R2%, R3%, R4%
 ENDPROC
